@@ -187,6 +187,14 @@ where
     Err(error.unwrap())
 }
 
+// A discovery seed is not necessarily an eligible application endpoint.
+// Keep the same fallback policy for discovery and endpoint-selection failures.
+fn allows_unbalanced_fallback(config: &Config) -> bool {
+    config.load_balance != "only-rr"
+        && config.load_balance != "only-primary"
+        && (config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only)
+}
+
 pub async fn yb_connect<T>(
     mut tls: T,
     config: &Config,
@@ -220,6 +228,9 @@ where
     }
 
     if let Err(e) = check_and_refresh(&mut tls, config).await {
+        if !allows_unbalanced_fallback(config) {
+            return Err(e);
+        }
         warn!(
             "Failed to establish control connection to available servers: {}. Falling back \
              to the upstream driver behaviour and attempting a connection to the configured host(s) {:?}",
@@ -241,10 +252,7 @@ where
                 // Only fallback to an upstream driver connection when the caller put
                 // no restriction on which node it will accept (`only-rr`,
                 // `only-primary` and `fallback_to_topology_keys_only`).
-                if config.load_balance == "only-rr"
-                    || config.load_balance == "only-primary"
-                    || (!config.topology_keys.is_empty() && config.fallback_to_topology_keys_only)
-                {
+                if !allows_unbalanced_fallback(config) {
                     return Err(e);
                 }
                 warn!(
