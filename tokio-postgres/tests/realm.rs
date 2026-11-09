@@ -686,11 +686,18 @@ async fn all_candidates_failing_quarantines_and_keeps_counts_exact() {
     for node in [&n2, &n3] {
         node.set(Behaviour::Refuse);
     }
+    let mut extra = Vec::new();
     for _ in 0..5 {
         // Only n1 remains; repeated failures elsewhere never skew counts.
+        // Holding the sessions raises n1's load, so the refusing nodes are
+        // tried (and quarantined) first.
         let s = connect(&conf, &realm).await.unwrap();
         assert_eq!(node_of(&s).await, n1.ip);
+        extra.push(s);
     }
+    assert_eq!(realm.connection_counts().get(&n1.ip), Some(&6));
+    drop(extra);
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut failed = realm.failed_nodes();
     failed.sort();
     let mut expected = vec![n2.ip.clone(), n3.ip.clone()];
