@@ -1,5 +1,7 @@
 //! TLS support.
 
+use crate::endpoint::EndpointLabel;
+use std::borrow::Cow;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
@@ -9,6 +11,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(crate) mod private {
     pub struct ForcePrivateApi;
+
+    /// What a connector attests about peer verification. Only connectors
+    /// inside this crate can override the attestation, because external code
+    /// cannot name these types.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PeerVerification {
+        /// Nothing is known about how (or whether) the peer is verified.
+        Unattested,
+        /// The connector verifies the chain against explicit trust roots and
+        /// the certificate against the expected TLS identity.
+        VerifyFull,
+    }
 }
 
 /// Channel binding information returned from a TLS handshake.
@@ -65,6 +79,11 @@ pub trait TlsConnect<S> {
     #[doc(hidden)]
     fn can_connect(&self, _: private::ForcePrivateApi) -> bool {
         true
+    }
+
+    #[doc(hidden)]
+    fn peer_verification(&self, _: private::ForcePrivateApi) -> private::PeerVerification {
+        private::PeerVerification::Unattested
     }
 }
 
@@ -162,3 +181,93 @@ impl fmt::Display for NoTlsError {
 }
 
 impl Error for NoTlsError {}
+
+/// The category of a TLS failure, for callers that must react differently to
+/// configuration mistakes, untrusted peers and transient conditions.
+///
+/// None of these categories is ever retried with weaker verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TlsFailureKind {
+    /// `sslmode=verify-full` was requested with a connector that does not
+    /// attest full verification (for example `NoTls` or a third-party
+    /// connector).
+    UnverifiedConnector,
+    /// The verifying connector was used with a mode other than `verify-full`.
+    ModeNotVerifyFull,
+    /// No expected TLS identity (hostname or IP address) was available.
+    NoExpectedIdentity,
+    /// The server refused to start TLS.
+    ServerRefusedTls,
+    /// The server certificate chain does not lead to a configured trust root.
+    UnknownIssuer,
+    /// The server certificate is not valid for the expected TLS identity.
+    IdentityMismatch,
+    /// The server certificate has expired.
+    Expired,
+    /// The server certificate is not yet valid.
+    NotYetValid,
+    /// The server certificate has been revoked by a configured CRL.
+    Revoked,
+    /// The server certificate was rejected for another reason.
+    InvalidCertificate,
+    /// The server rejected the client certificate.
+    ClientCertificateRejected,
+    /// The server required a client certificate and none was configured.
+    ClientCertificateRequired,
+    /// No mutually acceptable TLS protocol version.
+    ProtocolVersion,
+    /// The handshake failed for another reason.
+    HandshakeFailure,
+    /// The credential generation used by this session was revoked.
+    GenerationRevoked,
+}
+
+/// A classified TLS failure.
+///
+/// The message never contains credentials, file paths, key material or raw
+/// endpoint addresses; endpoints are reported as keyed labels.
+#[derive(Debug, Clone)]
+pub struct TlsFailure {
+    kind: TlsFailureKind,
+    detail: Cow<'static, str>,
+    endpoint: Option<EndpointLabel>,
+}
+
+impl TlsFailure {
+    pub(crate) fn new(kind: TlsFailureKind, detail: impl Into<Cow<'static, str>>) -> TlsFailure {
+        TlsFailure {
+            kind,
+            detail: detail.into(),
+            endpoint: None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "rustls"), allow(dead_code))]
+    pub(crate) fn with_endpoint(mut self, endpoint: EndpointLabel) -> TlsFailure {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// The failure category.
+    pub fn kind(&self) -> TlsFailureKind {
+        self.kind
+    }
+
+    /// The redacted label of the endpoint involved, when known.
+    pub fn endpoint(&self) -> Option<EndpointLabel> {
+        self.endpoint
+    }
+}
+
+impl fmt::Display for TlsFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)?;
+        if let Some(endpoint) = &self.endpoint {
+            write!(f, " (endpoint {})", endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for TlsFailure {}

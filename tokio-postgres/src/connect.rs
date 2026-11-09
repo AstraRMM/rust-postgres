@@ -1,7 +1,8 @@
 use crate::client::{Addr, SocketConfig};
-use crate::config::{Host, LoadBalanceHosts, TargetSessionAttrs};
+use crate::config::{Host, LoadBalanceHosts, SslMode, TargetSessionAttrs};
 use crate::connect_raw::connect_raw;
 use crate::connect_socket::connect_socket;
+use crate::endpoint::{self, ResolvedEndpoint};
 use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
@@ -10,6 +11,7 @@ use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
@@ -169,8 +171,12 @@ where
             None => host.cloned().unwrap(),
         };
 
-        let label = format!("{:?}", addr);
-        let attempt = connect_host(addr, hostname, port, &mut *tls, config);
+        // A seed's accounting identity is its configured name (or address).
+        let node = hostname
+            .clone()
+            .or_else(|| hostaddr.map(|addr| addr.to_string()));
+        let label = host_label(&addr);
+        let attempt = connect_host(addr, hostname, port, &mut *tls, config, node);
         let outcome = match attempt_timeout {
             Some(limit) => {
                 establish_control_connection(&label, limit, time::timeout(limit, attempt).await)
@@ -180,6 +186,9 @@ where
 
         match outcome {
             Ok((client, connection)) => return Ok((client, connection)),
+            // A verification or authentication failure is never hidden by
+            // trying another seed.
+            Err(e) if e.is_security_failure() => return Err(e),
             Err(e) => error = Some(e),
         }
     }
@@ -220,11 +229,16 @@ where
     }
 
     if let Err(e) = check_and_refresh(&mut tls, config).await {
+        // TLS, authentication and authorization failures are terminal: the
+        // configured seeds would fail the same verification again.
+        if e.is_security_failure() {
+            return Err(e);
+        }
         warn!(
             "Failed to establish control connection to available servers: {}. Falling back \
-             to the upstream driver behaviour and attempting a connection to the configured host(s) {:?}",
+             to the upstream driver behaviour and attempting a connection to the configured host(s) {}",
             error_chain(&e),
-            config.host
+            seeds_label(config)
         );
         let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
         count_unbalanced_connection(&client);
@@ -235,7 +249,7 @@ where
 
     loop {
         let newhost = get_least_loaded_server(config);
-        let mut host = match newhost {
+        let host = match newhost {
             Ok(host) => host,
             Err(e) => {
                 // Only fallback to an upstream driver connection when the caller put
@@ -248,10 +262,10 @@ where
                     return Err(e);
                 }
                 warn!(
-                    "No server available from the discovered topology: {}. Falling back to \
-                     the upstream driver behaviour and attempting a connection to the configured host(s) {:?}",
+                    "No admitted server available from the discovered topology: {}. Falling back to \
+                     the upstream driver behaviour and attempting a connection to the configured host(s) {}",
                     error_chain(&e),
-                    config.host
+                    seeds_label(config)
                 );
                 let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
                 count_unbalanced_connection(&client);
@@ -259,47 +273,160 @@ where
             }
         };
 
+        let identity = match &host {
+            Host::Tcp(identity) => identity.clone(),
+            #[cfg(unix)]
+            Host::Unix(_) => {
+                add_to_failed_host_list(host.clone());
+                continue;
+            }
+        };
+
         increase_connection_count(host.clone());
 
-        //check if we are to use public hosts
-        if USE_PUBLIC_IP.load(Ordering::SeqCst) {
-            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
-            let public_host = public_host_map.get(&host.clone());
-            if public_host.is_none() {
-                info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", host.clone());
+        let port = host_to_port_map.get(&host).copied().unwrap_or(0);
+        let mut target = match resolve_node(config, &identity, port) {
+            Some(target) => target,
+            None => {
+                info!(
+                    "Discovered server {} is not admitted by the trusted endpoint policy, skipping it",
+                    endpoint::label(&identity)
+                );
                 decrease_connection_count(host.clone());
                 add_to_failed_host_list(host.clone());
                 continue;
-            } else {
-                host = public_host.unwrap().clone();
+            }
+        };
+
+        // Legacy public/private address switching. It is never used with
+        // `verify-full` or an explicit endpoint policy: there the trusted
+        // policy alone decides the dial address and the expected TLS name.
+        if public_ip_mode_allowed(config) && USE_PUBLIC_IP.load(Ordering::SeqCst) {
+            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
+            match public_host_map.get(&host) {
+                Some(Host::Tcp(public)) if !public.is_empty() => {
+                    target.dial = public.clone();
+                    target.tls_name = public.clone();
+                }
+                _ => {
+                    info!(
+                        "Public host not available for private host {}, adding this to failed host list and trying another server",
+                        endpoint::label(&identity)
+                    );
+                    decrease_connection_count(host.clone());
+                    add_to_failed_host_list(host.clone());
+                    continue;
+                }
             }
         }
 
-        let hostname = match host.clone() {
-            Host::Tcp(host) => Some(host),
-            // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
-            #[cfg(unix)]
-            Host::Unix(_) => None,
-        };
-
-        info!("Creating connection to {:?}", hostname.clone());
+        info!("Creating connection to {}", endpoint::label(&identity));
         match connect_host(
-            host.clone(),
-            hostname.clone(),
-            host_to_port_map[&(host.clone())],
+            Host::Tcp(target.dial.clone()),
+            Some(target.tls_name.clone()),
+            target.port,
             &mut tls,
             config,
+            Some(target.identity.clone()),
         )
         .await
         {
             Ok((client, connection)) => return Ok((client, connection)),
-            Err(_e) => {
-                info!("Not able to create connection to {:?}, adding it to failed host list and trying a different host.",  hostname.clone());
+            Err(e) => {
                 decrease_connection_count(host.clone());
+                if e.is_security_failure() {
+                    // Never quarantine-and-fall-back on a verification or
+                    // authentication failure: that would hide an identity
+                    // mismatch behind a connection to a different endpoint.
+                    warn!(
+                        "Connection to {} failed a security check: {}",
+                        endpoint::label(&identity),
+                        error_chain(&e)
+                    );
+                    return Err(e);
+                }
+                info!(
+                    "Not able to create connection to {}: {}, adding it to failed host list and trying a different host.",
+                    endpoint::label(&identity),
+                    error_chain(&e)
+                );
                 add_to_failed_host_list(host);
             }
         }
     }
+}
+
+/// Whether the legacy public/private address switching may be used.
+fn public_ip_mode_allowed(config: &Config) -> bool {
+    config.ssl_mode != SslMode::VerifyFull && config.endpoint_policy.is_none()
+}
+
+/// Resolves a discovered node identity through trusted configuration only.
+///
+/// Returns `None` when the node is not admitted, or when its discovered port
+/// is invalid or conflicts with a pinned port.
+pub(crate) fn resolve_node(config: &Config, identity: &str, port: u16) -> Option<ResolvedEndpoint> {
+    if port == 0 || identity.is_empty() {
+        return None;
+    }
+    let policy = config.endpoint_policy.as_deref();
+    if let Some(node) = policy.and_then(|p| p.node(identity)) {
+        return ResolvedEndpoint::from_policy(identity, node, port);
+    }
+    let identity_ip = identity.parse::<IpAddr>().ok();
+    // Configured seeds: a `host=name hostaddr=ip` pair says that `name` is
+    // served at `ip`, so either identity dials `ip` and verifies `name`.
+    for (i, seed) in config.host.iter().enumerate() {
+        if let Host::Tcp(name) = seed {
+            let hostaddr = config.hostaddr.get(i);
+            let by_name = name.eq_ignore_ascii_case(identity);
+            let by_addr = identity_ip.is_some() && hostaddr == identity_ip.as_ref();
+            if by_name || by_addr {
+                return Some(ResolvedEndpoint {
+                    identity: identity.to_string(),
+                    dial: hostaddr.map_or_else(|| name.clone(), |addr| addr.to_string()),
+                    tls_name: name.clone(),
+                    port,
+                });
+            }
+        }
+    }
+    if config.host.is_empty() {
+        if let Some(ip) = identity_ip {
+            if config.hostaddr.contains(&ip) {
+                return Some(ResolvedEndpoint {
+                    identity: identity.to_string(),
+                    dial: ip.to_string(),
+                    tls_name: ip.to_string(),
+                    port,
+                });
+            }
+        }
+    }
+    let admitted_by_suffix = policy.map_or(false, |p| p.suffix_admits(identity));
+    let legacy_open = config.ssl_mode != SslMode::VerifyFull && policy.is_none();
+    if admitted_by_suffix || legacy_open {
+        return Some(ResolvedEndpoint {
+            identity: identity.to_string(),
+            dial: identity.to_string(),
+            tls_name: identity.to_string(),
+            port,
+        });
+    }
+    None
+}
+
+fn host_label(host: &Host) -> String {
+    match host {
+        Host::Tcp(name) => endpoint::label(name).to_string(),
+        #[cfg(unix)]
+        Host::Unix(_) => "unix-socket".to_string(),
+    }
+}
+
+fn seeds_label(config: &Config) -> String {
+    let labels: Vec<String> = config.host.iter().map(host_label).collect();
+    format!("[{}]", labels.join(", "))
 }
 
 fn increase_connection_count(host: Host) {
@@ -307,14 +434,14 @@ fn increase_connection_count(host: Host) {
     let count = conn_map.get(&host);
     if count.is_none() {
         conn_map.insert(host.clone(), 1);
-        debug!("Increasing connection count for {:?} to 1", host.clone());
+        debug!("Increasing connection count for {} to 1", host_label(&host));
     } else {
         let mut conn_count: i64 = *count.unwrap();
         conn_count += 1;
         conn_map.insert(host.clone(), conn_count);
         debug!(
-            "Increasing connection count for {:?} by one: {}",
-            host.clone(),
+            "Increasing connection count for {} by one: {}",
+            host_label(&host),
             conn_count
         );
     }
@@ -329,8 +456,8 @@ pub(crate) fn decrease_connection_count(host: Host) {
             conn_count -= 1;
             conn_map.insert(host.clone(), conn_count);
             debug!(
-                "Decremented connection count for {:?} by one: {}",
-                host.clone(),
+                "Decremented connection count for {} by one: {}",
+                host_label(&host),
                 conn_count
             );
         }
@@ -344,7 +471,31 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
     let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
     let placement_info_map_primary = PLACEMENT_INFO_MAP_PRIMARY.lock().unwrap().clone();
     let placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap().clone();
+    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
     let mut least_host: Vec<Host> = Vec::new();
+
+    // Trusted admission comes before topology, role, preference and load:
+    // a node the realm configuration does not admit is never a candidate.
+    let admitted = |host: &Host| match host {
+        Host::Tcp(identity) => {
+            let port = host_to_port_map.get(host).copied().unwrap_or(0);
+            resolve_node(config, identity, port).is_some()
+        }
+        #[cfg(unix)]
+        Host::Unix(_) => false,
+    };
+    let mut host_list_primary = host_list_primary;
+    let mut host_list_rr = host_list_rr;
+    let mut placement_info_map_primary = placement_info_map_primary;
+    let mut placement_info_map_rr = placement_info_map_rr;
+    host_list_primary.retain(|h| admitted(h));
+    host_list_rr.retain(|h| admitted(h));
+    for hosts in placement_info_map_primary.values_mut() {
+        hosts.retain(|h| admitted(h));
+    }
+    for hosts in placement_info_map_rr.values_mut() {
+        hosts.retain(|h| admitted(h));
+    }
 
     let mut host_list: Vec<Host>;
     let mut placement_info_map: HashMap<String, Vec<Host>>;
@@ -421,7 +572,7 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
     if !least_host.is_empty() {
         info!(
             "Following hosts have the least number of connections: {:?}, chosing one randomly",
-            least_host
+            least_host.iter().map(host_label).collect::<Vec<_>>()
         );
         let num = rand::thread_rng().gen_range(0..least_host.len());
         Ok(least_host.get(num).cloned().expect("least loaded host value is None"))
@@ -495,12 +646,12 @@ fn control_connection_config(config: &Config) -> Config {
 /// reads the depressed value and treats that host as the least loaded one.
 fn count_unbalanced_connection(client: &Client) {
     if let Some(socket_config) = client.get_socket_config() {
-        if let Some(hostname) = socket_config.hostname {
+        if let Some(node) = socket_config.node {
             info!(
                 "Counting fallback upstream connection to {} against its connection count.",
-                hostname
+                endpoint::label(&node)
             );
-            increase_connection_count(Host::Tcp(hostname));
+            increase_connection_count(Host::Tcp(node));
         }
     }
 }
@@ -555,8 +706,8 @@ where
     let config_err = match connect_with_tls_ref(tls, &control_config, Some(LOGIN_TIMEOUT)).await {
         Ok((client, connection)) => {
             info!(
-                "Control connection created to one of the configured host(s) {:?}",
-                config.host
+                "Control connection created to one of the configured host(s) {}",
+                seeds_label(config)
             );
             match refresh(client, connection, config).await {
                 Ok(()) => {
@@ -576,10 +727,13 @@ where
             }
         }
         Err(e) => {
+            if e.is_security_failure() {
+                return Err(e);
+            }
             info!(
-                "Failed to establish control connection to the configured host(s) {:?}: {}, \
+                "Failed to establish control connection to the configured host(s) {}: {}, \
                  trying the discovered servers",
-                config.host,
+                seeds_label(config),
                 error_chain(&e)
             );
             e
@@ -602,58 +756,61 @@ where
     debug!(
         "Discovered hosts to try for a control connection: {:?}; failed hosts \
          (host, time since marked down, delay {:?}): {:?}",
-        host_list,
+        host_list.iter().map(host_label).collect::<Vec<_>>(),
         config.failed_host_reconnect_delay_secs,
         failed_host_list
             .iter()
-            .map(|(host, marked_at)| (host, marked_at.elapsed()))
+            .map(|(host, marked_at)| (host_label(host), marked_at.elapsed()))
             .collect::<Vec<_>>()
     );
 
     let mut discovered_err: Option<Error> = None;
-    let mut index = 0;
-    while index < host_list.len() {
-        let host = host_list.get(index);
-        let mut conn_host = host.unwrap().to_owned();
-        //check if we are to use public hosts
-        if USE_PUBLIC_IP.load(Ordering::SeqCst) {
+    for host in host_list {
+        let identity = match &host {
+            Host::Tcp(identity) => identity.clone(),
+            #[cfg(unix)]
+            Host::Unix(_) => continue,
+        };
+        let port = host_to_port_map.get(&host).copied().unwrap_or(0);
+        let mut target = match resolve_node(config, &identity, port) {
+            Some(target) => target,
+            // Not admitted by this realm's trusted configuration.
+            None => continue,
+        };
+        if public_ip_mode_allowed(config) && USE_PUBLIC_IP.load(Ordering::SeqCst) {
             let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
-            let public_host = public_host_map.get(&conn_host.clone());
-            if public_host.is_none() {
-                info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", conn_host.clone());
-                add_to_failed_host_list(host.cloned().unwrap());
-                index += 1;
-                continue;
-            } else {
-                conn_host = public_host.unwrap().clone();
+            match public_host_map.get(&host) {
+                Some(Host::Tcp(public)) if !public.is_empty() => {
+                    target.dial = public.clone();
+                    target.tls_name = public.clone();
+                }
+                _ => {
+                    info!("Public host not available for private host {}, adding this to failed host list and trying another server", endpoint::label(&identity));
+                    add_to_failed_host_list(host.clone());
+                    continue;
+                }
             }
         }
 
-        // The value of host is used as the hostname for TLS validation,
-        let hostname = match conn_host.clone() {
-            Host::Tcp(host) => Some(host),
-            // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
-            #[cfg(unix)]
-            Host::Unix(_) => None,
-        };
-
+        let label = endpoint::label(&identity);
         match establish_control_connection(
-            &format!("{:?}", conn_host),
+            &label.to_string(),
             LOGIN_TIMEOUT,
             time::timeout(
                 LOGIN_TIMEOUT,
                 connect_host(
-                    conn_host.clone(),
-                    hostname.clone(),
-                    host_to_port_map[&(conn_host.clone())],
+                    Host::Tcp(target.dial.clone()),
+                    Some(target.tls_name.clone()),
+                    target.port,
                     &mut *tls,
                     &control_config,
+                    Some(target.identity.clone()),
                 ),
             )
             .await,
         ) {
             Ok((client, connection)) => {
-                info!("Control connection created to {:?}", hostname.clone());
+                info!("Control connection created to {}", label);
                 match refresh(client, connection, config).await {
                     Ok(()) => {
                         *refresh_time = Instant::now();
@@ -661,33 +818,38 @@ where
                         return Ok(());
                     }
                     Err(e) => {
-                        info!("Control connection to {:?} established but metadata refresh failed: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                        if e.is_security_failure() {
+                            return Err(e);
+                        }
+                        info!("Control connection to {} established but metadata refresh failed: {}, adding this to failed host list and trying another server", label, error_chain(&e));
                         discovered_err = Some(e);
-                        add_to_failed_host_list(host.cloned().unwrap());
-                        index += 1;
+                        add_to_failed_host_list(host);
                     }
                 }
             }
             Err(e) => {
-                info!("Failed to establish control connection to {:?}: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                if e.is_security_failure() {
+                    return Err(e);
+                }
+                info!("Failed to establish control connection to {}: {}, adding this to failed host list and trying another server", label, error_chain(&e));
                 discovered_err = Some(e);
-                add_to_failed_host_list(host.cloned().unwrap());
-                index += 1;
+                add_to_failed_host_list(host);
             }
         }
     }
 
     if discovered_candidates == 0 {
         warn!(
-            "Failed to refresh metadata using the configured host(s) {:?}; no \
+            "Failed to refresh metadata using the configured host(s) {}; no \
              discovered server was available to fall back to",
-            config.host
+            seeds_label(config)
         );
     } else {
         warn!(
-            "Failed to refresh metadata using the configured host(s) {:?} or any \
+            "Failed to refresh metadata using the configured host(s) {} or any \
              of the {} discovered server(s)",
-            config.host, discovered_candidates
+            seeds_label(config),
+            discovered_candidates
         );
     }
 
@@ -695,9 +857,9 @@ where
         Some(discovered) => Error::connect(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!(
-                "could not create control connection: configured host(s) {:?}: {}; \
+                "could not create control connection: configured host(s) {}: {}; \
                  last discovered server: {}",
-                config.host,
+                seeds_label(config),
                 error_chain(&config_err),
                 error_chain(&discovered)
             ),
@@ -709,7 +871,7 @@ where
 fn add_to_failed_host_list(host: Host) {
     let mut failedhostlist = FAILED_HOSTS.lock().unwrap();
     failedhostlist.insert(host.clone(), Instant::now());
-    info!("Added {:?} to failed host list", host.clone());
+    info!("Added {} to failed host list", host_label(&host));
 }
 
 async fn refresh<S>(
@@ -759,15 +921,19 @@ where
     // Close the control connection.
     drop(client);
     match time::timeout(CONTROL_CONN_CLOSE_TIMEOUT, connection).await {
-        Ok(Ok(())) => debug!("Control connection to {:?} closed cleanly", control_conn_host),
+        Ok(Ok(())) => debug!(
+            "Control connection to {} closed cleanly",
+            endpoint::label(&control_conn_host)
+        ),
         Ok(Err(e)) => debug!(
-            "Control connection to {:?} reported {} while closing",
-            control_conn_host,
+            "Control connection to {} reported {} while closing",
+            endpoint::label(&control_conn_host),
             error_chain(&e)
         ),
         Err(_) => debug!(
-            "Control connection to {:?} did not shut down within {:?}, dropping it",
-            control_conn_host, CONTROL_CONN_CLOSE_TIMEOUT
+            "Control connection to {} did not shut down within {:?}, dropping it",
+            endpoint::label(&control_conn_host),
+            CONTROL_CONN_CLOSE_TIMEOUT
         ),
     }
 
@@ -781,9 +947,16 @@ where
     for row in rows {
         let host_string: String = row.get("host");
         let host = Host::Tcp(host_string.to_string());
-        info!("Received entry for host {:?}", host);
+        info!("Received entry for host {}", endpoint::label(&host_string));
         let nodetype: String = row.get("node_type");
         let portvalue: i64 = row.get("port");
+        if host_string.is_empty() || !(1..=65535).contains(&portvalue) {
+            warn!(
+                "Ignoring yb_servers() entry {} with an empty host or invalid port",
+                endpoint::label(&host_string)
+            );
+            continue;
+        }
         let port: u16 = portvalue as u16;
         let cloud: String = row.get("cloud");
         let region: String = row.get("region");
@@ -794,12 +967,23 @@ where
         let star_placement_zone: String = cloud.clone() + "." + &region;
 
         host_to_port_map.insert(host.clone(), port);
-        host_to_port_map.insert(public_ip.clone(), port);
+        if !public_ip_string.is_empty() {
+            host_to_port_map.insert(public_ip.clone(), port);
+        }
 
         if !control_conn_host.is_empty()
+            && !public_ip_string.is_empty()
             && control_conn_host.eq_ignore_ascii_case(&public_ip_string)
         {
-            USE_PUBLIC_IP.store(true, Ordering::SeqCst);
+            if public_ip_mode_allowed(config) {
+                USE_PUBLIC_IP.store(true, Ordering::SeqCst);
+            } else {
+                warn!(
+                    "The control connection reached a node by its public address; public/private \
+                     address switching is not supported with verify-full or an endpoint policy, \
+                     so discovered nodes are dialled through the trusted endpoint policy only"
+                );
+            }
         }
 
         if !failed_host_list.contains_key(&host) {
@@ -807,13 +991,13 @@ where
                 if !host_list_primary.contains(&host) {
                     host_list_primary.push(host.clone());
                     public_host_map.insert(host.clone(), public_ip.clone());
-                    debug!("Added {:?} to host list primary", host.clone());
+                    debug!("Added {} to host list primary", host_label(&host));
                 }
             } else {
                 if !host_list_rr.contains(&host) {
                     host_list_rr.push(host.clone());
                     public_host_map.insert(host.clone(), public_ip.clone());
-                    debug!("Added {:?} to host list RR", host.clone());
+                    debug!("Added {} to host list RR", host_label(&host));
                 }
             }
         } else {
@@ -822,27 +1006,27 @@ where
             {
                 failed_host_list.remove(&host);
                 debug!(
-                    "Marking {:?} as UP since failed-host-reconnect-delay-secs has elapsed",
-                    host.clone()
+                    "Marking {} as UP since failed-host-reconnect-delay-secs has elapsed",
+                    host_label(&host)
                 );
                 if nodetype == "primary" {
                     if !host_list_primary.contains(&host) {
                         host_list_primary.push(host.clone());
                         public_host_map.insert(host.clone(), public_ip.clone());
-                        debug!("Added {:?} to host list primary", host.clone());
+                        debug!("Added {} to host list primary", host_label(&host));
                     }
                 } else {
                     if !host_list_rr.contains(&host) {
                         host_list_rr.push(host.clone());
                         public_host_map.insert(host.clone(), public_ip.clone());
-                        debug!("Added {:?} to host list RR", host.clone());
+                        debug!("Added {} to host list RR", host_label(&host));
                     }
                 }
                 make_connection_count_zero(host.clone());
             } else if host_list_primary.contains(&host) || host_list_rr.contains(&host) {
                 debug!(
-                    "Treating {:?} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
-                    host.clone()
+                    "Treating {} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
+                    host_label(&host)
                 );
                 if host_list_primary.contains(&host) {
                     let index = host_list_primary.iter().position(|x| *x == host).unwrap();
@@ -922,7 +1106,7 @@ fn make_connection_count_zero(host: Host) {
         return;
     }
     conn_map.insert(host.clone(), 0);
-    debug!("Resetting connection count for {:?} to zero", host.clone());
+    debug!("Resetting connection count for {} to zero", host_label(&host));
 }
 
 
@@ -932,6 +1116,7 @@ async fn connect_host<T>(
     port: u16,
     tls: &mut T,
     config: &Config,
+    node: Option<String>,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -949,10 +1134,20 @@ where
 
             let mut last_err = None;
             for addr in addrs {
-                match connect_once(Addr::Tcp(addr.ip()), hostname.as_deref(), port, tls, config)
-                    .await
+                match connect_once(
+                    Addr::Tcp(addr.ip()),
+                    hostname.as_deref(),
+                    port,
+                    tls,
+                    config,
+                    node.clone(),
+                )
+                .await
                 {
                     Ok(stream) => return Ok(stream),
+                    // Never let another resolved address mask a TLS or
+                    // authentication failure.
+                    Err(e) if e.is_security_failure() => return Err(e),
                     Err(e) => {
                         last_err = Some(e);
                         continue;
@@ -969,7 +1164,7 @@ where
         }
         #[cfg(unix)]
         Host::Unix(path) => {
-            connect_once(Addr::Unix(path), hostname.as_deref(), port, tls, config).await
+            connect_once(Addr::Unix(path), hostname.as_deref(), port, tls, config, node).await
         }
     }
 }
@@ -980,6 +1175,7 @@ async fn connect_once<T>(
     port: u16,
     tls: &mut T,
     config: &Config,
+    node: Option<String>,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -1046,6 +1242,7 @@ where
     client.set_socket_config(SocketConfig {
         addr,
         hostname: hostname.map(|s| s.to_string()),
+        node,
         port,
         connect_timeout: config.connect_timeout,
         tcp_user_timeout: config.tcp_user_timeout,

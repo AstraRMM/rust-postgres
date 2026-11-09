@@ -44,6 +44,13 @@ with-time-0_2 = ["postgres-types/with-time-0_2"]
 with-time-0_3 = ["postgres-types/with-time-0_3"]
 js = ["postgres-protocol/js"]
 
+# Verified TLS (`sslmode=verify-full`). `rustls` is the adapter; pick a provider.
+rustls = ["runtime", "dep:rustls", "dep:tokio-rustls"]
+rustls-aws-lc-rs = ["rustls", "rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
+rustls-ring = ["rustls", "rustls/ring", "tokio-rustls/ring"]
+# Builds aws-lc-rs against the AWS-LC FIPS module (needs cmake, Go and clang).
+rustls-fips = ["rustls-aws-lc-rs", "rustls/fips", "tokio-rustls/fips"]
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1.0"
@@ -63,6 +70,10 @@ tokio-util = { version = "0.7", features = ["codec"] }
 rand = "0.8.5"
 whoami = "1.4.1"
 lazy_static = "1.4.0"
+hmac = "0.12"
+sha2 = "0.10"
+rustls = { version = "0.23.27", default-features = false, features = ["std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["tls12"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 socket2 = { version = "0.5", features = ["all"] }

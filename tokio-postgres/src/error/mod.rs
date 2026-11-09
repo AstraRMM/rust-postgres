@@ -437,6 +437,51 @@ impl Error {
         self.as_db_error().map(DbError::code)
     }
 
+    /// Returns the classified TLS failure behind this error, if any.
+    ///
+    /// This walks the source chain, so it also finds failures raised while a
+    /// TLS session was already established (for example a server rejecting
+    /// the client certificate after a TLS 1.3 handshake, or a revoked
+    /// credential generation closing a borrowed session).
+    pub fn tls_failure(&self) -> Option<crate::tls::TlsFailureKind> {
+        let mut source: Option<&(dyn error::Error + 'static)> = self.source();
+        while let Some(err) = source {
+            if let Some(failure) = err.downcast_ref::<crate::tls::TlsFailure>() {
+                return Some(failure.kind());
+            }
+            if let Some(io) = err.downcast_ref::<io::Error>() {
+                if let Some(inner) = io.get_ref() {
+                    if let Some(failure) = inner.downcast_ref::<crate::tls::TlsFailure>() {
+                        return Some(failure.kind());
+                    }
+                    #[cfg(feature = "rustls")]
+                    {
+                        if let Some(rustls_error) = inner.downcast_ref::<::rustls::Error>() {
+                            return Some(crate::rustls::classify_rustls_error(rustls_error).0);
+                        }
+                    }
+                }
+            }
+            source = err.source();
+        }
+        None
+    }
+
+    /// Determines if the error is a TLS, authentication or authorization
+    /// failure (SQLSTATE class 28).
+    ///
+    /// The driver never answers these failures by trying a weaker transport,
+    /// quarantining the node as if it were down, or falling back to another
+    /// endpoint.
+    pub fn is_security_failure(&self) -> bool {
+        self.0.kind == Kind::Tls
+            || self.0.kind == Kind::Authentication
+            || self.tls_failure().is_some()
+            || self
+                .code()
+                .map_or(false, |code| code.code().starts_with("28"))
+    }
+
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
         Error(Box::new(ErrorInner { kind, cause }))
     }
