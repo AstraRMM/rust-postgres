@@ -579,6 +579,23 @@ async fn session_setup_and_preparation_are_separate_classes() {
     );
     assert_eq!(*counts.class(Class::Request), ClassCounts::default());
     assert_wire("preparation", preparation, &wire);
+
+    // Review finding 3: an explicit ambient Class::Request is innermost and
+    // wins over the driver's preparation purpose.
+    let wire_before = settle(&proxy).await;
+    let (stmt, counts) = observe::scope(
+        "wq.prepare_as_request",
+        observe::with_class(Class::Request, client.prepare("select $1::int8")),
+    )
+    .await;
+    let wire = settle(&proxy).await.since(&wire_before);
+    stmt.unwrap();
+    assert_eq!(*counts.class(Class::Preparation), ClassCounts::default());
+    let request = counts.class(Class::Request);
+    assert_eq!(request.operations, 1);
+    assert_eq!(request.parse_messages, 1);
+    assert_eq!(request.cycles_completed, 1);
+    assert_wire("explicit request class", request, &wire);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

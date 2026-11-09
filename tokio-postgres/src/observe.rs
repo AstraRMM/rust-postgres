@@ -860,10 +860,9 @@ impl Attribution {
             return None;
         }
         let owner = current_owner();
-        let class = current_class()
-            .filter(|class| *class != Class::Request)
-            .or(purpose)
-            .unwrap_or(Class::Request);
+        // An ambient class set with `with_class` (including an explicit
+        // `Class::Request`) wins over the driver's own purpose.
+        let class = current_class().or(purpose).unwrap_or(Class::Request);
         Some(Attribution { owner, class })
     }
 
