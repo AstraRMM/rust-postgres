@@ -71,7 +71,7 @@ legacy() {
   docker run -d --name legacy-pg -p 5433:5433 -e POSTGRES_PASSWORD=postgres \
     -v "$root/docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh:ro" postgres:14 >/dev/null
   wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || return 1
-  failing() { grep -E '^test .* FAILED$|^test result' "$1" | sort; }
+  failing() { grep -E '^test .* FAILED$|^test result' "$1" | sed 's/; finished in .*//' | sort; }
   cargo test -p yb-tokio-postgres --test test >/tmp/legacy-head-tp.log 2>&1
   cargo test -p yb-postgres >/tmp/legacy-head-p.log 2>&1
   step "legacy at HEAD"; failing /tmp/legacy-head-tp.log; failing /tmp/legacy-head-p.log

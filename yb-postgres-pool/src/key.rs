@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use yb_tokio_postgres::realm::Realm;
 
 /// Identity of one lazily created pool in a [`PoolSet`](crate::PoolSet).
 ///
@@ -17,6 +18,7 @@ use std::sync::Arc;
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
     realm: Arc<str>,
+    incarnation: Option<Arc<str>>,
     database: Arc<str>,
     role: Arc<str>,
     credential_generation: u64,
@@ -25,16 +27,39 @@ pub struct PoolKey {
 }
 
 impl PoolKey {
-    /// A key for `role` on `database` in `realm`, generation 0.
+    /// A key for `role` on `database` in the realm named `realm`,
+    /// generation 0.
     pub fn new(realm: &str, database: &str, role: &str) -> PoolKey {
         PoolKey {
             realm: realm.into(),
+            incarnation: None,
             database: database.into(),
             role: role.into(),
             credential_generation: 0,
             config_generation: 0,
             discriminator: None,
         }
+    }
+
+    /// A key for `role` on `database` in `realm`, carrying the realm's name
+    /// and declared cluster incarnation ([`Realm::key`]). Pass the same
+    /// `Realm` to the spec's `Config::realm` so the driver's topology and
+    /// node accounting are the realm's own.
+    pub fn for_realm(realm: &Realm, database: &str, role: &str) -> PoolKey {
+        let mut key = PoolKey::new(realm.key().name(), database, role);
+        key.incarnation = realm.key().incarnation().map(Into::into);
+        key
+    }
+
+    /// Sets the cluster incarnation label.
+    pub fn with_incarnation(mut self, incarnation: &str) -> PoolKey {
+        self.incarnation = Some(incarnation.into());
+        self
+    }
+
+    /// The cluster incarnation, if declared.
+    pub fn incarnation(&self) -> Option<&str> {
+        self.incarnation.as_deref()
     }
 
     /// Sets the credential generation (password, client certificate).
@@ -90,14 +115,14 @@ impl PoolKey {
 
 impl fmt::Debug for PoolKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PoolKey({}", self.realm)?;
+        if let Some(incarnation) = &self.incarnation {
+            write!(f, "@{}", incarnation)?;
+        }
         write!(
             f,
-            "PoolKey({}/{}/{} cred#{} cfg#{}",
-            self.realm,
-            self.database,
-            self.role,
-            self.credential_generation,
-            self.config_generation
+            "/{}/{} cred#{} cfg#{}",
+            self.database, self.role, self.credential_generation, self.config_generation
         )?;
         if let Some(d) = &self.discriminator {
             write!(f, " {}", d)?;

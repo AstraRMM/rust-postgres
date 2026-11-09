@@ -884,11 +884,18 @@ async fn ambiguous_commit_is_never_replayed() {
             let err = tx.commit().await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::AmbiguousCommit, "{err}");
         }
-        let n: i64 = admin
-            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
-            .await
-            .unwrap()
-            .get(0);
+        // The client was cut off before the server even saw COMMIT; the
+        // server still commits it.
+        let mut n = 0i64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while n == 0 && Instant::now() < deadline {
+            n = admin
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         println!(
             "[{}] ambiguous commit: row committed = {} (a blind replay would duplicate it)",
             e.name,
@@ -1089,6 +1096,56 @@ async fn protocol_cost_of_checkout_probe_and_reset() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn realm_leases_follow_pool_lifecycle() {
+    use yb_postgres_pool::yb_tokio_postgres::realm::Realm;
+    let key = PoolKey::for_realm(&Realm::with_incarnation("r1", "inc-7"), "db", "app");
+    assert_eq!((key.realm(), key.incarnation()), ("r1", Some("inc-7")));
+    for e in engines() {
+        let app = format!("pt_realm_{}", e.name);
+        let admin = e.admin().await;
+        let realm = Realm::new(format!("pool-test-{}", e.name));
+        let mut pg = e.config();
+        pg.realm(realm.clone());
+        if e.name == "yb" {
+            // The smart-driver path: discovery through yb_servers().
+            pg.load_balance("true");
+        }
+        let leased = |r: &Realm| r.connection_counts().values().sum::<usize>();
+        let mut config = short(&app);
+        config.max_size = 3;
+        let pool = Pool::new(pg, NoTls, config).unwrap();
+        let mut held = [
+            pool.get().await.unwrap(),
+            pool.get().await.unwrap(),
+            pool.get().await.unwrap(),
+        ];
+        let counted = leased(&realm);
+        println!(
+            "[{}] realm leases with 3 borrowed: {:?} (topology {:?})",
+            e.name,
+            realm.connection_counts(),
+            realm.topology().map(|t| t.nodes().len())
+        );
+        if e.name == "yb" {
+            assert_eq!(counted, 3);
+        }
+        assert!(counted == 3 || counted == 0, "{counted}");
+        held[0].retire();
+        drop(held);
+        assert!(eventually(Duration::from_secs(5), || pool.state().physical == 2).await);
+        if counted == 3 {
+            assert_eq!(leased(&realm), 2, "a retired client releases its lease");
+        }
+        pool.shutdown(Duration::from_secs(1)).await;
+        assert!(eventually(Duration::from_secs(5), || leased(&realm) == 0).await);
+        assert_eq!(
+            eventually_backends(&admin, &app, 0, Duration::from_secs(5)).await,
+            0
+        );
+    }
+}
+
 #[cfg(feature = "rustls")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_full_generation_retirement() {
@@ -1205,5 +1262,8 @@ async fn verify_full_generation_retirement() {
     println!("wrong CA: {} ({:?}) after {:?}", err, err.kind(), took);
     assert_eq!(err.kind(), ErrorKind::Security, "{err}");
     assert!(took < Duration::from_secs(4), "{took:?}");
+    // Terminal: the pool does not retry it in the background.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(pool.state().stats.connect_failures, 1);
     pool.shutdown(Duration::from_secs(1)).await;
 }

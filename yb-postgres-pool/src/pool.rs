@@ -47,10 +47,9 @@ impl fmt::Debug for NativeConnection {
 impl Drop for NativeConnection {
     fn drop(&mut self) {
         self.stats.retired(self.retire);
-        // Release the driver's per-node connection accounting. Dropping the
-        // client then ends the connection task, which closes the socket and
-        // returns the process-wide permit.
-        yb_tokio_postgres::close(&self.client);
+        // Dropping the client (right after this) releases the driver's
+        // per-node lease (AST-2129) and ends the connection task, which
+        // closes the socket and returns the process-wide permit.
     }
 }
 
@@ -79,7 +78,9 @@ pub(crate) struct Shared<T: PoolTls> {
     pub(crate) stats: Arc<Stats>,
     label: String,
     closed: AtomicBool,
-    /// Security/configuration connect failures and shutdown wake waiters.
+    /// Connect failures and shutdown wake waiters: a failed connect is
+    /// final (the driver already spent its bounded acquisition budget, and
+    /// security failures are terminal), so waiters get its error.
     fatal: Notify,
     fatal_seq: AtomicU64,
     connect_error_seq: AtomicU64,
@@ -104,11 +105,9 @@ impl<T: PoolTls> Shared<T> {
         bump(&self.stats.connect_failures);
         *self.last_error.lock() = Some(error.clone());
         self.connect_error_seq.fetch_add(1, Ordering::SeqCst);
-        if matches!(error.kind(), ErrorKind::Security | ErrorKind::Config) {
-            *self.last_fatal.lock() = Some(error.clone());
-            self.fatal_seq.fetch_add(1, Ordering::SeqCst);
-            self.fatal.notify_waiters();
-        }
+        *self.last_fatal.lock() = Some(error.clone());
+        self.fatal_seq.fetch_add(1, Ordering::SeqCst);
+        self.fatal.notify_waiters();
         log::warn!("pool {}: connect failed: {}", self.label, error);
     }
 
@@ -579,6 +578,14 @@ impl<T: PoolTls> Pool<T> {
         if let Some(name) = &config.session.application_name {
             pg.application_name(name);
         }
+        // Keep the driver's own acquisition budget inside the pool's connect
+        // budget so it ends with its classified error, not our timeout.
+        if pg.get_yb_acquire_timeout() > config.connect_timeout {
+            pg.yb_acquire_timeout(config.connect_timeout);
+        }
+        if pg.get_yb_attempt_timeout() > config.connect_timeout {
+            pg.yb_attempt_timeout(config.connect_timeout);
+        }
         let shared = Arc::new(Shared {
             pg,
             tls,
@@ -608,7 +615,10 @@ impl<T: PoolTls> Pool<T> {
             .max_lifetime(config.max_lifetime)
             .idle_timeout(config.idle_timeout)
             .connection_timeout(config.acquire_timeout)
-            .retry_connection(true)
+            // Never retried by the pool: the driver bounds discovery and node
+            // attempts itself (yb_acquire_timeout / yb_attempt_timeout /
+            // yb_max_attempts) and treats security failures as terminal.
+            .retry_connection(false)
             .reaper_rate(config.reaper_rate)
             .queue_strategy(match config.queue_strategy {
                 QueueStrategy::Lifo => bb8::QueueStrategy::Lifo,
@@ -649,8 +659,9 @@ impl<T: PoolTls> Pool<T> {
 
     /// Borrows a client within `min(budget, acquire_timeout)`. Covers
     /// waiting for an idle client and opening a new one (limiter, TLS,
-    /// authentication, session initialization). Security and configuration
-    /// connect failures end the wait immediately.
+    /// authentication, session initialization). A failed connect is not
+    /// retried by the pool and ends the wait with its classified error
+    /// (security, process limit, transport...).
     pub async fn get_within(&self, budget: Duration) -> Result<PooledClient<T>, PoolError> {
         let shared = &self.inner.shared;
         if shared.is_closed() {
