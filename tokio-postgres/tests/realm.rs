@@ -91,6 +91,7 @@ struct Node {
     port: u16,
     behaviour: Arc<Mutex<Behaviour>>,
     logins: Arc<AtomicUsize>,
+    #[allow(dead_code)]
     open: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
@@ -392,7 +393,7 @@ async fn two_realms_share_no_hosts_counts_failures_or_fallback() {
     let b_logins = b1.logins() + b2.logins();
     ra.invalidate_topology();
     let e = connect(&conf_a, &ra).await.err().expect("realm A is down");
-    assert!(!e.is_security_failure(), "{e}");
+    assert!(!e.is_security_failure(), "{}", e);
     assert_eq!(b1.logins() + b2.logins(), b_logins, "realm A touched realm B");
     assert!(rb.failed_nodes().is_empty());
     assert_eq!(total(&ra), 4, "failed attempts must not leak counts");
@@ -429,7 +430,7 @@ async fn strict_roles_fail_closed_when_exhausted() {
     let realm = Realm::new("roles");
     let before = p1.logins() + p2.logins();
     let e = connect(&config(&p1, "load_balance=only-rr"), &realm).await.err().expect("no read replicas");
-    assert!(e.to_string().contains("eligible"), "{e}");
+    assert!(e.to_string().contains("eligible"), "{}", e);
     // Only the control connection logged in; no data session reached a primary.
     assert_eq!(p1.logins() + p2.logins() - before, 1);
     let s = connect(&config(&p1, "load_balance=prefer-rr"), &realm).await.unwrap();
@@ -570,14 +571,14 @@ async fn stalled_endpoints_are_bounded_by_attempt_and_acquisition_budgets() {
     cluster.publish(&[(&s1, "primary", "z1"), (&s2, "primary", "z1"), (&s3, "primary", "z1")]);
     let realm = Realm::new("stall");
     let conf = config(&s1, "load_balance=only-primary yb_attempt_timeout=1 yb_acquire_timeout=4 yb_max_attempts=3");
-    connect(&conf, &realm).await.unwrap(); // snapshot
+    let _first = connect(&conf, &realm).await.unwrap(); // snapshot, held
     for node in [&s1, &s2, &s3] {
         node.set(Behaviour::Stall);
     }
     let started = Instant::now();
     let e = connect(&conf, &realm).await.err().expect("every node stalls");
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_millis(4500), "{elapsed:?}: {e}");
+    assert!(elapsed < Duration::from_millis(4500), "{:?}: {}", elapsed, e);
     assert_eq!(total(&realm), 1, "only the first session remains counted");
 
     // A stalled discovery query is bounded by the acquisition budget.
@@ -679,7 +680,7 @@ async fn authentication_failure_is_terminal_and_not_a_quarantine() {
     n2.set(Behaviour::AuthFail);
     let before = n1.logins() + n2.logins();
     let e = connect(&conf, &realm).await.err().expect("authentication fails");
-    assert!(e.is_security_failure(), "{e}");
+    assert!(e.is_security_failure(), "{}", e);
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"));
     assert_eq!(n1.logins() + n2.logins() - before, 1, "no second endpoint may be tried");
     assert!(realm.failed_nodes().is_empty());
@@ -718,8 +719,8 @@ async fn discovery_failure_cannot_bypass_restricted_routing() {
         connect(&config(&n1, parameters), &Realm::new("restricted"))
             .await
             .err()
-            .unwrap_or_else(|| panic!("restriction bypassed: {parameters}"));
-        assert_eq!(n1.logins() - before, 1, "{parameters}");
+            .unwrap_or_else(|| panic!("restriction bypassed: {}", parameters));
+        assert_eq!(n1.logins() - before, 1, "{}", parameters);
     }
 }
 
@@ -733,7 +734,7 @@ async fn discovery_failure_preserves_unrestricted_seed_fallback() {
         let realm = Realm::new("unrestricted");
         let s = connect(&config(&n1, parameters), &realm).await.unwrap();
         assert_eq!(node_of(&s).await, n1.ip);
-        assert_eq!(realm.connection_counts().get(&n1.ip), Some(&1), "{parameters}");
+        assert_eq!(realm.connection_counts().get(&n1.ip), Some(&1), "{}", parameters);
     }
 }
 
