@@ -73,15 +73,16 @@
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::sync::atomic::{
-    AtomicBool, AtomicU64,
+    AtomicU64,
     Ordering::{Relaxed, SeqCst},
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-/// Incremented on every `set_enabled(false)`, so a scope can tell whether
-/// observation stayed on for its whole lifetime.
-static DISABLES: AtomicU64 = AtomicU64::new(0);
+/// Observation switch and disable epoch in one word: `epoch << 1 | enabled`.
+/// Every disable advances the epoch and clears bit 0 in a single atomic
+/// update, so a scope that captured an enabled state and finds the identical
+/// state at its end saw observation on for its whole lifetime.
+static STATE: AtomicU64 = AtomicU64::new(0);
 
 /// Turns observation on for the whole process.
 ///
@@ -96,10 +97,13 @@ pub fn enable() {
 /// was turned off reports [`Counts::observed`] `false`, even if it was
 /// turned on again before the scope ended.
 pub fn set_enabled(enabled: bool) {
-    if !enabled {
-        DISABLES.fetch_add(1, SeqCst);
+    if enabled {
+        STATE.fetch_or(1, SeqCst);
+    } else {
+        let _ = STATE.fetch_update(SeqCst, SeqCst, |state| {
+            Some(((state >> 1).wrapping_add(1)) << 1)
+        });
     }
-    ENABLED.store(enabled, SeqCst);
 }
 
 /// Whether observation is on.
@@ -109,7 +113,7 @@ pub fn is_enabled() -> bool {
 
 #[inline]
 pub(crate) fn enabled() -> bool {
-    ENABLED.load(Relaxed)
+    STATE.load(Relaxed) & 1 == 1
 }
 
 /// What a protocol exchange was for.
@@ -699,9 +703,8 @@ struct ScopeData {
 
 struct ScopeCell {
     route: &'static str,
-    /// `DISABLES` when the scope started, or `None` if observation was
-    /// already off by then.
-    disable_epoch: Option<u64>,
+    /// `STATE` when the scope started.
+    start_state: u64,
     data: Mutex<ScopeData>,
 }
 
@@ -727,7 +730,7 @@ impl ScopeGuard {
             data.closed = true;
             data.classes
         };
-        let observed = enabled() && self.0.disable_epoch == Some(DISABLES.load(SeqCst));
+        let observed = self.0.start_state & 1 == 1 && STATE.load(SeqCst) == self.0.start_state;
         let counts = Counts {
             route: self.0.route,
             observed,
@@ -774,11 +777,10 @@ impl Drop for ScopeGuard {
 /// inherited. Enables observation.
 pub async fn scope<F: Future>(route: &'static str, future: F) -> (F::Output, Counts) {
     enable();
-    let epoch = DISABLES.load(SeqCst);
-    let disable_epoch = if enabled() { Some(epoch) } else { None };
+    let start_state = STATE.load(SeqCst);
     let cell = Arc::new(ScopeCell {
         route: route_label(route),
-        disable_epoch,
+        start_state,
         data: Mutex::new(ScopeData {
             classes: [ClassCounts::default(); CLASSES],
             closed: false,

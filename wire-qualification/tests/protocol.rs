@@ -944,6 +944,64 @@ async fn representative_budgets() {
     assert_eq!(counts.total().cycles_completed, 1);
 }
 
+/// Review finding 8: a scope that starts while another thread disables
+/// observation must never report `observed` if observation was off at any
+/// point of its lifetime, even when it is switched back on before the scope
+/// ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_toggles_never_yield_a_falsely_observed_scope() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serial = serial().lock().await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let toggler = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut flips = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                observe::set_enabled(false);
+                std::hint::spin_loop();
+                observe::set_enabled(true);
+                flips += 1;
+            }
+            flips
+        })
+    };
+    let (mut observed, mut gaps) = (0u64, 0u64);
+    for _ in 0..200_000 {
+        let (saw_off, counts) = observe::scope("wq.toggle_stress", async {
+            let mut saw_off = false;
+            for _ in 0..4 {
+                saw_off |= !observe::is_enabled();
+                tokio::task::yield_now().await;
+            }
+            saw_off
+        })
+        .await;
+        if saw_off {
+            gaps += 1;
+            assert!(
+                !counts.observed(),
+                "observation was off inside an observed scope"
+            );
+        }
+        if counts.observed() {
+            observed += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let flips = toggler.join().unwrap();
+    observe::set_enabled(true);
+    println!(
+        "TOGGLE-STRESS scopes=200000 observed={observed} scopes_that_saw_off={gaps} flips={flips}"
+    );
+    assert!(
+        gaps > 0,
+        "the stress never overlapped a disable; it proves nothing"
+    );
+    let ((), counts) = observe::scope("wq.toggle_after", async {}).await;
+    assert!(counts.observed());
+}
+
 /// Review finding 2: the plaintext/encrypted split must survive an
 /// `SSLRequest` split across short writes.
 #[test]
