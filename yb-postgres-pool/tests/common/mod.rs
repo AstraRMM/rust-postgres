@@ -246,6 +246,12 @@ impl Wire {
 
 /// Starts a plaintext proxy to `target` that counts frontend messages.
 pub async fn proxy(target: SocketAddr) -> (SocketAddr, Arc<Wire>) {
+    proxy_delayed(target, Duration::ZERO).await
+}
+
+/// Like [`proxy`], but each connection waits `delay` before it is relayed,
+/// so connects stay in flight that long.
+pub async fn proxy_delayed(target: SocketAddr, delay: Duration) -> (SocketAddr, Arc<Wire>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let wire = Arc::new(Wire::default());
@@ -254,6 +260,7 @@ pub async fn proxy(target: SocketAddr) -> (SocketAddr, Arc<Wire>) {
         while let Ok((client, _)) = listener.accept().await {
             let wire = shared.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
                 let _ = relay(client, target, wire).await;
             });
         }
@@ -311,4 +318,29 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     let _ = to_server.shutdown().await;
     let _ = down.await;
     Ok(())
+}
+
+/// A listener that accepts connections and never answers, so connects to it
+/// stall until their deadline.
+pub async fn stall_listener() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    addr
+}
+
+/// A configuration that is never dialed (or only reaches `addr`).
+pub fn unused_config(addr: SocketAddr) -> Config {
+    format!(
+        "host={} port={} user=pool dbname=pool sslmode=disable",
+        addr.ip(),
+        addr.port()
+    )
+    .parse()
+    .unwrap()
 }
