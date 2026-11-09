@@ -28,7 +28,25 @@ pub async fn connect<T>(
 where
     T: MakeTlsConnect<Socket>,
 {
-    connect_with_tls_ref(&mut tls, config, None).await
+    // Administrative, migration and probe clients connect directly. They get
+    // the same bounds as load-balanced acquisitions: each host attempt
+    // (DNS, TCP, TLS, authentication) within `yb_attempt_timeout`, the whole
+    // call within `yb_acquire_timeout`.
+    match time::timeout(
+        config.yb_acquire_timeout,
+        connect_with_tls_ref(&mut tls, config, Some(config.yb_attempt_timeout)),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::connect(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "no connection was established within the {:?} acquisition budget",
+                config.yb_acquire_timeout
+            ),
+        ))),
+    }
 }
 
 /// Same as [`connect`], but borrows the `MakeTlsConnect` instead of taking it by
@@ -288,14 +306,14 @@ fn establish_control_connection<T>(
         Ok(inner) => inner,
         Err(_) => {
             warn!(
-                "Control connection to {} did not finish connecting, TLS and \
+                "Connection to {} did not finish connecting, TLS and \
                  authentication within {:?}, giving up on it",
                 target, limit
             );
             Err(Error::connect(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "control connection to {} was not established within {:?}",
+                    "connection to {} was not established within {:?}",
                     target, limit
                 ),
             )))
