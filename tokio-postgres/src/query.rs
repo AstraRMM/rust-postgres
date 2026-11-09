@@ -1,11 +1,11 @@
 use crate::client::{InnerClient, Responses};
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
+use crate::observe::Class;
 use crate::types::{BorrowToSql, IsNull};
 use crate::{Error, Portal, Row, Statement};
 use bytes::{Bytes, BytesMut};
 use futures_util::{ready, Stream};
-use crate::observe::Class;
 use log::debug;
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::{CommandCompleteBody, Message};
@@ -134,7 +134,8 @@ async fn start(
     buf: Bytes,
     purpose: Option<Class>,
 ) -> Result<Responses, Error> {
-    let mut responses = client.send_for(RequestMessages::Single(FrontendMessage::Raw(buf)), purpose)?;
+    let mut responses =
+        client.send_for(RequestMessages::Single(FrontendMessage::Raw(buf)), purpose)?;
 
     match responses.next().await? {
         Message::BindComplete => {}

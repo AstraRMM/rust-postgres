@@ -164,7 +164,8 @@ macro_rules! quantities {
             $( $(#[$doc])* pub $name: u64, )*
         }
 
-        #[allow(non_camel_case_types)]
+        // Every quantity has a variant; only some are recorded one at a time.
+        #[allow(non_camel_case_types, dead_code)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub(crate) enum Q {
             $( $name, )*
@@ -483,10 +484,9 @@ impl Totals {
     pub fn render_prometheus(&self, namespace: &str) -> String {
         assert!(
             !namespace.is_empty()
-                && namespace
-                    .bytes()
-                    .enumerate()
-                    .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())),
+                && namespace.bytes().enumerate().all(|(i, b)| b == b'_'
+                    || b.is_ascii_alphabetic()
+                    || (i > 0 && b.is_ascii_digit())),
             "invalid metric namespace"
         );
         let mut out = String::new();
@@ -503,7 +503,10 @@ impl Totals {
                 }
             }
         }
-        let _ = writeln!(out, "# TYPE {namespace}_sql_wire_socket_bytes_total counter");
+        let _ = writeln!(
+            out,
+            "# TYPE {namespace}_sql_wire_socket_bytes_total counter"
+        );
         for role in SocketRole::ALL {
             let s = self.sockets(role);
             for (encryption, direction, value) in [
@@ -519,7 +522,10 @@ impl Totals {
                 );
             }
         }
-        let _ = writeln!(out, "# TYPE {namespace}_sql_wire_sockets_opened_total counter");
+        let _ = writeln!(
+            out,
+            "# TYPE {namespace}_sql_wire_sockets_opened_total counter"
+        );
         for role in SocketRole::ALL {
             let _ = writeln!(
                 out,
@@ -534,10 +540,16 @@ impl Totals {
             ("abandoned", self.late_abandoned),
             ("other", self.late_other),
         ] {
-            let _ = writeln!(out, "{namespace}_sql_wire_late_total{{kind=\"{kind}\"}} {value}");
+            let _ = writeln!(
+                out,
+                "{namespace}_sql_wire_late_total{{kind=\"{kind}\"}} {value}"
+            );
         }
         let _ = writeln!(out, "# TYPE {namespace}_sql_wire_scopes_total counter");
-        let _ = writeln!(out, "# TYPE {namespace}_sql_wire_route_cycles_completed_total counter");
+        let _ = writeln!(
+            out,
+            "# TYPE {namespace}_sql_wire_route_cycles_completed_total counter"
+        );
         for route in &self.routes {
             for (outcome, value) in [
                 ("complete", route.complete_scopes),
@@ -605,7 +617,9 @@ static ROUTES: Mutex<Vec<RouteTotals>> = Mutex::new(Vec::new());
 
 // Observation must never turn poisoned metadata into a database panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn load(row: &[AtomicU64; QUANTITIES]) -> ClassCounts {
@@ -1111,7 +1125,11 @@ impl SocketObservation {
             };
         }
         if enabled() {
-            let column = if self.negotiation == NEGOTIATION_TLS { 3 } else { 1 };
+            let column = if self.negotiation == NEGOTIATION_TLS {
+                3
+            } else {
+                1
+            };
             SOCKETS[self.role as usize][column].fetch_add(buf.len() as u64, Relaxed);
         }
     }

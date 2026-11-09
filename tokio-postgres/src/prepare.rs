@@ -69,8 +69,10 @@ pub async fn prepare(
 ) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = encode(client, &name, query, types)?;
-    let mut responses =
-        client.send_for(RequestMessages::Single(FrontendMessage::Raw(buf)), PREPARATION)?;
+    let mut responses = client.send_for(
+        RequestMessages::Single(FrontendMessage::Raw(buf)),
+        PREPARATION,
+    )?;
 
     match responses.next().await? {
         Message::ParseComplete => {}

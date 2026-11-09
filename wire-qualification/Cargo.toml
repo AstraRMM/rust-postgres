@@ -1,0 +1,12 @@
+[package]
+name = "wire-qualification"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Real-engine qualification of semantic SQL wire observation and log privacy (AST-2133)"
+
+[dependencies]
+yb-tokio-postgres = { path = "../tokio-postgres", features = ["rustls-aws-lc-rs"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "io-util", "sync"] }
+futures-util = "0.3"
+log = "0.4"

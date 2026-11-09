@@ -10,6 +10,7 @@ members = [
     "postgres-types",
     "tokio-postgres",
     "tls-qualification",
+    "wire-qualification",
 ]
 resolver = "2"
 
