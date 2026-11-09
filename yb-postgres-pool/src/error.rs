@@ -2,7 +2,6 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::io;
 use std::sync::Arc;
 use yb_tokio_postgres::error::{DbError, Severity, SqlState};
 
@@ -215,17 +214,6 @@ pub fn is_stale_statement(error: &yb_tokio_postgres::Error) -> bool {
         || message.contains("catalog version mismatch")
 }
 
-fn has_io_source(error: &yb_tokio_postgres::Error) -> bool {
-    let mut source = error.source();
-    while let Some(err) = source {
-        if err.downcast_ref::<io::Error>().is_some() {
-            return true;
-        }
-        source = err.source();
-    }
-    false
-}
-
 /// Maps a driver error onto an [`ErrorKind`].
 pub fn classify(error: &yb_tokio_postgres::Error) -> ErrorKind {
     if error.is_security_failure() {
@@ -254,17 +242,12 @@ pub fn classify(error: &yb_tokio_postgres::Error) -> ErrorKind {
         }
         return ErrorKind::Database;
     }
-    if error.is_closed() || has_io_source(error) {
+    // The driver's own classification (AST-2129): I/O, protocol, closed,
+    // connect and timeout failures, never security failures.
+    if error.is_transport() {
         return ErrorKind::Transport;
     }
     let text = error.to_string();
-    if text.starts_with("timeout waiting for server")
-        || text.starts_with("error connecting to server")
-        || text.starts_with("unexpected message from server")
-        || text.starts_with("error parsing response from server")
-    {
-        return ErrorKind::Transport;
-    }
     if text.starts_with("invalid configuration") || text.starts_with("invalid connection string") {
         return ErrorKind::Config;
     }

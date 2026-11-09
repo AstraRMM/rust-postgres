@@ -53,12 +53,44 @@ impl Drop for NativeConnection {
     }
 }
 
-/// Removes a connection from the live registry and returns its permit when
+/// The pool-capacity and process-wide permits one physical connection
+/// holds from just before it dials until its socket is closed.
+struct Permits {
+    _pool: OwnedSemaphorePermit,
+    _process: OwnedSemaphorePermit,
+}
+
+/// Removes a connection from the live registry and returns its permits when
 /// its task ends, completes or is aborted.
 struct LiveGuard {
     live: Weak<Mutex<HashMap<u64, AbortHandle>>>,
     id: u64,
-    _permit: OwnedSemaphorePermit,
+    _permits: Permits,
+}
+
+/// Counts an open (dial) in progress for as long as it runs.
+struct Opening<'a>(&'a AtomicU64);
+
+impl<'a> Opening<'a> {
+    fn start(counter: &'a AtomicU64) -> Opening<'a> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Opening(counter)
+    }
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts a checkout in progress (activity for pool-set eviction).
+struct Waiting<'a>(&'a AtomicU64);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for LiveGuard {
@@ -75,9 +107,19 @@ pub(crate) struct Shared<T: PoolTls> {
     pub(crate) config: PoolConfig,
     init_sql: Option<String>,
     limiter: ConnectionLimiter,
+    /// `max_size` permits, held per physical connection exactly like the
+    /// process-wide ones, so physical connections (including dials in
+    /// flight and sockets still closing) never exceed `max_size`, whoever
+    /// opens them (bb8 or warm-floor maintenance).
+    capacity: ConnectionLimiter,
     pub(crate) stats: Arc<Stats>,
     label: String,
     closed: AtomicBool,
+    shutdown_signal: Notify,
+    /// Dials in progress.
+    opening: AtomicU64,
+    /// Checkouts in progress.
+    waiting: AtomicU64,
     /// Connect failures and shutdown wake waiters: a failed connect is
     /// final (the driver already spent its bounded acquisition budget, and
     /// security failures are terminal), so waiters get its error.
@@ -112,49 +154,97 @@ impl<T: PoolTls> Shared<T> {
     }
 
     /// Opens one physical connection within `connect_timeout`. With
-    /// `wait_for_permit` false the process-wide limiter is only tried, never
-    /// waited on (warm-floor maintenance).
+    /// `wait_for_permit` false the pool-capacity and process-wide permits are
+    /// only tried, never waited on (warm-floor maintenance). Shutdown cancels
+    /// a dial in progress, and a dial that completes after shutdown began is
+    /// closed instead of being pooled.
     async fn open(self: &Arc<Self>, wait_for_permit: bool) -> Result<NativeConnection, PoolError> {
         if self.is_closed() {
             return Err(PoolError::kind_only(ErrorKind::PoolClosed));
         }
+        let _opening = Opening::start(&self.opening);
         let started = Instant::now();
         let budget = self.config.connect_timeout;
-        let permit = if wait_for_permit {
-            self.limiter.acquire(budget).await
-        } else {
-            self.limiter.try_acquire()
+        let attempt = self.attempt(wait_for_permit, started, budget);
+        let result = tokio::select! {
+            biased;
+            _ = self.until_closed() => Err(PoolError::new(
+                ErrorKind::PoolClosed,
+                "pool shut down while connecting",
+            )),
+            result = attempt => result,
         };
-        let result = match permit {
-            Ok(permit) => {
-                let remaining = budget.saturating_sub(started.elapsed());
-                match tokio::time::timeout(remaining, self.dial(permit)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(PoolError::new(
-                        ErrorKind::Transport,
-                        format!("connect did not complete within {:?}", budget),
-                    )),
-                }
+        let result = match result {
+            Ok(mut conn) if self.is_closed() => {
+                conn.retire = Some(Retire::Shutdown);
+                Err(PoolError::new(
+                    ErrorKind::PoolClosed,
+                    "pool shut down while connecting",
+                ))
             }
-            Err(e) => Err(e),
+            other => other,
         };
         match &result {
             Ok(_) => {
                 bump(&self.stats.connects);
                 add_duration(&self.stats.connect_nanos, started.elapsed());
             }
-            Err(e) if wait_for_permit || e.kind() != ErrorKind::ProcessLimit => {
-                self.record_connect_failure(e)
-            }
-            Err(_) => {}
+            Err(e) if e.kind() == ErrorKind::PoolClosed => {}
+            Err(e) if !wait_for_permit && e.kind() == ErrorKind::ProcessLimit => {}
+            Err(e) if !wait_for_permit && e.kind() == ErrorKind::AcquireTimeout => {}
+            Err(e) => self.record_connect_failure(e),
         }
         result
     }
 
-    async fn dial(
+    async fn attempt(
         self: &Arc<Self>,
-        permit: OwnedSemaphorePermit,
+        wait_for_permit: bool,
+        started: Instant,
+        budget: Duration,
     ) -> Result<NativeConnection, PoolError> {
+        let capacity = if wait_for_permit {
+            self.capacity.acquire(budget).await
+        } else {
+            self.capacity.try_acquire()
+        }
+        .map_err(|e| {
+            e.with_kind(ErrorKind::AcquireTimeout)
+                .with_message("pool capacity held by connections still open or closing")
+        })?;
+        let remaining = budget.saturating_sub(started.elapsed());
+        let process = if wait_for_permit {
+            self.limiter.acquire(remaining).await
+        } else {
+            self.limiter.try_acquire()
+        }?;
+        let permits = Permits {
+            _pool: capacity,
+            _process: process,
+        };
+        let remaining = budget.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, self.dial(permits)).await {
+            Ok(result) => result,
+            Err(_) => Err(PoolError::new(
+                ErrorKind::Transport,
+                format!("connect did not complete within {:?}", budget),
+            )),
+        }
+    }
+
+    async fn until_closed(&self) {
+        loop {
+            let notified = self.shutdown_signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn dial(self: &Arc<Self>, permits: Permits) -> Result<NativeConnection, PoolError> {
         let (client, connection) = self
             .pg
             .connect(self.tls.clone())
@@ -165,7 +255,7 @@ impl<T: PoolTls> Shared<T> {
         let guard = LiveGuard {
             live: Arc::downgrade(&self.live),
             id,
-            _permit: permit,
+            _permits: permits,
         };
         let stats = self.stats.clone();
         let label = self.label.clone();
@@ -364,6 +454,7 @@ impl<T: PoolTls> Shared<T> {
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.shutdown_signal.notify_waiters();
         *self.last_fatal.lock() = Some(PoolError::kind_only(ErrorKind::PoolClosed));
         self.fatal_seq.fetch_add(1, Ordering::SeqCst);
         self.fatal.notify_waiters();
@@ -512,6 +603,10 @@ pub struct PoolState {
     pub idle: u32,
     /// Clients currently borrowed (including ones in return cleanup).
     pub borrowed: u32,
+    /// Physical connects in progress.
+    pub opening: u32,
+    /// Checkouts in progress.
+    pub waiting: u32,
     /// Permits in use on the shared process-wide limiter.
     pub limiter_in_use: u32,
     /// The process-wide limit.
@@ -592,9 +687,13 @@ impl<T: PoolTls> Pool<T> {
             config: config.clone(),
             init_sql,
             limiter,
+            capacity: ConnectionLimiter::new(config.max_size),
             stats: Arc::new(Stats::default()),
             label: label.to_string(),
             closed: AtomicBool::new(false),
+            shutdown_signal: Notify::new(),
+            opening: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
             fatal: Notify::new(),
             fatal_seq: AtomicU64::new(0),
             connect_error_seq: AtomicU64::new(0),
@@ -668,6 +767,9 @@ impl<T: PoolTls> Pool<T> {
             return Err(PoolError::kind_only(ErrorKind::PoolClosed));
         }
         let budget = budget.min(shared.config.acquire_timeout);
+        shared.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting(&shared.waiting);
+        shared.touch();
         let error_seq = shared.connect_error_seq.load(Ordering::SeqCst);
         let fatal_seq = shared.fatal_seq.load(Ordering::SeqCst);
         let get = tokio::time::timeout(budget, self.inner.pool.get_owned());
@@ -704,7 +806,9 @@ impl<T: PoolTls> Pool<T> {
         let mut opened = 0;
         let _serial = shared.warm_lock.lock().await;
         while !shared.is_closed() {
-            let have = self.inner.pool.state().connections;
+            // Dials already in flight (bb8's or ours) count toward the floor.
+            let have =
+                self.inner.pool.state().connections + shared.opening.load(Ordering::SeqCst) as u32;
             if have >= floor {
                 shared.stats.warm_deficit.store(0, Ordering::Relaxed);
                 break;
@@ -722,7 +826,8 @@ impl<T: PoolTls> Pool<T> {
                     }
                 },
                 Err(_) => {
-                    let have = self.inner.pool.state().connections;
+                    let have = self.inner.pool.state().connections
+                        + shared.opening.load(Ordering::SeqCst) as u32;
                     shared
                         .stats
                         .warm_deficit
@@ -743,6 +848,8 @@ impl<T: PoolTls> Pool<T> {
             pooled: bb8_state.connections,
             idle: bb8_state.idle_connections,
             borrowed: shared.borrowed.load(Ordering::SeqCst) as u32,
+            opening: shared.opening.load(Ordering::SeqCst) as u32,
+            waiting: shared.waiting.load(Ordering::SeqCst) as u32,
             limiter_in_use: shared.limiter.in_use(),
             limiter_max: shared.limiter.max(),
             stats: shared.stats.snapshot(),
@@ -770,8 +877,24 @@ impl<T: PoolTls> Pool<T> {
         self.inner.shared.last_activity.lock().elapsed()
     }
 
-    pub(crate) fn borrowed(&self) -> u64 {
-        self.inner.shared.borrowed.load(Ordering::SeqCst)
+    pub(crate) fn touch(&self) {
+        self.inner.shared.touch();
+    }
+
+    /// Whether anything is borrowed, being checked out or being opened.
+    pub(crate) fn busy(&self) -> bool {
+        let shared = &self.inner.shared;
+        shared.borrowed.load(Ordering::SeqCst) > 0
+            || shared.waiting.load(Ordering::SeqCst) > 0
+            || shared.opening.load(Ordering::SeqCst) > 0
+    }
+
+    /// Drops every idle connection (each fails the checkout check once the
+    /// pool is closed).
+    async fn drain_idle(&self) {
+        if self.inner.pool.state().idle_connections > 0 {
+            let _ = tokio::time::timeout(Duration::from_millis(20), self.inner.pool.get()).await;
+        }
     }
 
     /// Closes the pool: refuses new checkouts (waiters fail with
@@ -781,8 +904,12 @@ impl<T: PoolTls> Pool<T> {
     pub async fn shutdown(&self, drain: Duration) -> ShutdownReport {
         let shared = &self.inner.shared;
         shared.close();
-        // Every idle connection fails the checkout check now and is dropped.
-        let _ = tokio::time::timeout(Duration::from_millis(50), self.inner.pool.get()).await;
+        // Dials in flight see the shutdown signal and end.
+        let opens = Instant::now() + Duration::from_secs(1);
+        while shared.opening.load(Ordering::SeqCst) > 0 && Instant::now() < opens {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.drain_idle().await;
         let deadline = Instant::now() + drain;
         loop {
             let notified = shared.released.notified();
@@ -807,9 +934,17 @@ impl<T: PoolTls> Pool<T> {
                 bump(&shared.stats.forced_closes);
             }
         }
-        // Closing sockets is asynchronous; give the tasks a moment.
+        // Closing sockets is asynchronous; give the tasks a moment, and
+        // close anything a dial that finished concurrently handed to bb8.
         let settle = Instant::now() + Duration::from_secs(1);
-        while !shared.live.lock().is_empty() && Instant::now() < settle {
+        loop {
+            self.drain_idle().await;
+            let quiet = shared.opening.load(Ordering::SeqCst) == 0
+                && self.inner.pool.state().idle_connections == 0
+                && shared.live.lock().is_empty();
+            if quiet || Instant::now() >= settle {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         ShutdownReport {
