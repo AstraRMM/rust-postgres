@@ -2,6 +2,7 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCod
 use crate::copy_in::CopyInReceiver;
 use crate::error::DbError;
 use crate::maybe_tls_stream::MaybeTlsStream;
+use crate::session_status::SessionShared;
 use crate::{AsyncMessage, Error, Notification};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -13,6 +14,7 @@ use postgres_protocol::message::frontend;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -54,6 +56,13 @@ pub struct Connection<S, T> {
     pending_responses: VecDeque<BackendMessage>,
     responses: VecDeque<Response>,
     state: State,
+    session: Arc<SessionShared>,
+}
+
+impl<S, T> Drop for Connection<S, T> {
+    fn drop(&mut self) {
+        self.session.connection_dropped();
+    }
 }
 
 impl<S, T> Connection<S, T> {
@@ -78,6 +87,7 @@ where
         pending_responses: VecDeque<BackendMessage>,
         parameters: HashMap<String, String>,
         receiver: mpsc::UnboundedReceiver<Request>,
+        session: Arc<SessionShared>,
     ) -> Connection<S, T> {
         Connection {
             stream,
@@ -87,6 +97,7 @@ where
             pending_responses,
             responses: VecDeque::new(),
             state: State::Active,
+            session,
         }
     }
 
@@ -138,6 +149,7 @@ where
                         body.name().map_err(Error::parse)?.to_string(),
                         body.value().map_err(Error::parse)?.to_string(),
                     );
+                    self.session.parameter_changed();
                     continue;
                 }
                 BackendMessage::Async(_) => unreachable!(),
@@ -155,8 +167,21 @@ where
                 },
             };
 
+            // The codec ends a completed request's chunk with its
+            // ReadyForQuery, whose last byte is the transaction status.
+            let ready_status = if request_complete {
+                messages.ready_status()
+            } else {
+                None
+            };
             match response.sender.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
+                    // Publish the status before the client can observe the
+                    // response, so a caller that has read ReadyForQuery
+                    // never sees a stale status.
+                    if request_complete {
+                        self.session.request_complete(ready_status);
+                    }
                     let _ = response.sender.start_send(messages);
                     if !request_complete {
                         self.responses.push_front(response);
@@ -164,7 +189,9 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     // we need to keep paging through the rest of the messages even if the receiver's hung up
-                    if !request_complete {
+                    if request_complete {
+                        self.session.request_complete(ready_status);
+                    } else {
                         self.responses.push_front(response);
                     }
                 }
