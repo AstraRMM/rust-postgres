@@ -431,7 +431,7 @@ impl Client {
     /// ```no_run
     /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let mut transaction = client.transaction()?;

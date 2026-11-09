@@ -53,7 +53,7 @@ fn url() {
     check("postgresql://", &Config::new());
     check(
         "postgresql://localhost",
-        Config::new().host("localhost").port(5432),
+        Config::new().host("localhost").port(5433),
     );
     check(
         "postgresql://localhost:5433",
@@ -61,11 +61,11 @@ fn url() {
     );
     check(
         "postgresql://localhost/mydb",
-        Config::new().host("localhost").port(5432).dbname("mydb"),
+        Config::new().host("localhost").port(5433).dbname("mydb"),
     );
     check(
         "postgresql://user@localhost",
-        Config::new().user("user").host("localhost").port(5432),
+        Config::new().user("user").host("localhost").port(5433),
     );
     check(
         "postgresql://user:secret@localhost",
@@ -73,14 +73,14 @@ fn url() {
             .user("user")
             .password("secret")
             .host("localhost")
-            .port(5432),
+            .port(5433),
     );
     check(
         "postgresql://other@localhost/otherdb?connect_timeout=10&application_name=myapp",
         Config::new()
             .user("other")
             .host("localhost")
-            .port(5432)
+            .port(5433)
             .dbname("otherdb")
             .connect_timeout(Duration::from_secs(10))
             .application_name("myapp"),
@@ -104,7 +104,7 @@ fn url() {
         "postgresql://[2001:db8::1234]/database",
         Config::new()
             .host("2001:db8::1234")
-            .port(5432)
+            .port(5433)
             .dbname("database"),
     );
     check(
@@ -126,7 +126,7 @@ fn url() {
         "postgresql://%2Fvar%2Flib%2Fpostgresql/dbname",
         Config::new()
             .host_path("/var/lib/postgresql")
-            .port(5432)
+            .port(5433)
             .dbname("dbname"),
     )
 }
