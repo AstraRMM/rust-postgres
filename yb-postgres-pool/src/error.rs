@@ -121,11 +121,6 @@ impl PoolError {
         self
     }
 
-    pub(crate) fn caused_by(mut self, source: Option<Arc<yb_tokio_postgres::Error>>) -> PoolError {
-        self.source = source;
-        self
-    }
-
     /// Classifies a driver error.
     pub fn from_driver(error: yb_tokio_postgres::Error) -> PoolError {
         PoolError {

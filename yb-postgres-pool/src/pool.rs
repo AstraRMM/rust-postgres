@@ -83,6 +83,7 @@ pub(crate) struct Shared<T: PoolTls> {
     fatal_seq: AtomicU64,
     connect_error_seq: AtomicU64,
     last_error: Mutex<Option<PoolError>>,
+    last_fatal: Mutex<Option<PoolError>>,
     live: Arc<Mutex<HashMap<u64, AbortHandle>>>,
     next_id: AtomicU64,
     epoch: AtomicU64,
@@ -103,6 +104,7 @@ impl<T: PoolTls> Shared<T> {
         *self.last_error.lock() = Some(error.clone());
         self.connect_error_seq.fetch_add(1, Ordering::SeqCst);
         if matches!(error.kind(), ErrorKind::Security | ErrorKind::Config) {
+            *self.last_fatal.lock() = Some(error.clone());
             self.fatal_seq.fetch_add(1, Ordering::SeqCst);
             self.fatal.notify_waiters();
         }
@@ -353,7 +355,7 @@ impl<T: PoolTls> Shared<T> {
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        *self.last_error.lock() = Some(PoolError::kind_only(ErrorKind::PoolClosed));
+        *self.last_fatal.lock() = Some(PoolError::kind_only(ErrorKind::PoolClosed));
         self.fatal_seq.fetch_add(1, Ordering::SeqCst);
         self.fatal.notify_waiters();
     }
@@ -365,7 +367,7 @@ impl<T: PoolTls> Shared<T> {
             notified.as_mut().enable();
             if self.fatal_seq.load(Ordering::SeqCst) > seq {
                 return self
-                    .last_error
+                    .last_fatal
                     .lock()
                     .clone()
                     .unwrap_or_else(|| PoolError::kind_only(ErrorKind::PoolClosed));
@@ -580,6 +582,7 @@ impl<T: PoolTls> Pool<T> {
             fatal_seq: AtomicU64::new(0),
             connect_error_seq: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            last_fatal: Mutex::new(None),
             live: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             epoch: AtomicU64::new(0),

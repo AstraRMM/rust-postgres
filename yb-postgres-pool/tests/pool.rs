@@ -1084,11 +1084,18 @@ async fn protocol_cost_of_checkout_probe_and_reset() {
 async fn verify_full_generation_retirement() {
     use yb_postgres_pool::yb_tokio_postgres::rustls::{MakeRustlsConnect, TlsMaterial, TlsOptions};
     use yb_postgres_pool::yb_tokio_postgres::Config;
-    let (port, roots) = match (
+    let (port, roots, wrong_roots) = match (
         std::env::var("POOL_TEST_TLS_PG"),
         std::env::var("POOL_TEST_TLS_ROOTS"),
     ) {
-        (Ok(port), Ok(roots)) => (port, std::fs::read(roots).unwrap()),
+        (Ok(port), Ok(roots)) => {
+            let wrong = std::path::Path::new(&roots).with_file_name("ca-b.crt");
+            (
+                port,
+                std::fs::read(&roots).unwrap(),
+                std::fs::read(wrong).unwrap(),
+            )
+        }
         _ => {
             assert!(
                 !require(),
@@ -1176,4 +1183,19 @@ async fn verify_full_generation_retirement() {
         eventually_backends(&admin, app, 0, Duration::from_secs(5)).await,
         0
     );
+
+    // A verification failure is a typed security error and ends the wait at
+    // once instead of surfacing as an acquisition timeout.
+    let wrong =
+        MakeRustlsConnect::new(&TlsMaterial::from_pem(wrong_roots), TlsOptions::new()).unwrap();
+    let mut wrong_config = short("pt_tls_wrong_ca");
+    wrong_config.acquire_timeout = Duration::from_secs(8);
+    let pool = Pool::new(conninfo.parse().unwrap(), wrong, wrong_config).unwrap();
+    let started = Instant::now();
+    let err = pool.get().await.unwrap_err();
+    let took = started.elapsed();
+    println!("wrong CA: {} ({:?}) after {:?}", err, err.kind(), took);
+    assert_eq!(err.kind(), ErrorKind::Security, "{err}");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    pool.shutdown(Duration::from_secs(1)).await;
 }

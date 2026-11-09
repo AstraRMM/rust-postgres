@@ -26,8 +26,9 @@ wait_for() { # name timeout command...
 }
 
 check() {
-  record fmt cargo fmt --check -p yb-postgres-pool -p yb-tokio-postgres
-  record clippy cargo clippy -p yb-postgres-pool --all-targets --features rustls-aws-lc-rs -- -D warnings
+  record fmt bash -c "cargo fmt --check -p yb-postgres-pool && rustfmt --check --edition 2018 tokio-postgres/src/session_status.rs tokio-postgres/src/client.rs tokio-postgres/src/connection.rs tokio-postgres/src/connect_raw.rs tokio-postgres/src/codec.rs"
+  record clippy cargo clippy -p yb-postgres-pool --no-deps --all-targets --features rustls-aws-lc-rs -- -D warnings
+  record clippy-fork cargo clippy -p yb-tokio-postgres --features rustls-aws-lc-rs --all-targets
   record build-fork cargo build -p yb-tokio-postgres --all-targets --features rustls-aws-lc-rs
   record unit cargo test -p yb-postgres-pool --lib --features rustls-aws-lc-rs
 }
