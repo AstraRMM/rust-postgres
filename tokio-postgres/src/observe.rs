@@ -389,7 +389,8 @@ impl Counts {
 /// Process totals per [`SocketRole`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SocketCounts {
-    /// Sockets connected.
+    /// Sockets that carried at least one byte, counted once under their
+    /// final role.
     pub opened: u64,
     /// Bytes written while the socket carried plaintext (including the TLS
     /// negotiation request).
@@ -1064,21 +1065,74 @@ pub(crate) fn session(ok: bool) {
 // ---------------------------------------------------------------------------
 // Socket bytes.
 
-const NEGOTIATION_FRESH: u8 = 0;
-const NEGOTIATION_REQUESTED: u8 = 1;
-const NEGOTIATION_PLAIN: u8 = 2;
-const NEGOTIATION_TLS: u8 = 3;
-
 /// The PostgreSQL `SSLRequest` frame: length 8, code 80877103.
 const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Negotiation {
+    /// The first frontend bytes so far are this many bytes of an
+    /// `SSLRequest` (a short write can split it).
+    Fresh(u8),
+    /// A complete `SSLRequest` was written; the server's answer decides.
+    Requested,
+    Plain,
+    Tls,
+}
+
+impl Negotiation {
+    fn wrote(&mut self, buf: &[u8]) {
+        if let Negotiation::Fresh(matched) = *self {
+            let matched = matched as usize;
+            let want = &SSL_REQUEST[matched..];
+            let take = buf.len().min(want.len());
+            *self = if buf[..take] != want[..take] || buf.len() > want.len() {
+                Negotiation::Plain
+            } else if matched + take == SSL_REQUEST.len() {
+                Negotiation::Requested
+            } else {
+                Negotiation::Fresh((matched + take) as u8)
+            };
+        }
+    }
+
+    /// Returns whether `buf` was read while the socket carried TLS.
+    fn read(&mut self, buf: &[u8]) -> bool {
+        let encrypted = *self == Negotiation::Tls;
+        match (*self, buf.first()) {
+            (Negotiation::Requested, Some(b'S')) => *self = Negotiation::Tls,
+            (Negotiation::Requested, Some(_)) | (Negotiation::Fresh(_), Some(_)) => {
+                *self = Negotiation::Plain
+            }
+            _ => {}
+        }
+        encrypted
+    }
+}
+
+/// Classifies a byte sequence the way a runtime socket does: returns whether
+/// the socket is encrypted after the given frontend writes and backend
+/// reads. Exposed only for the qualification suite.
+#[doc(hidden)]
+pub fn __negotiation_is_encrypted(writes: &[&[u8]], reads: &[&[u8]]) -> bool {
+    let mut negotiation = Negotiation::Fresh(0);
+    for buf in writes.iter().filter(|b| !b.is_empty()) {
+        negotiation.wrote(buf);
+    }
+    for buf in reads {
+        negotiation.read(buf);
+    }
+    negotiation == Negotiation::Tls
+}
+
 /// Byte accounting for one runtime socket. The plaintext/encrypted split
 /// follows the protocol: a socket is encrypted from the byte after the
-/// server's `S` answer to an `SSLRequest`.
+/// server's `S` answer to an `SSLRequest`. A socket is counted as opened,
+/// once and under its final role, when it first carries a byte.
 #[derive(Debug)]
 pub(crate) struct SocketObservation {
     role: SocketRole,
-    negotiation: u8,
+    negotiation: Negotiation,
+    counted: bool,
 }
 
 impl SocketObservation {
@@ -1087,62 +1141,52 @@ impl SocketObservation {
             Some(Class::Discovery) => SocketRole::Discovery,
             _ => SocketRole::Data,
         };
-        let observation = SocketObservation {
+        SocketObservation {
             role,
-            negotiation: NEGOTIATION_FRESH,
-        };
-        observation.opened();
-        observation
-    }
-
-    fn opened(&self) {
-        if enabled() {
-            SOCKETS[self.role as usize][0].fetch_add(1, Relaxed);
+            negotiation: Negotiation::Fresh(0),
+            counted: false,
         }
     }
 
+    /// Sets the role. Callers set it before the first byte is written, so
+    /// the opening is counted once under the final role.
     pub(crate) fn set_role(&mut self, role: SocketRole) {
-        if enabled() && role != self.role {
-            SOCKETS[self.role as usize][0].fetch_sub(1, Relaxed);
-            self.role = role;
-            self.opened();
-        }
         self.role = role;
     }
 
     #[inline]
-    pub(crate) fn wrote(&mut self, buf: &[u8]) {
-        if self.negotiation == NEGOTIATION_FRESH {
-            self.negotiation = if buf == SSL_REQUEST {
-                NEGOTIATION_REQUESTED
-            } else {
-                NEGOTIATION_PLAIN
-            };
-        }
+    fn count(&mut self, column: usize, bytes: usize) {
         if enabled() {
-            let column = if self.negotiation == NEGOTIATION_TLS {
-                3
-            } else {
-                1
-            };
-            SOCKETS[self.role as usize][column].fetch_add(buf.len() as u64, Relaxed);
+            let row = &SOCKETS[self.role as usize];
+            if !self.counted {
+                self.counted = true;
+                row[0].fetch_add(1, Relaxed);
+            }
+            row[column].fetch_add(bytes as u64, Relaxed);
         }
     }
 
     #[inline]
+    pub(crate) fn wrote(&mut self, buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
+        self.negotiation.wrote(buf);
+        let column = if self.negotiation == Negotiation::Tls {
+            3
+        } else {
+            1
+        };
+        self.count(column, buf.len());
+    }
+
+    #[inline]
     pub(crate) fn read(&mut self, buf: &[u8]) {
-        let encrypted = self.negotiation == NEGOTIATION_TLS;
-        if self.negotiation == NEGOTIATION_REQUESTED && !buf.is_empty() {
-            self.negotiation = if buf[0] == b'S' {
-                NEGOTIATION_TLS
-            } else {
-                NEGOTIATION_PLAIN
-            };
+        if buf.is_empty() {
+            return;
         }
-        if enabled() {
-            let column = if encrypted { 4 } else { 2 };
-            SOCKETS[self.role as usize][column].fetch_add(buf.len() as u64, Relaxed);
-        }
+        let column = if self.negotiation.read(buf) { 4 } else { 2 };
+        self.count(column, buf.len());
     }
 }
 

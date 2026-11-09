@@ -280,6 +280,7 @@ async fn pg_cancellation_dropped_futures_and_killed_sessions() {
     let wire_before = settle(&proxy).await;
     let log_before = server_log(&admin, app).await;
     let sockets_before = *observe::totals().sockets(SocketRole::Cancel);
+    let data_before = *observe::totals().sockets(SocketRole::Data);
     let token = client.cancel_token();
     let ((), counts) = observe::scope("wq.cancel", async {
         let handle = observe::current().expect("inside a scope");
@@ -295,6 +296,7 @@ async fn pg_cancellation_dropped_futures_and_killed_sessions() {
     let wire = settle(&proxy).await.since(&wire_before);
     let log = server_log(&admin, app).await.since(&log_before);
     let sockets = *observe::totals().sockets(SocketRole::Cancel);
+    let data = *observe::totals().sockets(SocketRole::Data);
     print_counts("cancel", &counts);
     let total = counts.total();
     assert!(counts.is_complete(), "{counts:#?}");
@@ -310,6 +312,12 @@ async fn pg_cancellation_dropped_futures_and_killed_sessions() {
     assert_eq!(
         sockets.plaintext_bytes_sent - sockets_before.plaintext_bytes_sent,
         16
+    );
+    // Review finding 4: the cancel socket is counted once, as Cancel; the
+    // Data counter neither gains nor loses it.
+    assert_eq!(
+        data.opened, data_before.opened,
+        "cancel socket is not a data socket"
     );
     assert_wire("pg cancel", &total, &wire);
 
@@ -885,6 +893,37 @@ async fn representative_budgets() {
     let (_, counts) = observe::scope("budget.yb_warm", yb.query_one(&yb_stmt, &[&1i32])).await;
     budget("yb_warm_prepared", &counts, start.elapsed());
     assert_eq!(counts.total().cycles_completed, 1);
+}
+
+/// Review finding 2: the plaintext/encrypted split must survive an
+/// `SSLRequest` split across short writes.
+#[test]
+fn ssl_request_split_across_writes_is_still_detected() {
+    const SSL: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+    let encrypted = observe::__negotiation_is_encrypted;
+    assert!(encrypted(&[&SSL], &[b"S"]));
+    assert!(encrypted(&[&SSL[..3], &SSL[3..]], &[b"S"]));
+    let bytes: Vec<&[u8]> = SSL.iter().map(std::slice::from_ref).collect();
+    assert!(encrypted(&bytes, &[b"S"]), "one byte per write");
+    assert!(encrypted(
+        &[&SSL[..5], &[], &SSL[5..]],
+        &[b"S", b"\x16\x03"]
+    ));
+    assert!(
+        !encrypted(&[&SSL[..3], &SSL[3..]], &[b"N"]),
+        "server declined TLS"
+    );
+    assert!(
+        !encrypted(&[&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30]], &[b"S"]),
+        "not an SSLRequest"
+    );
+    assert!(
+        !encrypted(&[&[0, 0, 0, 9, 0, 3, 0, 0]], &[b"S"]),
+        "startup message"
+    );
+    let mut longer = SSL.to_vec();
+    longer.push(0);
+    assert!(!encrypted(&[&longer], &[b"S"]));
 }
 
 #[tokio::test]
