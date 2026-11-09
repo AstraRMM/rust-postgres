@@ -224,6 +224,15 @@ async fn wrong_dns_san_is_identity_mismatch_and_redacted() {
 }
 
 #[tokio::test]
+async fn security_failure_on_one_seed_is_not_hidden_by_another() {
+    let tls = connector(&roots("ca-a.crt"));
+    let conninfo = format!(
+        "host=wrong.test,localhost hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
+    );
+    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::IdentityMismatch);
+}
+
+#[tokio::test]
 async fn wrong_ip_san_is_identity_mismatch() {
     let tls = connector(&roots("ca-a.crt"));
     // PostgreSQL listens on every address; the certificate names only 127.0.0.1.
@@ -368,10 +377,15 @@ async fn single_validated_configuration_path_from_files() {
     let s = open_config(&config, &tls).await.unwrap();
     assert_eq!(scalar(&s.client, "select current_user").await, "postgres");
 
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let e = MakeRustlsConnect::from_config(&config, options()).unwrap_err();
-    assert_eq!(e.kind(), TlsConfigErrorKind::KeyPermissions);
-    assert!(!e.to_string().contains(dir.to_str().unwrap()), "{e}");
+    use std::os::unix::fs::MetadataExt;
+    let root_owned = std::fs::metadata(&key).unwrap().uid() == 0;
+    let rejected: &[u32] = if root_owned { &[0o644, 0o604, 0o660] } else { &[0o644, 0o640, 0o604, 0o660] };
+    for &mode in rejected {
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+        let e = MakeRustlsConnect::from_config(&config, options()).unwrap_err();
+        assert_eq!(e.kind(), TlsConfigErrorKind::KeyPermissions, "{mode:o}");
+        assert!(!e.to_string().contains(dir.to_str().unwrap()), "{e}");
+    }
 
     let half: Config = format!("host=localhost sslrootcert={} sslcert={}", dir.join("ca-a.crt").display(), dir.join("client-postgres.crt").display()).parse().unwrap();
     assert_eq!(MakeRustlsConnect::from_config(&half, options()).unwrap_err().kind(), TlsConfigErrorKind::IncompleteClientIdentity);

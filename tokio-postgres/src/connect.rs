@@ -186,6 +186,9 @@ where
 
         match outcome {
             Ok((client, connection)) => return Ok((client, connection)),
+            // A verification or authentication failure is never hidden by
+            // trying another seed.
+            Err(e) if e.is_security_failure() => return Err(e),
             Err(e) => error = Some(e),
         }
     }
@@ -1142,6 +1145,9 @@ where
                 .await
                 {
                     Ok(stream) => return Ok(stream),
+                    // Never let another resolved address mask a TLS or
+                    // authentication failure.
+                    Err(e) if e.is_security_failure() => return Err(e),
                     Err(e) => {
                         last_err = Some(e);
                         continue;

@@ -30,8 +30,10 @@ docker rm -f legacy-pg >/dev/null 2>&1
 docker run -d --name legacy-pg -p 5433:5433 -e POSTGRES_PASSWORD=postgres \
   -v "$root/docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh:ro" postgres:14 >/dev/null
 until docker exec legacy-pg pg_isready -h 127.0.0.1 -p 5433 >/dev/null 2>&1; do sleep 2; done
-(cd /tmp/base && CARGO_TARGET_DIR=/tmp/base-target cargo test -p yb-tokio-postgres --test test 2>&1 | grep -E "^test .*FAILED|^test result|panicked")
-(cd /tmp/base && CARGO_TARGET_DIR=/tmp/base-target cargo test -p yb-postgres 2>&1 | grep -E "FAILED|^test result")
+# Recorded separately: the base revision's own failures are the comparison
+# baseline for HEAD's legacy results, so they are reported, not hidden.
+record base-legacy-tokio-postgres bash -o pipefail -c 'cd /tmp/base && CARGO_TARGET_DIR=/tmp/base-target cargo test -p yb-tokio-postgres --test test 2>&1 | grep -E "^test .*FAILED|^test result|panicked"'
+record base-legacy-postgres bash -o pipefail -c 'cd /tmp/base && CARGO_TARGET_DIR=/tmp/base-target cargo test -p yb-postgres 2>&1 | grep -E "FAILED|^test result"'
 docker rm -f legacy-pg >/dev/null
 
 tls-qualification/rig/run.sh all || status=1

@@ -71,9 +71,9 @@ tls() {
 }
 
 case $mode in
-  legacy) legacy ;;
-  tls) tls ;;
-  all) legacy; tls ;;
+  legacy) legacy || status=1 ;;
+  tls) tls || status=1 ;;
+  all) legacy || status=1; tls || status=1 ;;
 esac
 step "summary status=$status"
 exit $status

@@ -337,16 +337,18 @@ fn read_credential(path: &Path, role: Role) -> Result<Vec<u8>, TlsConfigError> {
     #[cfg(unix)]
     {
         if role == Role::Key {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = file
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = file
                 .metadata()
-                .map_err(|_| TlsConfigError::new(TlsConfigErrorKind::Read, read_error))?
-                .permissions()
-                .mode();
-            if mode & 0o007 != 0 {
+                .map_err(|_| TlsConfigError::new(TlsConfigErrorKind::Read, read_error))?;
+            let mode = metadata.permissions().mode();
+            // libpq's rule: at most u=rw (0600), or u=rw,g=r (0640) when the
+            // file is owned by root.
+            let allowed = if metadata.uid() == 0 { 0o640 } else { 0o600 };
+            if mode & 0o777 & !allowed != 0 {
                 return Err(TlsConfigError::new(
                     TlsConfigErrorKind::KeyPermissions,
-                    "sslkey must not be readable or writable by other users",
+                    "sslkey must not be accessible to other users (0600, or 0640 when owned by root)",
                 ));
             }
         }
