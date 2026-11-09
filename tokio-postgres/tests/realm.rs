@@ -500,13 +500,16 @@ async fn node_removal_and_metadata_changes_reconcile_atomically() {
     drop(n2);
     cluster.publish(&[(&n1, "primary", "z1"), (&n2_new, "primary", "z1")]);
     n1.set(Behaviour::Refuse);
-    let s = connect(&config(&n2_new, "load_balance=true yb_servers_refresh_interval=0"), &realm).await.unwrap();
+    let s = connect(&config(&n2_new, "load_balance=true yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=0"), &realm).await.unwrap();
     assert_eq!(node_of(&s).await, n2_new.ip);
+    // The refused attempt may have quarantined n1; that is correct
+    // behaviour, so clear it rather than wait out the reconnect delay.
     n1.set(Behaviour::Accept);
+    realm.invalidate_topology();
 
     // Role change: n2 becomes a read replica, so only-primary avoids it.
     cluster.publish(&[(&n1, "primary", "z1"), (&n2_new, "read_replica", "z1")]);
-    let only_primary = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0");
+    let only_primary = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=0");
     for _ in 0..4 {
         assert_eq!(node_of(&connect(&only_primary, &realm).await.unwrap()).await, n1.ip);
     }
