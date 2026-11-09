@@ -11,6 +11,7 @@ use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 #[cfg(feature = "runtime")]
 use crate::Socket;
+use crate::endpoint::EndpointPolicy;
 use crate::{Client, Connection, Error};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -21,7 +22,9 @@ use std::ops::Deref;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::str;
 use std::str::FromStr;
 use std::time::Duration;
@@ -39,15 +42,36 @@ pub enum TargetSessionAttrs {
 }
 
 /// TLS configuration.
+///
+/// The default is [`SslMode::VerifyFull`]. A connection is only ever made in
+/// plaintext when the caller explicitly chooses [`SslMode::Disable`] (or the
+/// legacy [`SslMode::Prefer`]); the driver never silently falls back to
+/// plaintext from a mode that requires TLS.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SslMode {
     /// Do not use TLS.
     Disable,
     /// Attempt to connect with TLS but allow sessions without.
+    ///
+    /// Legacy libpq behaviour: an attacker who can answer the SSLRequest can
+    /// downgrade the session to plaintext. Never use it for service traffic.
     Prefer,
     /// Require the use of TLS.
+    ///
+    /// The mode itself only refuses plaintext; whether the peer is
+    /// authenticated depends entirely on the `TlsConnect` implementation
+    /// supplied by the caller. The built-in verifying connector refuses this
+    /// mode so that the service contract is always stated as `verify-full`.
     Require,
+    /// Require TLS, verify the server certificate chain against the
+    /// configured trust roots, and verify that the certificate is valid for
+    /// the expected TLS identity of the endpoint being dialled.
+    ///
+    /// Only the built-in rustls connector (`tokio_postgres::rustls`, cargo
+    /// feature `rustls`) can satisfy this mode. Any other connector, including
+    /// `NoTls`, is rejected before a single byte is written to the socket.
+    VerifyFull,
 }
 
 /// Channel binding configuration.
@@ -101,7 +125,15 @@ pub enum Host {
 /// * `options` - Command line options used to configure the server.
 /// * `application_name` - Sets the `application_name` parameter on the server.
 /// * `sslmode` - Controls usage of TLS. If set to `disable`, TLS will not be used. If set to `prefer`, TLS will be used
-///     if available, but not used otherwise. If set to `require`, TLS will be forced to be used. Defaults to `prefer`.
+///     if available, but not used otherwise (legacy; open to downgrade). If set to `require`, TLS will be forced to be
+///     used. If set to `verify-full`, TLS is required, the server certificate chain is verified against `sslrootcert`
+///     and the certificate must be valid for the expected TLS identity of every endpoint. Defaults to `verify-full`.
+///     `verify-ca` and `allow` are rejected: they do not authenticate the server.
+/// * `sslrootcert` - Path to a PEM file with the trust roots used to verify server certificates. Only these roots are
+///     trusted; the platform or WebPKI root store is never consulted.
+/// * `sslcert` - Path to a PEM file with the client certificate chain (leaf first) for mutual TLS.
+/// * `sslkey` - Path to the PEM private key matching `sslcert`. `sslcert` and `sslkey` must be given together.
+/// * `sslcrl` - Path to a PEM file with certificate revocation lists checked against server certificates.
 /// * `host` - The host to connect to. On Unix platforms, if the host starts with a `/` character it is treated as the
 ///     path to the directory containing Unix domain sockets. Otherwise, it is treated as a hostname. Multiple hosts
 ///     can be specified, separated by commas. Each host will be tried in turn when connecting. Required if connecting
@@ -215,6 +247,11 @@ pub struct Config {
     pub(crate) options: Option<String>,
     pub(crate) application_name: Option<String>,
     pub(crate) ssl_mode: SslMode,
+    pub(crate) ssl_root_cert: Option<PathBuf>,
+    pub(crate) ssl_cert: Option<PathBuf>,
+    pub(crate) ssl_key: Option<PathBuf>,
+    pub(crate) ssl_crl: Option<PathBuf>,
+    pub(crate) endpoint_policy: Option<Arc<EndpointPolicy>>,
     pub(crate) host: Vec<Host>,
     pub(crate) hostaddr: Vec<IpAddr>,
     pub(crate) port: Vec<u16>,
@@ -249,7 +286,12 @@ impl Config {
             dbname: None,
             options: None,
             application_name: None,
-            ssl_mode: SslMode::Prefer,
+            ssl_mode: SslMode::VerifyFull,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
+            ssl_crl: None,
+            endpoint_policy: None,
             host: vec![],
             hostaddr: vec![],
             port: vec![],
@@ -342,7 +384,7 @@ impl Config {
 
     /// Sets the SSL configuration.
     ///
-    /// Defaults to `prefer`.
+    /// Defaults to `verify-full`.
     pub fn ssl_mode(&mut self, ssl_mode: SslMode) -> &mut Config {
         self.ssl_mode = ssl_mode;
         self
@@ -351,6 +393,66 @@ impl Config {
     /// Gets the SSL configuration.
     pub fn get_ssl_mode(&self) -> SslMode {
         self.ssl_mode
+    }
+
+    /// Sets the path of the PEM trust-root file (`sslrootcert`).
+    pub fn ssl_root_cert(&mut self, path: impl Into<PathBuf>) -> &mut Config {
+        self.ssl_root_cert = Some(path.into());
+        self
+    }
+
+    /// Gets the path of the PEM trust-root file, if configured.
+    pub fn get_ssl_root_cert(&self) -> Option<&std::path::Path> {
+        self.ssl_root_cert.as_deref()
+    }
+
+    /// Sets the path of the PEM client certificate chain (`sslcert`).
+    pub fn ssl_cert(&mut self, path: impl Into<PathBuf>) -> &mut Config {
+        self.ssl_cert = Some(path.into());
+        self
+    }
+
+    /// Gets the path of the PEM client certificate chain, if configured.
+    pub fn get_ssl_cert(&self) -> Option<&std::path::Path> {
+        self.ssl_cert.as_deref()
+    }
+
+    /// Sets the path of the PEM client private key (`sslkey`).
+    pub fn ssl_key(&mut self, path: impl Into<PathBuf>) -> &mut Config {
+        self.ssl_key = Some(path.into());
+        self
+    }
+
+    /// Gets the path of the PEM client private key, if configured.
+    pub fn get_ssl_key(&self) -> Option<&std::path::Path> {
+        self.ssl_key.as_deref()
+    }
+
+    /// Sets the path of a PEM file with certificate revocation lists (`sslcrl`).
+    pub fn ssl_crl(&mut self, path: impl Into<PathBuf>) -> &mut Config {
+        self.ssl_crl = Some(path.into());
+        self
+    }
+
+    /// Gets the path of the PEM CRL file, if configured.
+    pub fn get_ssl_crl(&self) -> Option<&std::path::Path> {
+        self.ssl_crl.as_deref()
+    }
+
+    /// Sets the trusted endpoint policy that admits discovered nodes and maps
+    /// each canonical node identity to its dial address and expected TLS name.
+    ///
+    /// Under `verify-full` a node returned by `yb_servers()` is only eligible
+    /// when it is admitted by this policy or is one of the configured seeds;
+    /// discovery can never widen its own trust boundary.
+    pub fn endpoint_policy(&mut self, policy: EndpointPolicy) -> &mut Config {
+        self.endpoint_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Gets the trusted endpoint policy, if configured.
+    pub fn get_endpoint_policy(&self) -> Option<&EndpointPolicy> {
+        self.endpoint_policy.as_deref()
     }
 
     /// Adds a host to the configuration.
@@ -714,9 +816,32 @@ impl Config {
                     "disable" => SslMode::Disable,
                     "prefer" => SslMode::Prefer,
                     "require" => SslMode::Require,
+                    "verify-full" => SslMode::VerifyFull,
+                    "verify-ca" | "allow" => {
+                        return Err(Error::config_parse(Box::new(UnsupportedValue(
+                            "sslmode",
+                            "this mode does not authenticate the server; use verify-full",
+                        ))))
+                    }
                     _ => return Err(Error::config_parse(Box::new(InvalidValue("sslmode")))),
                 };
                 self.ssl_mode(mode);
+            }
+            "sslrootcert" | "sslcert" | "sslkey" | "sslcrl" => {
+                if value.is_empty() {
+                    return Err(Error::config_parse(Box::new(InvalidValue(match key {
+                        "sslrootcert" => "sslrootcert",
+                        "sslcert" => "sslcert",
+                        "sslkey" => "sslkey",
+                        _ => "sslcrl",
+                    }))));
+                }
+                match key {
+                    "sslrootcert" => self.ssl_root_cert(value),
+                    "sslcert" => self.ssl_cert(value),
+                    "sslkey" => self.ssl_key(value),
+                    _ => self.ssl_crl(value),
+                };
             }
             "host" => {
                 for host in value.split(',') {
@@ -942,6 +1067,11 @@ impl fmt::Debug for Config {
             .field("options", &self.options)
             .field("application_name", &self.application_name)
             .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert.as_ref().map(|_| Redaction {}))
+            .field("ssl_cert", &self.ssl_cert.as_ref().map(|_| Redaction {}))
+            .field("ssl_key", &self.ssl_key.as_ref().map(|_| Redaction {}))
+            .field("ssl_crl", &self.ssl_crl.as_ref().map(|_| Redaction {}))
+            .field("endpoint_policy", &self.endpoint_policy)
             .field("host", &self.host)
             .field("hostaddr", &self.hostaddr)
             .field("port", &self.port)
@@ -985,6 +1115,17 @@ impl fmt::Display for InvalidValue {
 }
 
 impl error::Error for InvalidValue {}
+
+#[derive(Debug)]
+struct UnsupportedValue(&'static str, &'static str);
+
+impl fmt::Display for UnsupportedValue {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(fmt, "unsupported value for option `{}`: {}", self.0, self.1)
+    }
+}
+
+impl error::Error for UnsupportedValue {}
 
 struct Parser<'a> {
     s: &'a str,

@@ -156,7 +156,10 @@ impl InnerClient {
 #[derive(Clone)]
 pub(crate) struct SocketConfig {
     pub addr: Addr,
+    /// Expected TLS identity used for this connection (and its cancel requests).
     pub hostname: Option<String>,
+    /// Canonical node identity used for connection accounting.
+    pub node: Option<String>,
     pub port: u16,
     pub connect_timeout: Option<Duration>,
     pub tcp_user_timeout: Option<Duration>,
@@ -216,6 +219,15 @@ impl Client {
 
     pub(crate) fn get_socket_config(&self) -> Option<SocketConfig> {
         self.socket_config.clone()
+    }
+
+    /// The canonical identity of the node this client is connected to, as
+    /// used for smart-driver connection accounting: the discovered
+    /// `yb_servers()` host for load-balanced connections, or the configured
+    /// host for direct connections.
+    #[cfg(feature = "runtime")]
+    pub fn node_identity(&self) -> Option<&str> {
+        self.socket_config.as_ref().and_then(|c| c.node.as_deref())
     }
 
     /// Creates a new prepared statement.

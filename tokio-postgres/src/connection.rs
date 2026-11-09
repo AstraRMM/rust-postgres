@@ -56,6 +56,18 @@ pub struct Connection<S, T> {
     state: State,
 }
 
+impl<S, T> Connection<S, T> {
+    /// The TLS session, when the connection uses TLS. With the verifying
+    /// rustls connector this exposes the credential generation the session
+    /// authenticated with.
+    pub fn tls_stream(&self) -> Option<&T> {
+        match self.stream.get_ref() {
+            MaybeTlsStream::Tls(stream) => Some(stream),
+            MaybeTlsStream::Raw(_) => None,
+        }
+    }
+}
+
 impl<S, T> Connection<S, T>
 where
     S: AsyncRead + AsyncWrite + Unpin,

@@ -56,7 +56,11 @@ impl<F: Future> Future for Cancellable<F> {
 
 async fn connect_raw(s: &str) -> Result<(Client, Connection<TcpStream, NoTlsStream>), Error> {
     let socket = TcpStream::connect("127.0.0.1:5433").await.unwrap();
-    let config = s.parse::<Config>().unwrap();
+    let mut config = s.parse::<Config>().unwrap();
+    // The default is verify-full; these legacy tests use plaintext explicitly.
+    if !s.contains("sslmode") {
+        config.ssl_mode(yb_tokio_postgres::config::SslMode::Disable);
+    }
     config.connect_raw(socket, NoTls).await
 }
 

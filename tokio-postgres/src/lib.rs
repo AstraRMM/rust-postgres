@@ -157,6 +157,7 @@ mod codec;
 pub mod config;
 #[cfg(feature = "runtime")]
 mod connect;
+pub mod endpoint;
 mod connect_raw;
 #[cfg(feature = "runtime")]
 mod connect_socket;
@@ -173,6 +174,8 @@ mod portal;
 mod prepare;
 mod query;
 pub mod row;
+#[cfg(feature = "rustls")]
+pub mod rustls;
 mod simple_query;
 #[cfg(feature = "runtime")]
 mod socket;
@@ -205,12 +208,9 @@ where
 ///close connection to server
 pub fn close(client: &Client) {
     if let Some(socket_config) = client.get_socket_config() {
-        if let Some(hostname) = socket_config.hostname {
-            info!(
-                "Closing one connection to {}",
-                hostname
-            );
-            decrease_connection_count(Host::Tcp(hostname));
+        if let Some(node) = socket_config.node {
+            info!("Closing one connection to {}", endpoint::label(&node));
+            decrease_connection_count(Host::Tcp(node));
         }
     }
 }
