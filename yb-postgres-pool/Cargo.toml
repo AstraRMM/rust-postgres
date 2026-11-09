@@ -1,0 +1,25 @@
+[package]
+name = "yb-postgres-pool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT/Apache-2.0"
+description = "Thin bb8 pool and session contract over the native yb-tokio-postgres client (AST-2130)"
+
+[features]
+default = []
+# Retire sessions of superseded verify-full credential generations.
+rustls = ["yb-tokio-postgres/rustls"]
+rustls-aws-lc-rs = ["rustls", "yb-tokio-postgres/rustls-aws-lc-rs"]
+rustls-ring = ["rustls", "yb-tokio-postgres/rustls-ring"]
+
+[dependencies]
+bb8 = "=0.9.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+log = "0.4"
+parking_lot = "0.12"
+tokio = { version = "1.38", features = ["rt", "sync", "time", "macros"] }
+yb-tokio-postgres = { path = "../tokio-postgres", features = ["runtime"] }
+
+[dev-dependencies]
+tokio = { version = "1.27", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

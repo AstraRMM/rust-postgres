@@ -2,6 +2,7 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCod
 use crate::config::{self, Config};
 use crate::connect_tls::connect_tls;
 use crate::maybe_tls_stream::MaybeTlsStream;
+use crate::session_status::SessionShared;
 use crate::tls::{TlsConnect, TlsStream};
 use crate::{Client, Connection, Error};
 use bytes::BytesMut;
@@ -17,6 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -107,8 +109,15 @@ where
     let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
 
     let (sender, receiver) = mpsc::unbounded();
-    let client = Client::new(sender, config.ssl_mode, process_id, secret_key);
-    let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+    let session = Arc::new(SessionShared::new());
+    let client = Client::new(
+        sender,
+        session.clone(),
+        config.ssl_mode,
+        process_id,
+        secret_key,
+    );
+    let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver, session);
 
     Ok((client, connection))
 }

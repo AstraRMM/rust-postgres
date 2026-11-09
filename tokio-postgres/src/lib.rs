@@ -130,6 +130,7 @@ pub use crate::generic_client::GenericClient;
 pub use crate::portal::Portal;
 pub use crate::query::RowStream;
 pub use crate::row::{Row, SimpleQueryRow};
+pub use crate::session_status::TransactionStatus;
 pub use crate::simple_query::SimpleQueryStream;
 #[cfg(feature = "runtime")]
 pub use crate::socket::Socket;
@@ -174,6 +175,7 @@ pub mod realm;
 pub mod row;
 #[cfg(feature = "rustls")]
 pub mod rustls;
+mod session_status;
 mod simple_query;
 #[cfg(feature = "runtime")]
 mod socket;

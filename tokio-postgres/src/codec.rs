@@ -24,6 +24,12 @@ impl BackendMessages {
     pub fn empty() -> BackendMessages {
         BackendMessages(BytesMut::new())
     }
+
+    /// The transaction status byte of a chunk the decoder ended at a
+    /// `ReadyForQuery` (only meaningful when `request_complete` is set).
+    pub fn ready_status(&self) -> Option<u8> {
+        self.0.last().copied()
+    }
 }
 
 impl FallibleIterator for BackendMessages {

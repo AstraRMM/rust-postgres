@@ -5,6 +5,7 @@ use crate::copy_out::CopyOutStream;
 #[cfg(feature = "runtime")]
 use crate::keepalive::KeepaliveConfig;
 use crate::query::RowStream;
+use crate::session_status::{SessionShared, TransactionStatus};
 use crate::simple_query::SimpleQueryStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
@@ -83,6 +84,7 @@ struct CachedTypeInfo {
 
 pub struct InnerClient {
     sender: mpsc::UnboundedSender<Request>,
+    session: Arc<SessionShared>,
     cached_typeinfo: Mutex<CachedTypeInfo>,
 
     /// A buffer to use when writing out postgres commands.
@@ -93,9 +95,13 @@ impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel(1);
         let request = Request { messages, sender };
-        self.sender
-            .unbounded_send(request)
-            .map_err(|_| Error::closed())?;
+        // Count before handing over: the connection may complete the request
+        // before `unbounded_send` returns.
+        self.session.request_sent();
+        if self.sender.unbounded_send(request).is_err() {
+            self.session.request_complete(None);
+            return Err(Error::closed());
+        }
 
         Ok(Responses {
             receiver,
@@ -193,6 +199,7 @@ pub struct Client {
 impl Client {
     pub(crate) fn new(
         sender: mpsc::UnboundedSender<Request>,
+        session: Arc<SessionShared>,
         ssl_mode: SslMode,
         process_id: i32,
         secret_key: i32,
@@ -200,6 +207,7 @@ impl Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
+                session,
                 cached_typeinfo: Default::default(),
                 buffer: Default::default(),
             }),
@@ -598,6 +606,42 @@ impl Client {
     /// In that case, all future queries will fail.
     pub fn is_closed(&self) -> bool {
         self.inner.sender.is_closed()
+    }
+
+    /// The transaction status reported by the most recent `ReadyForQuery`
+    /// the connection processed. Costs no round trip.
+    ///
+    /// While [`pending_requests`](Self::pending_requests) is non-zero this
+    /// can lag behind requests already sent.
+    pub fn transaction_status(&self) -> TransactionStatus {
+        self.inner.session.transaction_status()
+    }
+
+    /// Requests sent to the connection whose `ReadyForQuery` has not been
+    /// processed yet, including fire-and-forget requests such as the
+    /// `ROLLBACK` of a dropped [`Transaction`] or the `Close` of a dropped
+    /// [`Statement`]. A dropped (cancelled) query future leaves its request
+    /// pending until the server finishes it.
+    pub fn pending_requests(&self) -> u64 {
+        self.inner.session.pending()
+    }
+
+    /// The number of `ParameterStatus` messages received after startup.
+    ///
+    /// The server reports changes to `GUC_REPORT` settings (for example
+    /// `application_name`, `TimeZone`, `DateStyle`, `is_superuser` and
+    /// `session_authorization`), so a change in this counter means session
+    /// state was modified. Other settings such as `search_path` (before
+    /// PostgreSQL 18) and `role` are not reported.
+    pub fn parameter_status_changes(&self) -> u64 {
+        self.inner.session.parameter_changes()
+    }
+
+    /// Resolves once no request is pending or the connection has closed.
+    ///
+    /// Only one task should wait at a time.
+    pub async fn wait_until_settled(&self) {
+        self.inner.session.settle().await
     }
 
     #[doc(hidden)]
