@@ -75,7 +75,7 @@ async fn two_verified_realms_in_one_process_are_isolated() {
     assert_eq!(rb.topology().unwrap().nodes()[0].identity(), "127.0.0.3");
 
     // Realm B loses its only endpoint; it must fail rather than reach A.
-    let broken_b = yb("yb-b.test", "127.0.0.3", "yb_servers_refresh_interval=0 port=5999");
+    let broken_b = yb("yb-b.test", "127.0.0.9", "yb_servers_refresh_interval=0 yb_acquire_timeout=5");
     let mut config = broken_b.clone();
     let lost = Realm::new("yb-b-lost");
     config.realm(lost.clone());
