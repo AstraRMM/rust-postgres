@@ -132,44 +132,47 @@ impl<T: PoolTls> PoolSet<T> {
     }
 
     /// The pool for `key`, created on first use.
+    ///
+    /// When the set is full, the least recently used pool with nothing
+    /// borrowed, checked out or being opened is evicted, but only after the
+    /// replacement has been resolved and validated.
     pub fn pool(&self, key: &PoolKey) -> Result<Pool<T>, PoolError> {
+        let mut pools = self.inner.pools.lock();
+        // Checked under the registry lock: `shutdown` sets the flag before
+        // draining the registry, so no pool is inserted after it.
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(PoolError::kind_only(ErrorKind::PoolClosed));
         }
-        let mut pools = self.inner.pools.lock();
         if let Some(pool) = pools.get(key) {
             if !pool.is_closed() {
+                // Counts as activity, so the janitor cannot evict the pool
+                // between this lookup and the checkout.
+                pool.touch();
                 return Ok(pool.clone());
             }
             pools.remove(key);
         }
-        if pools.len() >= self.inner.config.max_pools {
+        let victim = if pools.len() >= self.inner.config.max_pools {
             let victim = pools
                 .iter()
-                .filter(|(_, p)| p.borrowed() == 0)
+                .filter(|(_, p)| !p.busy())
                 .max_by_key(|(_, p)| p.idle_for())
                 .map(|(k, _)| k.clone());
             match victim {
-                Some(victim) => {
-                    if let Some(pool) = pools.remove(&victim) {
-                        log::info!("pool set: evicting {} to admit {}", victim, key);
-                        let drain = self.inner.config.drain_timeout;
-                        tokio::spawn(async move {
-                            pool.shutdown(drain).await;
-                        });
-                    }
-                }
+                Some(victim) => Some(victim),
                 None => {
                     return Err(PoolError::new(
                         ErrorKind::TooManyPools,
                         format!(
-                            "{} pools active and all are borrowed from",
+                            "{} pools active and all are in use",
                             self.inner.config.max_pools
                         ),
                     ))
                 }
             }
-        }
+        } else {
+            None
+        };
         let spec = self.inner.resolver.resolve(key)?;
         let pool = Pool::with_limiter(
             spec.config,
@@ -178,6 +181,15 @@ impl<T: PoolTls> PoolSet<T> {
             self.inner.limiter.clone(),
             &key.to_string(),
         )?;
+        if let Some(victim) = victim {
+            if let Some(evicted) = pools.remove(&victim) {
+                log::info!("pool set: evicting {} to admit {}", victim, key);
+                let drain = self.inner.config.drain_timeout;
+                tokio::spawn(async move {
+                    evicted.shutdown(drain).await;
+                });
+            }
+        }
         pools.insert(key.clone(), pool.clone());
         Ok(pool)
     }
@@ -201,8 +213,8 @@ impl<T: PoolTls> PoolSet<T> {
         self.inner.pools.lock().get(key).map(|p| p.state())
     }
 
-    /// Shuts down and removes pools with nothing borrowed and no activity
-    /// for `pool_idle_ttl`. Returns how many were evicted. The janitor runs
+    /// Shuts down and removes pools with nothing borrowed, checked out or
+    /// being opened and no activity for `pool_idle_ttl`. Returns how many were evicted. The janitor runs
     /// this every `maintenance_interval`.
     pub fn evict_idle(&self) -> usize {
         let ttl = self.inner.config.pool_idle_ttl;
@@ -210,7 +222,7 @@ impl<T: PoolTls> PoolSet<T> {
             let mut pools = self.inner.pools.lock();
             let keys: Vec<PoolKey> = pools
                 .iter()
-                .filter(|(_, p)| p.borrowed() == 0 && p.idle_for() >= ttl)
+                .filter(|(_, p)| !p.busy() && p.idle_for() >= ttl)
                 .map(|(k, _)| k.clone())
                 .collect();
             keys.iter().filter_map(|k| pools.remove(k)).collect()
