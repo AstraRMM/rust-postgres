@@ -790,7 +790,7 @@ impl MakeRustlsConnect {
             .live
             .lock()
             .iter()
-            .filter(|g| g.upgrade().map_or(false, |g| g.info.id < info.id))
+            .filter(|g| g.upgrade().is_some_and(|g| g.info.id < info.id))
             .cloned()
             .collect();
         handle.spawn(async move {
