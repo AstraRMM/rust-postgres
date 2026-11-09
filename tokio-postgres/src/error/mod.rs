@@ -467,6 +467,24 @@ impl Error {
         None
     }
 
+    /// Determines if the error means the connection itself failed: I/O,
+    /// an unexpected or unparseable protocol message, a closed connection,
+    /// a connect failure or a timeout.
+    ///
+    /// Security failures ([`Error::is_security_failure`]) are never transport
+    /// failures, even when they surface as I/O. A transport failure does not
+    /// say whether the server executed the request; during `COMMIT` the
+    /// outcome is ambiguous and must be reconciled, not blindly replayed.
+    pub fn is_transport(&self) -> bool {
+        let transport = match self.0.kind {
+            Kind::Io | Kind::UnexpectedMessage | Kind::Parse | Kind::Closed | Kind::Timeout => true,
+            #[cfg(feature = "runtime")]
+            Kind::Connect => self.as_db_error().is_none(),
+            _ => false,
+        };
+        transport && !self.is_security_failure()
+    }
+
     /// Determines if the error is a TLS, authentication or authorization
     /// failure (SQLSTATE class 28).
     ///

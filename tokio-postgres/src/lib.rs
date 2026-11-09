@@ -118,10 +118,6 @@
 //! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
-use config::Host;
-use connect::decrease_connection_count;
-use log::info;
-
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
@@ -173,6 +169,8 @@ mod maybe_tls_stream;
 mod portal;
 mod prepare;
 mod query;
+#[cfg(feature = "runtime")]
+pub mod realm;
 pub mod row;
 #[cfg(feature = "rustls")]
 pub mod rustls;
@@ -205,15 +203,9 @@ where
     config.connect(tls).await
 }
 
-///close connection to server
-pub fn close(client: &Client) {
-    if let Some(socket_config) = client.get_socket_config() {
-        if let Some(node) = socket_config.node {
-            info!("Closing one connection to {}", endpoint::label(&node));
-            decrease_connection_count(Host::Tcp(node));
-        }
-    }
-}
+/// Retained for API compatibility. Smart-driver connection accounting is
+/// released when the [`Client`] is dropped, so this does nothing.
+pub fn close(_client: &Client) {}
 
 /// An asynchronous notification.
 #[derive(Clone, Debug)]
