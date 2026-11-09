@@ -38,8 +38,25 @@ fn roots(name: &str) -> TlsMaterial {
     TlsMaterial::from_pem(read(name))
 }
 
+/// Provider under test, selected with `TLS_QUAL_PROVIDER` (default aws-lc-rs).
+fn options() -> TlsOptions {
+    let selected = std::env::var("TLS_QUAL_PROVIDER").unwrap_or_default();
+    match selected.as_str() {
+        "" | "aws-lc-rs" => TlsOptions::new(),
+        #[cfg(feature = "ring")]
+        "ring" => TlsOptions::new().provider(yb_tokio_postgres::rustls::Provider::Ring),
+        #[cfg(feature = "fips")]
+        "fips" => TlsOptions::new().provider(yb_tokio_postgres::rustls::Provider::AwsLcRsFips),
+        other => panic!("provider {other} is not compiled in"),
+    }
+}
+
 fn connector(material: &TlsMaterial) -> MakeRustlsConnect {
-    MakeRustlsConnect::new(material, TlsOptions::new()).unwrap()
+    let tls = MakeRustlsConnect::new(material, options()).unwrap();
+    if std::env::var("TLS_QUAL_PROVIDER").as_deref() == Ok("fips") {
+        assert!(tls.current().fips(), "FIPS provider must report FIPS mode");
+    }
+    tls
 }
 
 fn pg(port: u16, host: &str) -> String {
@@ -302,7 +319,7 @@ async fn tls12_only_server_needs_explicit_opt_in() {
     expect_tls(open(&pg(PG_TLS12, "localhost"), &tls).await, TlsFailureKind::ProtocolVersion);
     let tls12 = MakeRustlsConnect::new(
         &roots("ca-a.crt"),
-        TlsOptions::new().protocol_versions(ProtocolVersions::Tls12AndTls13),
+        options().protocol_versions(ProtocolVersions::Tls12AndTls13),
     )
     .unwrap();
     let s = open(&pg(PG_TLS12, "localhost"), &tls12).await.unwrap();
@@ -347,21 +364,21 @@ async fn single_validated_configuration_path_from_files() {
     let debug = format!("{config:?}");
     assert!(!debug.contains(dir.to_str().unwrap()), "paths leaked: {debug}");
 
-    let tls = MakeRustlsConnect::from_config(&config, TlsOptions::new()).unwrap();
+    let tls = MakeRustlsConnect::from_config(&config, options()).unwrap();
     let s = open_config(&config, &tls).await.unwrap();
     assert_eq!(scalar(&s.client, "select current_user").await, "postgres");
 
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let e = MakeRustlsConnect::from_config(&config, TlsOptions::new()).unwrap_err();
+    let e = MakeRustlsConnect::from_config(&config, options()).unwrap_err();
     assert_eq!(e.kind(), TlsConfigErrorKind::KeyPermissions);
     assert!(!e.to_string().contains(dir.to_str().unwrap()), "{e}");
 
     let half: Config = format!("host=localhost sslrootcert={} sslcert={}", dir.join("ca-a.crt").display(), dir.join("client-postgres.crt").display()).parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&half, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::IncompleteClientIdentity);
+    assert_eq!(MakeRustlsConnect::from_config(&half, options()).unwrap_err().kind(), TlsConfigErrorKind::IncompleteClientIdentity);
     let require: Config = format!("host=localhost sslmode=require sslrootcert={}", dir.join("ca-a.crt").display()).parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&require, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::ModeNotVerifyFull);
+    assert_eq!(MakeRustlsConnect::from_config(&require, options()).unwrap_err().kind(), TlsConfigErrorKind::ModeNotVerifyFull);
     let missing: Config = "host=localhost".parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&missing, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::MissingRootCert);
+    assert_eq!(MakeRustlsConnect::from_config(&missing, options()).unwrap_err().kind(), TlsConfigErrorKind::MissingRootCert);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

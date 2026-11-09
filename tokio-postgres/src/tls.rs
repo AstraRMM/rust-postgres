@@ -243,6 +243,7 @@ impl TlsFailure {
         }
     }
 
+    #[cfg_attr(not(feature = "rustls"), allow(dead_code))]
     pub(crate) fn with_endpoint(mut self, endpoint: EndpointLabel) -> TlsFailure {
         self.endpoint = Some(endpoint);
         self
