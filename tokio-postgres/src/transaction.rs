@@ -1,6 +1,7 @@
 use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::copy_out::CopyOutStream;
+use crate::observe;
 use crate::query::RowStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
@@ -48,6 +49,8 @@ impl<'a> Drop for Transaction<'a> {
             frontend::query(&query, buf).unwrap();
             buf.split().freeze()
         });
+        observe::note(observe::Q::rollbacks, None);
+        observe::note(observe::Q::automatic_rollbacks, None);
         let _ = self
             .client
             .inner()
@@ -85,6 +88,7 @@ impl<'a> Transaction<'a> {
         } else {
             "ROLLBACK".to_string()
         };
+        observe::note(observe::Q::rollbacks, None);
         self.client.batch_execute(&query).await
     }
 
@@ -201,6 +205,7 @@ impl<'a> Transaction<'a> {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
+        observe::operation(None);
         let statement = statement.__convert().into_statement(self.client).await?;
         bind::bind(self.client.inner(), statement, params).await
     }
@@ -224,6 +229,7 @@ impl<'a> Transaction<'a> {
         portal: &Portal,
         max_rows: i32,
     ) -> Result<RowStream, Error> {
+        observe::operation(None);
         query::query_portal(self.client.inner(), portal, max_rows).await
     }
 

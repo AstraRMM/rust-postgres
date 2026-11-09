@@ -166,6 +166,7 @@ mod generic_client;
 #[cfg(not(target_arch = "wasm32"))]
 mod keepalive;
 mod maybe_tls_stream;
+pub mod observe;
 mod portal;
 mod prepare;
 mod query;

@@ -1123,11 +1123,16 @@ impl Config {
     where
         T: MakeTlsConnect<Socket>,
     {
-        if self.load_balance != "false" {
-            yb_connect(tls, self).await
-        } else {
-            connect(tls, self).await
-        }
+        // Everything up to a usable session, including SQL run to check it,
+        // is session setup; discovery marks its own exchanges.
+        let setup = async {
+            if self.load_balance != "false" {
+                yb_connect(tls, self).await
+            } else {
+                connect(tls, self).await
+            }
+        };
+        crate::observe::with_class(crate::observe::Class::SessionSetup, setup).await
     }
 
     /// Connects to a PostgreSQL database over an arbitrary stream.
@@ -1142,7 +1147,11 @@ impl Config {
         S: AsyncRead + AsyncWrite + Unpin,
         T: TlsConnect<S>,
     {
-        connect_raw(stream, tls, true, self).await
+        crate::observe::with_class(
+            crate::observe::Class::SessionSetup,
+            connect_raw(stream, tls, true, self),
+        )
+        .await
     }
 }
 

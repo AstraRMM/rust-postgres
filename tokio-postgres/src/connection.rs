@@ -2,6 +2,7 @@ use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCod
 use crate::copy_in::CopyInReceiver;
 use crate::error::DbError;
 use crate::maybe_tls_stream::MaybeTlsStream;
+use crate::observe::{self, RequestObservation};
 use crate::{AsyncMessage, Error, Notification};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -25,10 +26,14 @@ pub enum RequestMessages {
 pub struct Request {
     pub messages: RequestMessages,
     pub sender: mpsc::Sender<BackendMessages>,
+    /// Wire accounting for the issuing context; `None` while observation is
+    /// off. Dropping it before `ReadyForQuery` counts the cycle as abandoned.
+    pub observation: Option<RequestObservation>,
 }
 
 pub struct Response {
     sender: mpsc::Sender<BackendMessages>,
+    observation: Option<RequestObservation>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -54,6 +59,8 @@ pub struct Connection<S, T> {
     pending_responses: VecDeque<BackendMessage>,
     responses: VecDeque<Response>,
     state: State,
+    /// Transaction status from the last `ReadyForQuery` (`I`, `T` or `E`).
+    transaction_status: u8,
 }
 
 impl<S, T> Connection<S, T> {
@@ -87,6 +94,7 @@ where
             pending_responses,
             responses: VecDeque::new(),
             state: State::Active,
+            transaction_status: b'I',
         }
     }
 
@@ -157,12 +165,16 @@ where
 
             match response.sender.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
+                    self.observe_response(&mut response, &messages, request_complete);
                     let _ = response.sender.start_send(messages);
                     if !request_complete {
                         self.responses.push_front(response);
                     }
                 }
                 Poll::Ready(Err(_)) => {
+                    // The issuer stopped listening (for example its future was
+                    // dropped), but the exchange still happened on its behalf.
+                    self.observe_response(&mut response, &messages, request_complete);
                     // we need to keep paging through the rest of the messages even if the receiver's hung up
                     if !request_complete {
                         self.responses.push_front(response);
@@ -196,6 +208,7 @@ where
                 trace!("polled new request");
                 self.responses.push_back(Response {
                     sender: request.sender,
+                    observation: request.observation,
                 });
                 Poll::Ready(Some(request.messages))
             }
@@ -244,9 +257,12 @@ where
 
             match request {
                 RequestMessages::Single(request) => {
+                    let before = self.observe_before_write();
+                    let raw = self.observed_raw(&request);
                     Pin::new(&mut self.stream)
                         .start_send(request)
                         .map_err(Error::io)?;
+                    self.observe_written(before, raw.as_deref());
                     if self.state == State::Terminating {
                         trace!("poll_write: sent eof, closing");
                         self.state = State::Closing;
@@ -265,9 +281,12 @@ where
                             return Ok(true);
                         }
                     };
+                    let before = self.observe_before_write();
+                    let raw = self.observed_raw(&message);
                     Pin::new(&mut self.stream)
                         .start_send(message)
                         .map_err(Error::io)?;
+                    self.observe_written(before, raw.as_deref());
                     self.pending_request = Some(RequestMessages::CopyIn(receiver));
                 }
             }
@@ -302,6 +321,73 @@ where
                 trace!("poll_shutdown: waiting on socket");
                 Poll::Pending
             }
+        }
+    }
+
+    /// Whether the request being written (the most recently accepted one) is
+    /// observed. The internal `Terminate` has no response entry.
+    fn writing_observed(&self) -> bool {
+        self.state == State::Active
+            && self
+                .responses
+                .back()
+                .map_or(false, |response| response.observation.is_some())
+    }
+
+    fn observe_before_write(&self) -> Option<usize> {
+        if self.writing_observed() {
+            Some(self.stream.write_buffer().len())
+        } else {
+            None
+        }
+    }
+
+    fn observed_raw(&self, message: &FrontendMessage) -> Option<bytes::Bytes> {
+        match message {
+            FrontendMessage::Raw(raw) if self.writing_observed() => Some(raw.clone()),
+            _ => None,
+        }
+    }
+
+    fn observe_written(&mut self, before: Option<usize>, raw: Option<&[u8]>) {
+        let before = match before {
+            Some(before) => before,
+            None => return,
+        };
+        let encoded = self.stream.write_buffer().len().saturating_sub(before);
+        if let Some(observation) = self
+            .responses
+            .back_mut()
+            .and_then(|response| response.observation.as_mut())
+        {
+            observation.frontend(raw, encoded);
+        }
+    }
+
+    fn observe_response(
+        &mut self,
+        response: &mut Response,
+        messages: &BackendMessages,
+        request_complete: bool,
+    ) {
+        let ready = if request_complete {
+            messages.ready_status()
+        } else {
+            None
+        };
+        if let Some(observation) = response.observation.as_mut() {
+            let scan = observe::scan_backend(messages.as_bytes());
+            // A complete batch always ends with ReadyForQuery; a missing or
+            // invalid status is recorded as an abandoned cycle.
+            let status = if request_complete {
+                Some(ready.unwrap_or(0))
+            } else {
+                None
+            };
+            observation.backend(scan, status, self.transaction_status);
+        }
+        if let Some(status) = ready {
+            self.transaction_status = status;
         }
     }
 
@@ -347,7 +433,9 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         while let Some(message) = ready!(self.poll_message(cx)?) {
             if let AsyncMessage::Notice(notice) = message {
-                info!("{}: {}", notice.severity(), notice.message());
+                // Notice text can quote SQL, parameters or row values; log
+                // only its severity and SQLSTATE.
+                info!("{} ({})", notice.severity(), notice.code().code());
             }
         }
         Poll::Ready(Ok(()))

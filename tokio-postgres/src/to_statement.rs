@@ -15,7 +15,9 @@ mod private {
         pub async fn into_statement(self, client: &Client) -> Result<Statement, Error> {
             match self {
                 ToStatementType::Statement(s) => Ok(s.clone()),
-                ToStatementType::Query(s) => client.prepare(s).await,
+                // Implicit preparation is part of the calling operation, not a
+                // separate logical operation.
+                ToStatementType::Query(s) => crate::prepare::prepare(client.inner(), s, &[]).await,
             }
         }
     }

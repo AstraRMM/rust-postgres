@@ -5,27 +5,14 @@ use crate::types::{BorrowToSql, IsNull};
 use crate::{Error, Portal, Row, Statement};
 use bytes::{Bytes, BytesMut};
 use futures_util::{ready, Stream};
-use log::{debug, log_enabled, Level};
+use crate::observe::Class;
+use log::debug;
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::{CommandCompleteBody, Message};
 use postgres_protocol::message::frontend;
-use std::fmt;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-struct BorrowToSqlParamsDebug<'a, T>(&'a [T]);
-
-impl<'a, T> fmt::Debug for BorrowToSqlParamsDebug<'a, T>
-where
-    T: BorrowToSql,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.0.iter().map(|x| x.borrow_to_sql()))
-            .finish()
-    }
-}
 
 pub async fn query<P, I>(
     client: &InnerClient,
@@ -37,24 +24,40 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let buf = if log_enabled!(Level::Debug) {
-        let params = params.into_iter().collect::<Vec<_>>();
-        debug!(
-            "executing statement {} with parameters: {:?}",
-            statement.name(),
-            BorrowToSqlParamsDebug(params.as_slice()),
-        );
-        encode(client, &statement, params)?
-    } else {
-        encode(client, &statement, params)?
-    };
-    let responses = start(client, buf).await?;
+    query_for(client, statement, params, None).await
+}
+
+/// Like [`query`], attributing the exchange to `purpose`.
+pub async fn query_for<P, I>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
+    purpose: Option<Class>,
+) -> Result<RowStream, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let params = params.into_iter();
+    log_execution(&statement, params.len());
+    let buf = encode(client, &statement, params)?;
+    let responses = start(client, buf, purpose).await?;
     Ok(RowStream {
         statement,
         responses,
         rows_affected: None,
         _p: PhantomPinned,
     })
+}
+
+/// Parameter values are never logged: they are application data.
+fn log_execution(statement: &Statement, params: usize) {
+    debug!(
+        "executing statement {} with {} parameters",
+        statement.name(),
+        params
+    );
 }
 
 pub async fn query_portal(
@@ -101,18 +104,10 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let buf = if log_enabled!(Level::Debug) {
-        let params = params.into_iter().collect::<Vec<_>>();
-        debug!(
-            "executing statement {} with parameters: {:?}",
-            statement.name(),
-            BorrowToSqlParamsDebug(params.as_slice()),
-        );
-        encode(client, &statement, params)?
-    } else {
-        encode(client, &statement, params)?
-    };
-    let mut responses = start(client, buf).await?;
+    let params = params.into_iter();
+    log_execution(&statement, params.len());
+    let buf = encode(client, &statement, params)?;
+    let mut responses = start(client, buf, None).await?;
 
     let mut rows = 0;
     loop {
@@ -128,8 +123,12 @@ where
     }
 }
 
-async fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+async fn start(
+    client: &InnerClient,
+    buf: Bytes,
+    purpose: Option<Class>,
+) -> Result<Responses, Error> {
+    let mut responses = client.send_for(RequestMessages::Single(FrontendMessage::Raw(buf)), purpose)?;
 
     match responses.next().await? {
         Message::BindComplete => {}
