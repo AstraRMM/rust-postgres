@@ -25,6 +25,7 @@ pub struct NativeConnection {
     pub(crate) client: Client,
     pub(crate) cache: StatementCache,
     pub(crate) stats: Arc<Stats>,
+    terminal: Arc<Mutex<Option<PoolError>>>,
     id: u64,
     generation: Option<u64>,
     created: Instant,
@@ -169,16 +170,24 @@ impl<T: PoolTls> Shared<T> {
         };
         let stats = self.stats.clone();
         let label = self.label.clone();
+        let terminal: Arc<Mutex<Option<PoolError>>> = Arc::new(Mutex::new(None));
+        let terminal_slot = terminal.clone();
+        let mut connection = connection;
         {
             // Hold the registry lock across spawn so the task cannot remove
             // its entry before it is inserted.
             let mut live = self.live.lock();
             let handle = tokio::spawn(async move {
                 let _guard = guard;
-                if let Err(e) = connection.await {
+                // Poll by reference so the cause is recorded before the
+                // connection (and with it the client's channel) is dropped:
+                // a borrower that sees the closed client can find it.
+                if let Err(e) = (&mut connection).await {
                     bump(&stats.terminal_failures);
                     log::debug!("pool {}: connection {} ended: {}", label, id, e);
+                    *terminal_slot.lock() = Some(PoolError::from_driver(e));
                 }
+                drop(connection);
             });
             live.insert(id, handle.abort_handle());
         }
@@ -189,6 +198,7 @@ impl<T: PoolTls> Shared<T> {
                 self.epoch.load(Ordering::SeqCst),
             ),
             stats: self.stats.clone(),
+            terminal,
             id,
             generation,
             created: Instant::now(),
@@ -930,8 +940,28 @@ impl<T: PoolTls> PooledClient<T> {
         self.native_mut().retire = Some(Retire::Explicit);
     }
 
-    fn map_error(&mut self, error: yb_tokio_postgres::Error) -> PoolError {
+    /// The error that ended this connection's task, if it ended with one
+    /// (for example a revoked TLS generation or a server termination).
+    pub fn terminal_error(&self) -> Option<PoolError> {
+        self.native().terminal.lock().clone()
+    }
+
+    /// Classifies an error from this client. A transport error on a client
+    /// whose connection task already failed reports that cause instead, so a
+    /// session closed by TLS revocation is [`ErrorKind::Security`] rather
+    /// than a bare "connection closed".
+    pub fn classify_error(&self, error: yb_tokio_postgres::Error) -> PoolError {
         let error = PoolError::from_driver(error);
+        if error.kind() == ErrorKind::Transport && self.native().client.is_closed() {
+            if let Some(cause) = self.terminal_error() {
+                return cause;
+            }
+        }
+        error
+    }
+
+    fn map_error(&mut self, error: yb_tokio_postgres::Error) -> PoolError {
+        let error = self.classify_error(error);
         if error.kind() == ErrorKind::StaleStatement {
             let n = self.native_mut().cache.clear();
             if n > 0 {

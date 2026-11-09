@@ -1175,12 +1175,10 @@ async fn verify_full_generation_retirement() {
     assert_eq!(client.tls_generation(), Some(3));
     tls.reload(&material).unwrap();
     assert!(tls.revoke_superseded() >= 1);
-    let err = PoolError::from(client.simple_query("SELECT 1").await.unwrap_err());
+    let raw = client.simple_query("SELECT 1").await.unwrap_err();
+    let err = client.classify_error(raw);
     println!("revoked borrowed session: {} ({:?})", err, err.kind());
-    assert!(
-        matches!(err.kind(), ErrorKind::Security | ErrorKind::Transport),
-        "{err}"
-    );
+    assert_eq!(err.kind(), ErrorKind::Security, "{err}");
     drop(client);
     let client = pool.get().await.unwrap();
     assert_eq!(client.tls_generation(), Some(4));
