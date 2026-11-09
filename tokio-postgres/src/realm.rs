@@ -32,7 +32,7 @@ use crate::connect::{
 use crate::endpoint;
 use crate::tls::MakeTlsConnect;
 use crate::{Connection, Error, Socket};
-use futures_util::{future, pin_mut, FutureExt};
+use futures_util::{future, pin_mut, Future, FutureExt};
 use lazy_static::lazy_static;
 use log::{debug, info, warn};
 use parking_lot::{Mutex, RwLock};

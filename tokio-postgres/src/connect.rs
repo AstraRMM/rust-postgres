@@ -6,7 +6,7 @@ use crate::endpoint::{self, ResolvedEndpoint};
 use crate::realm::Realm;
 use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
-use futures_util::{future, pin_mut, FutureExt, Stream};
+use futures_util::{future, pin_mut, Future, FutureExt, Stream};
 use log::warn;
 use rand::seq::SliceRandom;
 use std::net::IpAddr;
