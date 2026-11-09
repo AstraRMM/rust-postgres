@@ -57,7 +57,9 @@ containers() {
   local log_args=(-c logging_collector=on -c log_directory=log -c log_filename=wq.log -c log_rotation_size=0
     -c log_min_duration_statement=0 -c 'log_line_prefix=%a|%e|' -c shared_preload_libraries=pg_stat_statements
     -c pg_stat_statements.track=all)
-  docker run -d --name wq-pg --network host -e POSTGRES_PASSWORD="$WQ_PG_PASSWORD" "$pg_image" \
+  # Host connections must authenticate (the image's initdb trusts loopback).
+  docker run -d --name wq-pg --network host -e POSTGRES_PASSWORD="$WQ_PG_PASSWORD" \
+    -e POSTGRES_INITDB_ARGS='--auth-host=scram-sha-256 --auth-local=trust' "$pg_image" \
     -c port=55440 -c listen_addresses='*' "${log_args[@]}" >/dev/null
   docker run -d --name wq-pg-tls --network host -e POSTGRES_PASSWORD="$WQ_PG_PASSWORD" \
     -v "$fix:/fixtures:ro" --entrypoint /fixtures/pg-entry.sh "$pg_image" 55441 server-valid scram >/dev/null
@@ -67,11 +69,11 @@ containers() {
   wait_for wq-pg-tls 120 docker exec wq-pg-tls pg_isready -h 127.0.0.1 -p 55441 || return 1
   wait_for wq-yb 420 docker exec wq-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select 1' || return 1
   sleep 3
-  docker exec wq-pg psql -h 127.0.0.1 -p 55440 -U postgres -c 'create extension if not exists pg_stat_statements' || return 1
+  docker exec wq-pg psql -p 55440 -U postgres -c 'create extension if not exists pg_stat_statements' || return 1
   docker exec wq-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'create extension if not exists pg_stat_statements' || return 1
   docker exec wq-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select host, port, node_type from yb_servers()'
   docker exec wq-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -At -c 'select version()'
-  docker exec wq-pg psql -h 127.0.0.1 -p 55440 -U postgres -At -c 'select version()'
+  docker exec wq-pg psql -p 55440 -U postgres -At -c 'select version()'
   docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' "$pg_image" "$yb_image"
 }
 

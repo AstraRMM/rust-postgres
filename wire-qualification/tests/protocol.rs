@@ -148,8 +148,10 @@ async fn pg_counts_match_wire_and_server_log() {
             .batch_execute("insert into wq_basic values (1, 'a')")
             .await
             .unwrap();
+        // floor(random()) is volatile, so the division runs at Execute (a
+        // constant divisor already fails at Bind, while planning).
         let err = client
-            .query("select 1 / $1::int4", &[&0i32])
+            .query("select 1 / (floor(random())::int4 + $1::int4)", &[&0i32])
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some(&SqlState::DIVISION_BY_ZERO));
@@ -601,10 +603,10 @@ async fn yb_discovery_is_attributed_and_backed_by_pg_stat_statements() {
     assert_eq!(discovery.operations, 1);
     assert_eq!(discovery.parse_messages, 1);
     assert_eq!(discovery.execute_messages, 1);
-    assert_eq!(
-        discovery.cycles_completed, 3,
-        "prepare, execute, detached close"
-    );
+    // The returned rows keep the statement alive until the control
+    // connection is closed, so its Close is never sent: two cycles.
+    assert_eq!(discovery.cycles_completed, 2, "prepare and execute");
+    assert_eq!(discovery.close_messages, 0);
     assert_eq!(calls, 1, "the server executed yb_servers() once");
     assert_eq!(setup.sessions_started, 1, "one data connection");
     assert_eq!(*counts.class(Class::Request), ClassCounts::default());
