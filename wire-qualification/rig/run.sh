@@ -35,20 +35,28 @@ lint() {
   record fmt rustfmt --edition 2018 --check tokio-postgres/src/observe.rs
   record fmt-qualification rustfmt --edition 2021 --check wire-qualification/src/lib.rs wire-qualification/src/bin/overhead.rs wire-qualification/tests/protocol.rs wire-qualification/tests/privacy.rs
   step clippy
-  cargo clippy -p yb-tokio-postgres -p yb-postgres -p wire-qualification --all-targets --features yb-tokio-postgres/rustls-aws-lc-rs 2>&1 | tee /tmp/wq-clippy.log | tail -5
-  # Upstream crates carry pre-existing lints; fail only on lints in files this change owns.
+  cargo clippy --locked -p yb-tokio-postgres -p yb-postgres -p wire-qualification --all-targets --features yb-tokio-postgres/rustls-aws-lc-rs >/tmp/wq-clippy.log 2>&1
+  local clippy_rc=$?
+  tail -5 /tmp/wq-clippy.log
+  # Upstream crates carry pre-existing lints; besides cargo's own status, fail
+  # on any lint in files this change owns.
+  local owned_lints=0
   if grep -E -A3 '^(warning|error)' /tmp/wq-clippy.log | grep -E -- '--> (tokio-postgres/src/(observe|connection|client|socket|query|prepare|codec|connect_raw|simple_query|statement|portal|transaction|to_statement|cancel_query|cancel_query_raw)\.rs|wire-qualification/)'; then
-    echo "RESULT clippy rc=1"; status=1
-  else
-    echo "RESULT clippy rc=0"
+    owned_lints=1
   fi
-  record docs cargo doc -q --no-deps -p yb-tokio-postgres
+  echo "clippy cargo_rc=$clippy_rc owned_lints=$owned_lints"
+  if [[ $clippy_rc == 0 && $owned_lints == 0 ]]; then
+    echo "RESULT clippy rc=0"
+  else
+    echo "RESULT clippy rc=1"; status=1
+  fi
+  record docs cargo doc -q --locked --no-deps -p yb-tokio-postgres
 }
 
 containers() {
   step "fixtures"
   rm -rf "$fix" && mkdir -p "$fix"
-  cargo run -q -p tls-qualification --bin gen-fixtures -- "$fix" || return 1
+  cargo run -q --locked -p tls-qualification --bin gen-fixtures -- "$fix" || return 1
   cp tls-qualification/rig/pg-entry.sh wire-qualification/rig/yb-plain-entry.sh "$fix/"
   chmod -R a+rX "$fix"; chmod 755 "$fix"/*.sh
 
@@ -79,12 +87,12 @@ containers() {
 
 wire() {
   containers || { status=1; return; }
-  record wire-protocol cargo test -p wire-qualification --test protocol -- --test-threads=1 --nocapture
-  record wire-privacy cargo test -p wire-qualification --test privacy -- --nocapture
+  record wire-protocol cargo test --locked -p wire-qualification --test protocol -- --test-threads=1 --nocapture
+  record wire-privacy cargo test --locked -p wire-qualification --test privacy -- --nocapture
 }
 
 overhead() {
-  cargo build -q --release -p wire-qualification --bin overhead || { status=1; return; }
+  cargo build -q --locked --release -p wire-qualification --bin overhead || { status=1; return; }
   for engine in pg yb; do
     for run in 1 2 3; do
       record "overhead-$engine-$run" target/release/overhead "$engine" 40 1000
