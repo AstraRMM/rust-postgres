@@ -642,7 +642,7 @@ pub fn totals() -> Totals {
     totals
 }
 
-fn route_entry(routes: &mut Vec<RouteTotals>, route: &'static str) -> &mut RouteTotals {
+fn route_entry<'a>(routes: &'a mut Vec<RouteTotals>, route: &'static str) -> &'a mut RouteTotals {
     let route = match routes.iter().position(|r| r.route == route) {
         Some(index) => return &mut routes[index],
         None if routes.len() < MAX_ROUTES || route == OTHER_ROUTE => route,

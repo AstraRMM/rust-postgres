@@ -39,9 +39,12 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let params = params.into_iter();
-    log_execution(&statement, params.len());
-    let buf = encode(client, &statement, params)?;
+    // Scoped so the parameter iterator is never held across an await.
+    let buf = {
+        let params = params.into_iter();
+        log_execution(&statement, params.len());
+        encode(client, &statement, params)?
+    };
     let responses = start(client, buf, purpose).await?;
     Ok(RowStream {
         statement,
@@ -104,9 +107,12 @@ where
     I: IntoIterator<Item = P>,
     I::IntoIter: ExactSizeIterator,
 {
-    let params = params.into_iter();
-    log_execution(&statement, params.len());
-    let buf = encode(client, &statement, params)?;
+    // Scoped so the parameter iterator is never held across an await.
+    let buf = {
+        let params = params.into_iter();
+        log_execution(&statement, params.len());
+        encode(client, &statement, params)?
+    };
     let mut responses = start(client, buf, None).await?;
 
     let mut rows = 0;
