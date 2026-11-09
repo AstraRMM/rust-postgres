@@ -285,11 +285,7 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&body);
     to_server.write_all(&frame).await?;
-    loop {
-        let tag = match from_client.read_u8().await {
-            Ok(tag) => tag,
-            Err(_) => break,
-        };
+    while let Ok(tag) = from_client.read_u8().await {
         let len = from_client.read_u32().await?;
         let mut body = vec![0u8; len as usize - 4];
         from_client.read_exact(&mut body).await?;
@@ -298,17 +294,19 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
         frame.push(tag);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&body);
-        to_server.write_all(&frame).await?;
         if tag == b'Q'
             && body.starts_with(b"COMMIT")
             && wire.kill_after_commit.swap(false, Ordering::SeqCst)
         {
-            // Let the server commit, then cut the client off before the
-            // reply arrives.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Stop relaying replies, let the server commit, then cut the
+            // client off: it never learns the outcome.
             down.abort();
+            let _ = down.await;
+            to_server.write_all(&frame).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             return Ok(());
         }
+        to_server.write_all(&frame).await?;
     }
     let _ = to_server.shutdown().await;
     let _ = down.await;

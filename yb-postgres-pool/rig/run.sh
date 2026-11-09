@@ -3,10 +3,14 @@
 # Docker (scripts/aws-check.sh --rust --docker in git-platform), never on a
 # shared workstation.
 #
-#   yb-postgres-pool/rig/run.sh [check|pool|legacy|all]
+#   yb-postgres-pool/rig/run.sh [check|pool|legacy|all] [base-rev]
+#
+# legacy/all with a base revision also run the upstream suites there and
+# print both failure lists, so fork changes are judged against the base.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 mode=${1:-all}
+base=${2:-}
 fix=${POOL_TEST_FIXTURES:-/tmp/pool-test-fixtures}
 pg_image=postgres:16.10
 yb_image=yugabytedb/yugabyte:2025.2.5.2-b5
@@ -61,11 +65,36 @@ pool() {
   docker rm -f pool-pg pool-pg-tls pool-yb >/dev/null 2>&1
 }
 
+legacy() {
+  step "legacy suites (plaintext opt-in, upstream fixtures)"
+  docker rm -f legacy-pg >/dev/null 2>&1
+  docker run -d --name legacy-pg -p 5433:5433 -e POSTGRES_PASSWORD=postgres \
+    -v "$root/docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh:ro" postgres:14 >/dev/null
+  wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || return 1
+  failing() { grep -E '^test .* FAILED$|^test result' "$1" | sort; }
+  cargo test -p yb-tokio-postgres --test test >/tmp/legacy-head-tp.log 2>&1
+  cargo test -p yb-postgres >/tmp/legacy-head-p.log 2>&1
+  step "legacy at HEAD"; failing /tmp/legacy-head-tp.log; failing /tmp/legacy-head-p.log
+  if [[ -n $base ]]; then
+    rm -rf /tmp/legacy-base && git worktree add -q /tmp/legacy-base "$base"
+    (cd /tmp/legacy-base && CARGO_TARGET_DIR=/tmp/legacy-base-target cargo test -p yb-tokio-postgres --test test >/tmp/legacy-base-tp.log 2>&1
+     CARGO_TARGET_DIR=/tmp/legacy-base-target cargo test -p yb-postgres >/tmp/legacy-base-p.log 2>&1)
+    step "legacy at base $(git rev-parse --short "$base")"; failing /tmp/legacy-base-tp.log; failing /tmp/legacy-base-p.log
+    if diff <(failing /tmp/legacy-head-tp.log; failing /tmp/legacy-head-p.log) \
+            <(failing /tmp/legacy-base-tp.log; failing /tmp/legacy-base-p.log); then
+      echo "RESULT legacy-vs-base rc=0 (identical failure lists)"
+    else
+      echo "RESULT legacy-vs-base rc=1"; status=1
+    fi
+  fi
+  docker rm -f legacy-pg >/dev/null
+}
+
 case $mode in
   check) check ;;
   pool) pool ;;
-  legacy) tls-qualification/rig/run.sh legacy || status=1 ;;
-  all) check; pool; tls-qualification/rig/run.sh legacy || status=1 ;;
+  legacy) legacy ;;
+  all) check; pool; legacy ;;
 esac
 step "summary status=$status"
 exit $status

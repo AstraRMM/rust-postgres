@@ -1088,12 +1088,14 @@ mod tests {
 
     #[test]
     fn session_settings_render_without_quoting() {
-        let mut session = SessionConfig::default();
-        session.statement_timeout = Some(Duration::from_secs(5));
-        session.lock_timeout = Some(Duration::from_micros(10));
-        session.idle_in_transaction_session_timeout = Some(Duration::from_secs(30));
-        session.role = Some("app_runtime".into());
-        session.search_path = Some(vec!["app".into(), "public".into()]);
+        let mut session = SessionConfig {
+            statement_timeout: Some(Duration::from_secs(5)),
+            lock_timeout: Some(Duration::from_micros(10)),
+            idle_in_transaction_session_timeout: Some(Duration::from_secs(30)),
+            role: Some("app_runtime".into()),
+            search_path: Some(vec!["app".into(), "public".into()]),
+            ..SessionConfig::default()
+        };
         assert_eq!(
             session.startup_options().unwrap(),
             "-c statement_timeout=5000 -c lock_timeout=1 -c idle_in_transaction_session_timeout=30000 -c search_path=app,public -c role=app_runtime"
@@ -1108,8 +1110,10 @@ mod tests {
     #[test]
     fn rejects_unsafe_identifiers_and_inconsistent_limits() {
         for bad in ["App", "a b", "x;drop", "", "1abc"] {
-            let mut session = SessionConfig::default();
-            session.role = Some(bad.into());
+            let session = SessionConfig {
+                role: Some(bad.into()),
+                ..SessionConfig::default()
+            };
             assert!(session.validate().is_err(), "{bad}");
         }
         let mut config = PoolConfig::default();
