@@ -489,6 +489,55 @@ async fn attribution_is_isolated_and_follows_the_issuer() {
         after.unscoped(Class::Request).cycles_completed,
         before.unscoped(Class::Request).cycles_completed
     );
+    // Re-review finding 2: the late completion also reaches the route
+    // aggregate (and so `route_cycles_completed_total`).
+    let route_cycles = |t: &observe::Totals| {
+        let entry = t
+            .routes
+            .iter()
+            .find(|r| r.route == "wq.stream")
+            .or_else(|| t.routes.iter().find(|r| r.route == observe::OTHER_ROUTE));
+        entry.map_or(0, |r| r.counts.cycles_completed)
+    };
+    assert_eq!(route_cycles(&after) - route_cycles(&before), 1);
+    let rendered = after.render_prometheus("wq");
+    let line = format!(
+        "wq_sql_wire_route_cycles_completed_total{{route=\"{}\"}} {}",
+        after
+            .routes
+            .iter()
+            .find(|r| r.route == "wq.stream")
+            .map_or(observe::OTHER_ROUTE, |r| r.route),
+        route_cycles(&after)
+    );
+    assert!(rendered.contains(&line), "{line} not rendered");
+
+    // Re-review finding 1: a scope during which observation was switched
+    // off (even if switched on again before it ended) is not observed, so it
+    // can never claim an exact count.
+    let ((), counts) = observe::scope("wq.toggled", async {
+        client.query_one(&stmt, &[&1i32]).await.unwrap();
+        observe::set_enabled(false);
+        client.query_one(&stmt, &[&2i32]).await.unwrap();
+        observe::set_enabled(true);
+        client.query_one(&stmt, &[&3i32]).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        counts.class(Class::Request).cycles_completed,
+        2,
+        "the disabled request is missing"
+    );
+    assert!(!counts.observed());
+    assert!(!counts.is_complete());
+    let ((), counts) = observe::scope("wq.untoggled", async {
+        client.query_one(&stmt, &[&1i32]).await.unwrap();
+    })
+    .await;
+    assert!(
+        counts.observed() && counts.is_complete(),
+        "later scopes are observed again"
+    );
 
     // Nested scopes are independent; classes and acquisitions are separate.
     let ((inner, ()), outer) = observe::scope("wq.outer", async {

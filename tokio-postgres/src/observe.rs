@@ -72,10 +72,16 @@
 
 use std::fmt::{self, Write as _};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Incremented on every `set_enabled(false)`, so a scope can tell whether
+/// observation stayed on for its whole lifetime.
+static DISABLES: AtomicU64 = AtomicU64::new(0);
 
 /// Turns observation on for the whole process.
 ///
@@ -86,9 +92,14 @@ pub fn enable() {
 }
 
 /// Turns observation on or off. Requests already in flight keep the
-/// accounting they started with.
+/// accounting they started with. A scope that was open while observation
+/// was turned off reports [`Counts::observed`] `false`, even if it was
+/// turned on again before the scope ended.
 pub fn set_enabled(enabled: bool) {
-    ENABLED.store(enabled, Relaxed);
+    if !enabled {
+        DISABLES.fetch_add(1, SeqCst);
+    }
+    ENABLED.store(enabled, SeqCst);
 }
 
 /// Whether observation is on.
@@ -342,8 +353,8 @@ impl Counts {
         self.route
     }
 
-    /// Whether observation was enabled for the scope. Counts of an unobserved
-    /// scope are not evidence of zero exchanges.
+    /// Whether observation stayed enabled for the scope's whole lifetime.
+    /// Counts of an unobserved scope are not evidence of zero exchanges.
     pub fn observed(&self) -> bool {
         self.observed
     }
@@ -440,7 +451,9 @@ pub struct RouteTotals {
     pub incomplete_scopes: u64,
     /// Scopes dropped before their future finished.
     pub cancelled_scopes: u64,
-    /// Sum over all classes of the finished scopes' counts.
+    /// Sum over all classes of everything attributed to scopes of this
+    /// route: finished and cancelled scopes, including work that completed
+    /// after its scope ended.
     pub counts: ClassCounts,
 }
 
@@ -686,6 +699,9 @@ struct ScopeData {
 
 struct ScopeCell {
     route: &'static str,
+    /// `DISABLES` when the scope started, or `None` if observation was
+    /// already off by then.
+    disable_epoch: Option<u64>,
     data: Mutex<ScopeData>,
 }
 
@@ -711,9 +727,10 @@ impl ScopeGuard {
             data.closed = true;
             data.classes
         };
+        let observed = enabled() && self.0.disable_epoch == Some(DISABLES.load(SeqCst));
         let counts = Counts {
             route: self.0.route,
-            observed: enabled(),
+            observed,
             classes,
         };
         let total = counts.total();
@@ -731,14 +748,19 @@ impl ScopeGuard {
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        let closed = {
+        let (closed, classes) = {
             let mut data = lock(&self.0.data);
-            std::mem::replace(&mut data.closed, true)
+            (std::mem::replace(&mut data.closed, true), data.classes)
         };
         if !closed {
+            let mut total = ClassCounts::default();
+            for class in &classes {
+                total.merge(class);
+            }
             let mut routes = lock(&ROUTES);
             let entry = route_entry(&mut routes, self.0.route);
             entry.cancelled_scopes = entry.cancelled_scopes.saturating_add(1);
+            entry.counts.merge(&total);
         }
     }
 }
@@ -752,8 +774,11 @@ impl Drop for ScopeGuard {
 /// inherited. Enables observation.
 pub async fn scope<F: Future>(route: &'static str, future: F) -> (F::Output, Counts) {
     enable();
+    let epoch = DISABLES.load(SeqCst);
+    let disable_epoch = if enabled() { Some(epoch) } else { None };
     let cell = Arc::new(ScopeCell {
         route: route_label(route),
+        disable_epoch,
         data: Mutex::new(ScopeData {
             classes: [ClassCounts::default(); CLASSES],
             closed: false,
@@ -883,6 +908,12 @@ impl Attribution {
                     data.closed
                 };
                 if closed {
+                    // The scope already merged its snapshot into the route
+                    // aggregate; late work is added there too.
+                    {
+                        let mut routes = lock(&ROUTES);
+                        route_entry(&mut routes, owner.route).counts.merge(delta);
+                    }
                     if delta.cycles_completed == 0 && delta.cycles_abandoned == 0 {
                         LATE_OTHER.fetch_add(1, Relaxed);
                     }
