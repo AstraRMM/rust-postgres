@@ -3,14 +3,10 @@
 # Docker (scripts/aws-check.sh --rust --docker in git-platform), never on a
 # shared workstation.
 #
-#   yb-postgres-pool/rig/run.sh [check|pool|legacy|all] [base-rev]
-#
-# legacy/all with a base revision also run the upstream suites there and
-# print both failure lists, so fork changes are judged against the base.
+#   yb-postgres-pool/rig/run.sh [check|pool|legacy|all]
 set -uo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 mode=${1:-all}
-base=${2:-}
 fix=${POOL_TEST_FIXTURES:-/tmp/pool-test-fixtures}
 pg_image=postgres:16.10
 yb_image=yugabytedb/yugabyte:2025.2.5.2-b5
@@ -54,7 +50,7 @@ pool() {
     --entrypoint /fixtures/yb-plain-entry.sh "$yb_image" 127.0.0.4 5434 >/dev/null
   wait_for pool-pg 120 docker exec pool-pg pg_isready -h 127.0.0.1 -p 55440 || return 1
   wait_for pool-pg-tls 120 docker exec pool-pg-tls pg_isready -h 127.0.0.1 -p 55441 || return 1
-  wait_for pool-yb 420 docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -c 'select 1' || return 1
+  wait_for pool-yb 420 docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -c 'select 1' || { status=1; return 1; }
   docker exec pool-pg psql -U postgres -h 127.0.0.1 -p 55440 -Atc 'select version()'
   docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -Atc 'select version()'
   docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' "$pg_image" "$yb_image"
@@ -70,23 +66,9 @@ legacy() {
   docker rm -f legacy-pg >/dev/null 2>&1
   docker run -d --name legacy-pg -p 5433:5433 -e POSTGRES_PASSWORD=postgres \
     -v "$root/docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh:ro" postgres:14 >/dev/null
-  wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || return 1
-  failing() { grep -E '^test .* FAILED$|^test result' "$1" | sed 's/; finished in .*//' | sort; }
-  cargo test -p yb-tokio-postgres --test test >/tmp/legacy-head-tp.log 2>&1
-  cargo test -p yb-postgres >/tmp/legacy-head-p.log 2>&1
-  step "legacy at HEAD"; failing /tmp/legacy-head-tp.log; failing /tmp/legacy-head-p.log
-  if [[ -n $base ]]; then
-    rm -rf /tmp/legacy-base && git worktree add -q /tmp/legacy-base "$base"
-    (cd /tmp/legacy-base && CARGO_TARGET_DIR=/tmp/legacy-base-target cargo test -p yb-tokio-postgres --test test >/tmp/legacy-base-tp.log 2>&1
-     CARGO_TARGET_DIR=/tmp/legacy-base-target cargo test -p yb-postgres >/tmp/legacy-base-p.log 2>&1)
-    step "legacy at base $(git rev-parse --short "$base")"; failing /tmp/legacy-base-tp.log; failing /tmp/legacy-base-p.log
-    if diff <(failing /tmp/legacy-head-tp.log; failing /tmp/legacy-head-p.log) \
-            <(failing /tmp/legacy-base-tp.log; failing /tmp/legacy-base-p.log); then
-      echo "RESULT legacy-vs-base rc=0 (identical failure lists)"
-    else
-      echo "RESULT legacy-vs-base rc=1"; status=1
-    fi
-  fi
+  wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || { status=1; return 1; }
+  record legacy-tokio-postgres cargo test -p yb-tokio-postgres --test test
+  record legacy-postgres cargo test -p yb-postgres
   docker rm -f legacy-pg >/dev/null
 }
 
