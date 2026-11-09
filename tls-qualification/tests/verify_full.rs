@@ -372,6 +372,8 @@ async fn single_validated_configuration_path_from_files() {
     let config: Config = conninfo.parse().unwrap();
     let debug = format!("{config:?}");
     assert!(!debug.contains(dir.to_str().unwrap()), "paths leaked: {debug}");
+    assert!(!debug.contains("localhost"), "host leaked: {debug}");
+    assert!(debug.contains("Tcp(ep-"), "{debug}");
 
     let tls = MakeRustlsConnect::from_config(&config, options()).unwrap();
     let s = open_config(&config, &tls).await.unwrap();

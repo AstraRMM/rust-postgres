@@ -1189,8 +1189,15 @@ impl fmt::Debug for Config {
             .field("ssl_key", &self.ssl_key.as_ref().map(|_| Redaction {}))
             .field("ssl_crl", &self.ssl_crl.as_ref().map(|_| Redaction {}))
             .field("endpoint_policy", &self.endpoint_policy)
-            .field("host", &self.host)
-            .field("hostaddr", &self.hostaddr)
+            .field("host", &RedactedHosts(&self.host))
+            .field(
+                "hostaddr",
+                &self
+                    .hostaddr
+                    .iter()
+                    .map(|addr| crate::endpoint::label(&addr.to_string()))
+                    .collect::<Vec<_>>(),
+            )
             .field("port", &self.port)
             .field("connect_timeout", &self.connect_timeout)
             .field("tcp_user_timeout", &self.tcp_user_timeout)
@@ -1207,6 +1214,22 @@ impl fmt::Debug for Config {
         config_dbg
             .field("target_session_attrs", &self.target_session_attrs)
             .field("channel_binding", &self.channel_binding)
+            .finish()
+    }
+}
+
+/// Debug view of configured hosts: TCP hosts appear only as keyed endpoint
+/// labels, so a logged `Config` never reveals addresses or names.
+struct RedactedHosts<'a>(&'a [Host]);
+
+impl fmt::Debug for RedactedHosts<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|host| match host {
+                Host::Tcp(name) => format!("Tcp({})", crate::endpoint::label(name)),
+                #[cfg(unix)]
+                Host::Unix(_) => "Unix(_)".to_string(),
+            }))
             .finish()
     }
 }
