@@ -4,6 +4,7 @@ use crate::connection::{Request, RequestMessages};
 use crate::copy_out::CopyOutStream;
 #[cfg(feature = "runtime")]
 use crate::keepalive::KeepaliveConfig;
+use crate::observe::{self, Class, RequestObservation};
 use crate::query::RowStream;
 use crate::session_status::{SessionShared, TransactionStatus};
 use crate::simple_query::SimpleQueryStream;
@@ -93,8 +94,37 @@ pub struct InnerClient {
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
+        self.send_observed(messages, None, false)
+    }
+
+    /// Sends a request whose exchanges are attributed to `purpose` unless an
+    /// ambient [`observe::with_class`] overrides it.
+    pub fn send_for(
+        &self,
+        messages: RequestMessages,
+        purpose: Option<Class>,
+    ) -> Result<Responses, Error> {
+        self.send_observed(messages, purpose, false)
+    }
+
+    /// Sends a fire-and-forget request issued from a destructor (closing a
+    /// statement or portal); see `observe::ClassCounts::detached_cycles_queued`.
+    pub fn send_detached(&self, messages: RequestMessages, purpose: Option<Class>) {
+        let _ = self.send_observed(messages, purpose, true);
+    }
+
+    fn send_observed(
+        &self,
+        messages: RequestMessages,
+        purpose: Option<Class>,
+        detached: bool,
+    ) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel(1);
-        let request = Request { messages, sender };
+        let request = Request {
+            messages,
+            sender,
+            observation: RequestObservation::start(purpose, detached),
+        };
         // Count before handing over: the connection may complete the request
         // before `unbounded_send` returns.
         self.session.request_sent();
@@ -265,6 +295,7 @@ impl Client {
         query: &str,
         parameter_types: &[Type],
     ) -> Result<Statement, Error> {
+        observe::operation(Some(Class::Preparation));
         prepare::prepare(&self.inner, query, parameter_types).await
     }
 
@@ -398,6 +429,7 @@ impl Client {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
+        observe::operation(None);
         let statement = statement.__convert().into_statement(self).await?;
         query::query(&self.inner, statement, params).await
     }
@@ -440,6 +472,7 @@ impl Client {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
+        observe::operation(None);
         let statement = statement.__convert().into_statement(self).await?;
         query::execute(self.inner(), statement, params).await
     }
@@ -453,6 +486,7 @@ impl Client {
         T: ?Sized + ToStatement,
         U: Buf + 'static + Send,
     {
+        observe::operation(None);
         let statement = statement.__convert().into_statement(self).await?;
         copy_in::copy_in(self.inner(), statement).await
     }
@@ -464,6 +498,7 @@ impl Client {
     where
         T: ?Sized + ToStatement,
     {
+        observe::operation(None);
         let statement = statement.__convert().into_statement(self).await?;
         copy_out::copy_out(self.inner(), statement).await
     }
@@ -486,6 +521,7 @@ impl Client {
     }
 
     pub(crate) async fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
+        observe::operation(None);
         simple_query::simple_query(self.inner(), query).await
     }
 
@@ -500,6 +536,7 @@ impl Client {
     /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
     pub async fn batch_execute(&self, query: &str) -> Result<(), Error> {
+        observe::operation(None);
         simple_query::batch_execute(self.inner(), query).await
     }
 
@@ -522,6 +559,8 @@ impl Client {
                     frontend::query("ROLLBACK", buf).unwrap();
                     buf.split().freeze()
                 });
+                observe::note(observe::Q::rollbacks, None);
+                observe::note(observe::Q::automatic_rollbacks, None);
                 let _ = self
                     .client
                     .inner()

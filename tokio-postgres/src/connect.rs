@@ -269,16 +269,11 @@ pub(crate) fn seeds_label(config: &Config) -> String {
 /// `outer: inner: innermost` string, so control-connection failures surface the
 /// real underlying cause (DNS, TCP refused, TLS rejected, auth failed, ...)
 /// instead of a generic wrapper.
+///
+/// Server-supplied database error text is reduced to severity and SQLSTATE
+/// (AST-2133): it can quote SQL, parameter values or keys.
 pub(crate) fn error_chain(err: &Error) -> String {
-    use std::error::Error as StdError;
-
-    let mut message = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        message.push_str(&format!(": {}", cause));
-        source = cause.source();
-    }
-    message
+    crate::observe::Redacted(err).to_string()
 }
 
 /// Builds the `Config` used for control connections with connect_timeout bounded to

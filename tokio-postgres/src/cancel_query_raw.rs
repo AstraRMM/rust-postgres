@@ -26,5 +26,6 @@ where
     stream.flush().await.map_err(Error::io)?;
     stream.shutdown().await.map_err(Error::io)?;
 
+    crate::observe::note(crate::observe::Q::cancel_requests, None);
     Ok(())
 }

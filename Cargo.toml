@@ -11,6 +11,7 @@ members = [
     "tokio-postgres",
     "tls-qualification",
     "yb-postgres-pool",
+    "wire-qualification",
 ]
 resolver = "2"
 

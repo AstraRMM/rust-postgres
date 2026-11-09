@@ -58,6 +58,10 @@ ORDER BY attnum
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// Preparation and the type lookups it needs are attributed to
+/// [`Class::Preparation`](crate::observe::Class::Preparation).
+const PREPARATION: Option<crate::observe::Class> = Some(crate::observe::Class::Preparation);
+
 pub async fn prepare(
     client: &Arc<InnerClient>,
     query: &str,
@@ -65,7 +69,10 @@ pub async fn prepare(
 ) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = encode(client, &name, query, types)?;
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let mut responses = client.send_for(
+        RequestMessages::Single(FrontendMessage::Raw(buf)),
+        PREPARATION,
+    )?;
 
     match responses.next().await? {
         Message::ParseComplete => {}
@@ -112,11 +119,12 @@ fn prepare_rec<'a>(
 }
 
 fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
-    if types.is_empty() {
-        debug!("preparing query {}: {}", name, query);
-    } else {
-        debug!("preparing query {} with types {:?}: {}", name, types, query);
-    }
+    // Never log the SQL text: it can embed literals and identifiers.
+    debug!(
+        "preparing statement {} with {} declared parameter types",
+        name,
+        types.len()
+    );
 
     client.with_buf(|buf| {
         frontend::parse(name, query, types.iter().map(Type::oid), buf).map_err(Error::encode)?;
@@ -137,7 +145,7 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
 
     let stmt = typeinfo_statement(client).await?;
 
-    let rows = query::query(client, stmt, slice_iter(&[&oid])).await?;
+    let rows = query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION).await?;
     pin_mut!(rows);
 
     let row = match rows.try_next().await? {
@@ -207,7 +215,7 @@ async fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Erro
 async fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
     let stmt = typeinfo_enum_statement(client).await?;
 
-    query::query(client, stmt, slice_iter(&[&oid]))
+    query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION)
         .await?
         .and_then(|row| async move { row.try_get(0) })
         .try_collect()
@@ -234,7 +242,7 @@ async fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement,
 async fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
     let stmt = typeinfo_composite_statement(client).await?;
 
-    let rows = query::query(client, stmt, slice_iter(&[&oid]))
+    let rows = query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION)
         .await?
         .try_collect::<Vec<_>>()
         .await?;

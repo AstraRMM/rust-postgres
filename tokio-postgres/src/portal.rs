@@ -19,7 +19,7 @@ impl Drop for Inner {
                 frontend::sync(buf);
                 buf.split().freeze()
             });
-            let _ = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+            client.send_detached(RequestMessages::Single(FrontendMessage::Raw(buf)), None);
         }
     }
 }

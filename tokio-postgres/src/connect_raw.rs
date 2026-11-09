@@ -91,6 +91,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: TlsConnect<S>,
 {
+    let result = startup_session(stream, tls, has_hostname, config).await;
+    crate::observe::session(result.is_ok());
+    result
+}
+
+async fn startup_session<S, T>(
+    stream: S,
+    tls: T,
+    has_hostname: bool,
+    config: &Config,
+) -> Result<(Client, Connection<S, T::Stream>), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: TlsConnect<S>,
+{
     let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
 
     let mut stream = StartupStream {

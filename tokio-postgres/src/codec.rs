@@ -25,10 +25,18 @@ impl BackendMessages {
         BackendMessages(BytesMut::new())
     }
 
-    /// The transaction status byte of a chunk the decoder ended at a
-    /// `ReadyForQuery` (only meaningful when `request_complete` is set).
+    /// The raw, unparsed message bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The `ReadyForQuery` status byte, when this batch ends with one. The
+    /// decoder always ends a complete batch at its `ReadyForQuery`.
     pub fn ready_status(&self) -> Option<u8> {
-        self.0.last().copied()
+        match self.0.len().checked_sub(6).map(|start| &self.0[start..]) {
+            Some([backend::READY_FOR_QUERY_TAG, 0, 0, 0, 5, status]) => Some(*status),
+            _ => None,
+        }
     }
 }
 

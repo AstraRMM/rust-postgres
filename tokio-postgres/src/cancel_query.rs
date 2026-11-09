@@ -29,7 +29,7 @@ where
         .map_err(|e| Error::tls(e.into()))?;
     let has_hostname = config.hostname.is_some();
 
-    let socket = connect_socket::connect_socket(
+    let mut socket = connect_socket::connect_socket(
         &config.addr,
         config.port,
         config.connect_timeout,
@@ -37,6 +37,7 @@ where
         config.keepalive.as_ref(),
     )
     .await?;
+    socket.set_observed_role(crate::observe::SocketRole::Cancel);
 
     cancel_query_raw::cancel_query_raw(socket, ssl_mode, tls, has_hostname, process_id, secret_key)
         .await
