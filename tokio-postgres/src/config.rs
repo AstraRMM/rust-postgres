@@ -120,7 +120,7 @@ pub enum Host {
 ///             The value for `host` is ignored unless the authentication method requires it,
 ///             in which case it will be used as the host name.
 /// * `port` - The port to connect to. Multiple ports can be specified, separated by commas. The number of ports must be
-///     either 1, in which case it will be used for all hosts, or the same as the number of hosts. Defaults to 5432 if
+///     either 1, in which case it will be used for all hosts, or the same as the number of hosts. Defaults to 5433 (YSQL) if
 ///     omitted or the empty string.
 /// * `connect_timeout` - The time limit in seconds applied to each socket-level connection attempt. Note that hostnames
 ///     can resolve to multiple IP addresses, and this limit is applied to each address. Defaults to no timeout.
@@ -404,7 +404,7 @@ impl Config {
     /// Adds a port to the configuration.
     ///
     /// Multiple ports can be specified by calling this method multiple times. There must either be no ports, in which
-    /// case the default of 5432 is used, a single port, in which it is used for all hosts, or the same number of ports
+    /// case the default of 5433 (YSQL) is used, a single port, in which it is used for all hosts, or the same number of ports
     /// as hosts.
     pub fn port(&mut self, port: u16) -> &mut Config {
         self.port.push(port);
