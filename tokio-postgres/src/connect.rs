@@ -3,92 +3,23 @@ use crate::config::{Host, LoadBalanceHosts, SslMode, TargetSessionAttrs};
 use crate::connect_raw::connect_raw;
 use crate::connect_socket::connect_socket;
 use crate::endpoint::{self, ResolvedEndpoint};
+use crate::realm::Realm;
 use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
-use futures_util::{future, pin_mut, Future, FutureExt, Stream};
-use lazy_static::lazy_static;
-use log::{debug, info, warn};
+use futures_util::{future, pin_mut, FutureExt, Stream};
+use log::warn;
 use rand::seq::SliceRandom;
-use rand::Rng;
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{cmp, io};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time;
 
-/// Upper bounds on a control connection.
-///
-/// * `CONNECT_TIMEOUT` -- the TCP connect. This is all `Config::connect_timeout`
-///   reaches: `connect_socket` wraps only `TcpStream::connect`, so the SSLRequest
-///   exchange, the TLS handshake and `startup`/`authenticate`/`read_info` are not
-///   covered by it.
-/// * `LOGIN_TIMEOUT` -- establishing the whole session: connect, TLS and
-///   authentication.
-/// * `QUERY_TIMEOUT` -- the `yb_servers()` query once the session exists.
+/// Upper bound on the TCP connect of a control connection. `connect_timeout`
+/// only reaches `TcpStream::connect`; the TLS handshake and authentication
+/// are bounded by the per-attempt limits in [`crate::realm`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Closing a control connection is a courtesy, so it gets a short leash since
-/// the shutdown is awaited while LAST_TIME_META_DATA_FETCHED is still held.
-const CONTROL_CONN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-
-lazy_static! {
-    static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
-        let mut m = HashMap::new();
-        let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
-        let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
-        let host_list = [host_list_primary, host_list_rr].concat();
-        let size = host_list.len();
-        for i in 0..size {
-            let host = host_list.get(i);
-            if host.is_some() {
-                m.insert(host.unwrap().clone(), 0);
-            }
-        }
-        Mutex::new(m)
-    };
-    static ref LAST_TIME_META_DATA_FETCHED: TokioMutex<Instant> = {
-        let m = Instant::now();
-        TokioMutex::new(m)
-    };
-    static ref HOST_INFO_PRIMAY: Mutex<Vec<Host>> = {
-        let m = Vec::new();
-        Mutex::new(m)
-    };
-    static ref HOST_INFO_RR: Mutex<Vec<Host>> = {
-        let m = Vec::new();
-        Mutex::new(m)
-    };
-    static ref FAILED_HOSTS: Mutex<HashMap<Host, Instant>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };
-    pub(crate) static ref PLACEMENT_INFO_MAP_PRIMARY: Mutex<HashMap<String, Vec<Host>>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };
-    pub(crate) static ref PLACEMENT_INFO_MAP_RR: Mutex<HashMap<String, Vec<Host>>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };
-    static ref PUBLIC_HOST_MAP: Mutex<HashMap<Host, Host>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };
-    static ref HOST_TO_PORT_MAP: Mutex<HashMap<Host, u16>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };
-}
-
-static USE_PUBLIC_IP: AtomicBool = AtomicBool::new(false);
 
 pub async fn connect<T>(
     mut tls: T,
@@ -106,7 +37,7 @@ where
 /// while still using the caller-provided TLS connector.
 /// `attempt_timeout` bounds each candidate individually, not the loop as a whole,
 /// so that a couple of blackholed candidates do not starve the rest.
-async fn connect_with_tls_ref<T>(
+pub(crate) async fn connect_with_tls_ref<T>(
     tls: &mut T,
     config: &Config,
     attempt_timeout: Option<Duration>,
@@ -228,136 +159,23 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-    if let Err(e) = check_and_refresh(&mut tls, config).await {
-        // TLS, authentication and authorization failures are terminal: the
-        // configured seeds would fail the same verification again.
-        if e.is_security_failure() {
-            return Err(e);
-        }
-        warn!(
-            "Failed to establish control connection to available servers: {}. Falling back \
-             to the upstream driver behaviour and attempting a connection to the configured host(s) {}",
-            error_chain(&e),
-            seeds_label(config)
-        );
-        let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
-        count_unbalanced_connection(&client);
-        return Ok((client, connection));
-    }
+    let realm = match &config.realm {
+        Some(realm) => realm.clone(),
+        None => Realm::for_config(config),
+    };
+    realm.connect(&mut tls, config).await
+}
 
-    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
-
-    loop {
-        let newhost = get_least_loaded_server(config);
-        let host = match newhost {
-            Ok(host) => host,
-            Err(e) => {
-                // Only fallback to an upstream driver connection when the caller put
-                // no restriction on which node it will accept (`only-rr`,
-                // `only-primary` and `fallback_to_topology_keys_only`).
-                if config.load_balance == "only-rr"
-                    || config.load_balance == "only-primary"
-                    || (!config.topology_keys.is_empty() && config.fallback_to_topology_keys_only)
-                {
-                    return Err(e);
-                }
-                warn!(
-                    "No admitted server available from the discovered topology: {}. Falling back to \
-                     the upstream driver behaviour and attempting a connection to the configured host(s) {}",
-                    error_chain(&e),
-                    seeds_label(config)
-                );
-                let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
-                count_unbalanced_connection(&client);
-                return Ok((client, connection));
-            }
-        };
-
-        let identity = match &host {
-            Host::Tcp(identity) => identity.clone(),
-            #[cfg(unix)]
-            Host::Unix(_) => {
-                add_to_failed_host_list(host.clone());
-                continue;
-            }
-        };
-
-        increase_connection_count(host.clone());
-
-        let port = host_to_port_map.get(&host).copied().unwrap_or(0);
-        let mut target = match resolve_node(config, &identity, port) {
-            Some(target) => target,
-            None => {
-                info!(
-                    "Discovered server {} is not admitted by the trusted endpoint policy, skipping it",
-                    endpoint::label(&identity)
-                );
-                decrease_connection_count(host.clone());
-                add_to_failed_host_list(host.clone());
-                continue;
-            }
-        };
-
-        // Legacy public/private address switching. It is never used with
-        // `verify-full` or an explicit endpoint policy: there the trusted
-        // policy alone decides the dial address and the expected TLS name.
-        if public_ip_mode_allowed(config) && USE_PUBLIC_IP.load(Ordering::SeqCst) {
-            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
-            match public_host_map.get(&host) {
-                Some(Host::Tcp(public)) if !public.is_empty() => {
-                    target.dial = public.clone();
-                    target.tls_name = public.clone();
-                }
-                _ => {
-                    info!(
-                        "Public host not available for private host {}, adding this to failed host list and trying another server",
-                        endpoint::label(&identity)
-                    );
-                    decrease_connection_count(host.clone());
-                    add_to_failed_host_list(host.clone());
-                    continue;
-                }
-            }
-        }
-
-        info!("Creating connection to {}", endpoint::label(&identity));
-        match connect_host(
-            Host::Tcp(target.dial.clone()),
-            Some(target.tls_name.clone()),
-            target.port,
-            &mut tls,
-            config,
-            Some(target.identity.clone()),
-        )
-        .await
-        {
-            Ok((client, connection)) => return Ok((client, connection)),
-            Err(e) => {
-                decrease_connection_count(host.clone());
-                if e.is_security_failure() {
-                    // Never quarantine-and-fall-back on a verification or
-                    // authentication failure: that would hide an identity
-                    // mismatch behind a connection to a different endpoint.
-                    warn!(
-                        "Connection to {} failed a security check: {}",
-                        endpoint::label(&identity),
-                        error_chain(&e)
-                    );
-                    return Err(e);
-                }
-                info!(
-                    "Not able to create connection to {}: {}, adding it to failed host list and trying a different host.",
-                    endpoint::label(&identity),
-                    error_chain(&e)
-                );
-                add_to_failed_host_list(host);
-            }
-        }
-    }
+/// Whether a failed or unavailable topology may fall back to the configured
+/// seeds of the same realm. Restricted routing never falls back.
+pub(crate) fn allows_unbalanced_fallback(config: &Config) -> bool {
+    config.load_balance != "only-rr"
+        && config.load_balance != "only-primary"
+        && (config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only)
 }
 
 /// Whether the legacy public/private address switching may be used.
-fn public_ip_mode_allowed(config: &Config) -> bool {
+pub(crate) fn public_ip_mode_allowed(config: &Config) -> bool {
     config.ssl_mode != SslMode::VerifyFull && config.endpoint_policy.is_none()
 }
 
@@ -424,193 +242,16 @@ fn host_label(host: &Host) -> String {
     }
 }
 
-fn seeds_label(config: &Config) -> String {
+pub(crate) fn seeds_label(config: &Config) -> String {
     let labels: Vec<String> = config.host.iter().map(host_label).collect();
     format!("[{}]", labels.join(", "))
-}
-
-fn increase_connection_count(host: Host) {
-    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
-    let count = conn_map.get(&host);
-    if count.is_none() {
-        conn_map.insert(host.clone(), 1);
-        debug!("Increasing connection count for {} to 1", host_label(&host));
-    } else {
-        let mut conn_count: i64 = *count.unwrap();
-        conn_count += 1;
-        conn_map.insert(host.clone(), conn_count);
-        debug!(
-            "Increasing connection count for {} by one: {}",
-            host_label(&host),
-            conn_count
-        );
-    }
-}
-
-pub(crate) fn decrease_connection_count(host: Host) {
-    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
-    let count = conn_map.get(&host);
-    if count.is_some() {
-        let mut conn_count: i64 = *count.unwrap();
-        if conn_count != 0 {
-            conn_count -= 1;
-            conn_map.insert(host.clone(), conn_count);
-            debug!(
-                "Decremented connection count for {} by one: {}",
-                host_label(&host),
-                conn_count
-            );
-        }
-    }
-}
-
-fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
-    let conn_map = CONNECTION_COUNT_MAP.lock().unwrap().clone();
-    let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
-    let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
-    let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
-    let placement_info_map_primary = PLACEMENT_INFO_MAP_PRIMARY.lock().unwrap().clone();
-    let placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap().clone();
-    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
-    let mut least_host: Vec<Host> = Vec::new();
-
-    // Trusted admission comes before topology, role, preference and load:
-    // a node the realm configuration does not admit is never a candidate.
-    let admitted = |host: &Host| match host {
-        Host::Tcp(identity) => {
-            let port = host_to_port_map.get(host).copied().unwrap_or(0);
-            resolve_node(config, identity, port).is_some()
-        }
-        #[cfg(unix)]
-        Host::Unix(_) => false,
-    };
-    let mut host_list_primary = host_list_primary;
-    let mut host_list_rr = host_list_rr;
-    let mut placement_info_map_primary = placement_info_map_primary;
-    let mut placement_info_map_rr = placement_info_map_rr;
-    host_list_primary.retain(|h| admitted(h));
-    host_list_rr.retain(|h| admitted(h));
-    for hosts in placement_info_map_primary.values_mut() {
-        hosts.retain(|h| admitted(h));
-    }
-    for hosts in placement_info_map_rr.values_mut() {
-        hosts.retain(|h| admitted(h));
-    }
-
-    let mut host_list: Vec<Host>;
-    let mut placement_info_map: HashMap<String, Vec<Host>>;
-
-    if config.load_balance == "only-rr" || config.load_balance == "prefer-rr" {
-        host_list = host_list_rr.clone();
-        placement_info_map = placement_info_map_rr.clone();
-    } else if config.load_balance == "only-primary" || config.load_balance == "prefer-primary" {
-        host_list = host_list_primary.clone();
-        placement_info_map = placement_info_map_primary.clone();
-    } else {
-        host_list = host_list_rr.clone();
-        placement_info_map = placement_info_map_rr.clone();
-        host_list.extend(host_list_primary.clone());
-        for (key, value) in placement_info_map_primary {
-            if let Some(vec) = placement_info_map.get_mut(&key) {
-                vec.extend(value);
-            } else {
-                placement_info_map.insert(key, value);
-            }
-        }
-    }
-
-    if !config.topology_keys.is_empty() {
-        for i in 0..config.topology_keys.len() as i64 {
-            let mut server: Vec<Host> = Vec::new();
-            let prefered_zone = config.topology_keys.get(&(i + 1)).unwrap();
-            for placement_info in prefered_zone.iter() {
-                let to_check_star: Vec<&str> = placement_info.split(".").collect();
-                if to_check_star[2] == "*" {
-                    let star_placement_info: String =
-                        to_check_star[0].to_owned() + "." + to_check_star[1];
-                    let append_hosts = placement_info_map.get(&star_placement_info);
-                    if let Some(append_hosts_value) = append_hosts {
-                        server.extend(append_hosts_value.to_owned());
-                    }
-                } else {
-                    let append_hosts = placement_info_map.get(placement_info);
-                    if let Some(append_hosts_value) = append_hosts {
-                        server.extend(append_hosts_value.to_owned());
-                    }
-                }
-            }
-            least_host = get_least_loaded_hosts(server, conn_map.clone(), failed_host_list.clone());
-
-            if !least_host.is_empty() {
-                break;
-            }
-        }
-    }
-
-    if least_host.is_empty() {
-        if !(config.load_balance == "prefer-primary" || config.load_balance == "prefer-rr") {
-            if config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only {
-                least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
-            } else {
-                return Err(Error::connect(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "no preferred server available, fallback-to-topology-keys-only is set to true",
-                )));
-            }
-        } else {
-            least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
-            if least_host.is_empty() {
-                if config.load_balance == "prefer-rr"{
-                    least_host = get_least_loaded_hosts(host_list_primary, conn_map.clone(), failed_host_list.clone());
-                } else {
-                    least_host = get_least_loaded_hosts(host_list_rr, conn_map.clone(), failed_host_list.clone());
-                }
-            }
-        }
-    }
-
-    if !least_host.is_empty() {
-        info!(
-            "Following hosts have the least number of connections: {:?}, chosing one randomly",
-            least_host.iter().map(host_label).collect::<Vec<_>>()
-        );
-        let num = rand::thread_rng().gen_range(0..least_host.len());
-        Ok(least_host.get(num).cloned().expect("least loaded host value is None"))
-    } else {
-        Err(Error::connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "could not find a server to connect to",
-        )))
-    }
-}
-
-fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed_hosts: HashMap<Host, Instant>) -> Vec<Host> {
-    let mut min_count = i64::MAX;
-    let mut least_host: Vec<Host> = Vec::new();
-    for host in hosts.iter() {
-        if !failed_hosts.contains_key(host) {
-            let count = conn_map.get(host);
-            let mut counter: i64 = 0;
-            if count.is_some() {
-                counter = *count.unwrap();
-            }
-            if min_count > counter {
-                min_count = counter;
-                least_host.clear();
-                least_host.push(host.clone());
-            } else if min_count == counter {
-                least_host.push(host.clone());
-            }
-        }
-    }
-    least_host
 }
 
 /// Walks an [`Error`]'s `source` chain and renders it as a single
 /// `outer: inner: innermost` string, so control-connection failures surface the
 /// real underlying cause (DNS, TCP refused, TLS rejected, auth failed, ...)
 /// instead of a generic wrapper.
-fn error_chain(err: &Error) -> String {
+pub(crate) fn error_chain(err: &Error) -> String {
     use std::error::Error as StdError;
 
     let mut message = err.to_string();
@@ -624,7 +265,7 @@ fn error_chain(err: &Error) -> String {
 
 /// Builds the `Config` used for control connections with connect_timeout bounded to
 /// `CONNECT_TIMEOUT`.
-fn control_connection_config(config: &Config) -> Config {
+pub(crate) fn control_connection_config(config: &Config) -> Config {
     let mut control_config = config.clone();
     control_config.connect_timeout = Some(
         config
@@ -634,26 +275,6 @@ fn control_connection_config(config: &Config) -> Config {
             }),
     );
     control_config
-}
-
-/// Counts a connection that did not come from the load-balanced path.
-///
-/// `increase_connection_count` is otherwise only called for a host chosen by
-/// `get_least_loaded_server`, while the decrement side fires for every client that
-/// is closed or dropped (`lib.rs`, and `Client::drop` in the sync wrapper). Left
-/// asymmetric, a fallback connection to a host that is also a discovered host
-/// decrements a count it never contributed to, and `get_least_loaded_hosts` then
-/// reads the depressed value and treats that host as the least loaded one.
-fn count_unbalanced_connection(client: &Client) {
-    if let Some(socket_config) = client.get_socket_config() {
-        if let Some(node) = socket_config.node {
-            info!(
-                "Counting fallback upstream connection to {} against its connection count.",
-                endpoint::label(&node)
-            );
-            increase_connection_count(Host::Tcp(node));
-        }
-    }
 }
 
 /// Collapses the `time::timeout` result around a control-connection establish into
@@ -682,435 +303,7 @@ fn establish_control_connection<T>(
     }
 }
 
-async fn check_and_refresh<T>(tls: &mut T, config: &Config) -> Result<(), Error>
-where
-    T: MakeTlsConnect<Socket>,
-{
-    let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().await;
-    let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
-    let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
-    let host_list = [host_list_primary, host_list_rr].concat();
-
-    let elapsed = refresh_time.elapsed();
-    if !host_list.is_empty() && elapsed <= config.yb_servers_refresh_interval {
-        debug!(
-            "Skipping `yb_servers()` refresh: last successful refresh was {:?} ago, \
-             within yb_servers_refresh_interval of {:?}",
-            elapsed, config.yb_servers_refresh_interval
-        );
-        return Ok(());
-    }
-
-    let control_config = control_connection_config(config);
-    // LOGIN_TIMEOUT is handed down so that it bounds each configured host separately.
-    let config_err = match connect_with_tls_ref(tls, &control_config, Some(LOGIN_TIMEOUT)).await {
-        Ok((client, connection)) => {
-            info!(
-                "Control connection created to one of the configured host(s) {}",
-                seeds_label(config)
-            );
-            match refresh(client, connection, config).await {
-                Ok(()) => {
-                    *refresh_time = Instant::now();
-                    info!("Resetting LAST_TIME_META_DATA_FETCHED");
-                    return Ok(());
-                }
-                Err(e) => {
-                    // Fall through to the discovered hosts instead of giving up.
-                    info!(
-                        "Control connection to the configured host(s) established but metadata \
-                         refresh failed: {}, trying the discovered servers",
-                        error_chain(&e)
-                    );
-                    e
-                }
-            }
-        }
-        Err(e) => {
-            if e.is_security_failure() {
-                return Err(e);
-            }
-            info!(
-                "Failed to establish control connection to the configured host(s) {}: {}, \
-                 trying the discovered servers",
-                seeds_label(config),
-                error_chain(&e)
-            );
-            e
-        }
-    };
-
-    // Fall back to the servers discovered by an earlier refresh, skipping hosts known
-    // to be down -- but only while their reconnect delay has not elapsed.
-    let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
-    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
-    let host_list: Vec<Host> = host_list
-        .into_iter()
-        .filter(|host| match failed_host_list.get(host) {
-            Some(failed_at) => failed_at.elapsed() > config.failed_host_reconnect_delay_secs,
-            None => true,
-        })
-        .collect();
-    let discovered_candidates = host_list.len();
-
-    debug!(
-        "Discovered hosts to try for a control connection: {:?}; failed hosts \
-         (host, time since marked down, delay {:?}): {:?}",
-        host_list.iter().map(host_label).collect::<Vec<_>>(),
-        config.failed_host_reconnect_delay_secs,
-        failed_host_list
-            .iter()
-            .map(|(host, marked_at)| (host_label(host), marked_at.elapsed()))
-            .collect::<Vec<_>>()
-    );
-
-    let mut discovered_err: Option<Error> = None;
-    for host in host_list {
-        let identity = match &host {
-            Host::Tcp(identity) => identity.clone(),
-            #[cfg(unix)]
-            Host::Unix(_) => continue,
-        };
-        let port = host_to_port_map.get(&host).copied().unwrap_or(0);
-        let mut target = match resolve_node(config, &identity, port) {
-            Some(target) => target,
-            // Not admitted by this realm's trusted configuration.
-            None => continue,
-        };
-        if public_ip_mode_allowed(config) && USE_PUBLIC_IP.load(Ordering::SeqCst) {
-            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
-            match public_host_map.get(&host) {
-                Some(Host::Tcp(public)) if !public.is_empty() => {
-                    target.dial = public.clone();
-                    target.tls_name = public.clone();
-                }
-                _ => {
-                    info!("Public host not available for private host {}, adding this to failed host list and trying another server", endpoint::label(&identity));
-                    add_to_failed_host_list(host.clone());
-                    continue;
-                }
-            }
-        }
-
-        let label = endpoint::label(&identity);
-        match establish_control_connection(
-            &label.to_string(),
-            LOGIN_TIMEOUT,
-            time::timeout(
-                LOGIN_TIMEOUT,
-                connect_host(
-                    Host::Tcp(target.dial.clone()),
-                    Some(target.tls_name.clone()),
-                    target.port,
-                    &mut *tls,
-                    &control_config,
-                    Some(target.identity.clone()),
-                ),
-            )
-            .await,
-        ) {
-            Ok((client, connection)) => {
-                info!("Control connection created to {}", label);
-                match refresh(client, connection, config).await {
-                    Ok(()) => {
-                        *refresh_time = Instant::now();
-                        info!("Resetting LAST_TIME_META_DATA_FETCHED");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if e.is_security_failure() {
-                            return Err(e);
-                        }
-                        info!("Control connection to {} established but metadata refresh failed: {}, adding this to failed host list and trying another server", label, error_chain(&e));
-                        discovered_err = Some(e);
-                        add_to_failed_host_list(host);
-                    }
-                }
-            }
-            Err(e) => {
-                if e.is_security_failure() {
-                    return Err(e);
-                }
-                info!("Failed to establish control connection to {}: {}, adding this to failed host list and trying another server", label, error_chain(&e));
-                discovered_err = Some(e);
-                add_to_failed_host_list(host);
-            }
-        }
-    }
-
-    if discovered_candidates == 0 {
-        warn!(
-            "Failed to refresh metadata using the configured host(s) {}; no \
-             discovered server was available to fall back to",
-            seeds_label(config)
-        );
-    } else {
-        warn!(
-            "Failed to refresh metadata using the configured host(s) {} or any \
-             of the {} discovered server(s)",
-            seeds_label(config),
-            discovered_candidates
-        );
-    }
-
-    Err(match discovered_err {
-        Some(discovered) => Error::connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!(
-                "could not create control connection: configured host(s) {}: {}; \
-                 last discovered server: {}",
-                seeds_label(config),
-                error_chain(&config_err),
-                error_chain(&discovered)
-            ),
-        )),
-        None => config_err,
-    })
-}
-
-fn add_to_failed_host_list(host: Host) {
-    let mut failedhostlist = FAILED_HOSTS.lock().unwrap();
-    failedhostlist.insert(host.clone(), Instant::now());
-    info!("Added {} to failed host list", host_label(&host));
-}
-
-async fn refresh<S>(
-    client: Client,
-    mut connection: Connection<Socket, S>,
-    config: &Config,
-) -> Result<(), Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut control_conn_host = String::new();
-    if let Some(socket_config) = client.get_socket_config() {
-        if let Some(hostname) = socket_config.hostname {
-            control_conn_host = hostname;
-        }
-    }
-
-    info!("Executing query: `select * from yb_servers()` to fetch list of servers");
-    // Drive the control connection inline while the metadata query runs rather
-    // than spawning it onto the runtime. This avoids requiring
-    // `T::Stream: Send + 'static` on the public connect API and lets query
-    // errors propagate to the caller instead of panicking via `unwrap()`.
-    let rows = {
-        let query = client.query("select * from yb_servers()", &[]);
-        pin_mut!(query);
-        time::timeout(
-            QUERY_TIMEOUT,
-            future::poll_fn(|cx| {
-                if connection.poll_unpin(cx)?.is_ready() {
-                    return Poll::Ready(Err(Error::closed()));
-                }
-                query.as_mut().poll(cx)
-            }),
-        )
-        .await
-        .map_err(|_| {
-            Error::connect(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "`select * from yb_servers()` did not complete within {:?}",
-                    QUERY_TIMEOUT
-                ),
-            ))
-        })??
-    };
-
-    // Close the control connection.
-    drop(client);
-    match time::timeout(CONTROL_CONN_CLOSE_TIMEOUT, connection).await {
-        Ok(Ok(())) => debug!(
-            "Control connection to {} closed cleanly",
-            endpoint::label(&control_conn_host)
-        ),
-        Ok(Err(e)) => debug!(
-            "Control connection to {} reported {} while closing",
-            endpoint::label(&control_conn_host),
-            error_chain(&e)
-        ),
-        Err(_) => debug!(
-            "Control connection to {} did not shut down within {:?}, dropping it",
-            endpoint::label(&control_conn_host),
-            CONTROL_CONN_CLOSE_TIMEOUT
-        ),
-    }
-
-    let mut host_list_primary = HOST_INFO_PRIMAY.lock().unwrap();
-    let mut host_list_rr = HOST_INFO_RR.lock().unwrap();
-    let mut failed_host_list = FAILED_HOSTS.lock().unwrap();
-    let mut placement_info_map_primary = PLACEMENT_INFO_MAP_PRIMARY.lock().unwrap();
-    let mut placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap();
-    let mut public_host_map = PUBLIC_HOST_MAP.lock().unwrap();
-    let mut host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap();
-    for row in rows {
-        let host_string: String = row.get("host");
-        let host = Host::Tcp(host_string.to_string());
-        info!("Received entry for host {}", endpoint::label(&host_string));
-        let nodetype: String = row.get("node_type");
-        let portvalue: i64 = row.get("port");
-        if host_string.is_empty() || !(1..=65535).contains(&portvalue) {
-            warn!(
-                "Ignoring yb_servers() entry {} with an empty host or invalid port",
-                endpoint::label(&host_string)
-            );
-            continue;
-        }
-        let port: u16 = portvalue as u16;
-        let cloud: String = row.get("cloud");
-        let region: String = row.get("region");
-        let zone: String = row.get("zone");
-        let public_ip_string: String = row.get("public_ip");
-        let public_ip = Host::Tcp(public_ip_string.to_string());
-        let placement_zone: String = cloud.clone() + "." + &region + "." + &zone;
-        let star_placement_zone: String = cloud.clone() + "." + &region;
-
-        host_to_port_map.insert(host.clone(), port);
-        if !public_ip_string.is_empty() {
-            host_to_port_map.insert(public_ip.clone(), port);
-        }
-
-        if !control_conn_host.is_empty()
-            && !public_ip_string.is_empty()
-            && control_conn_host.eq_ignore_ascii_case(&public_ip_string)
-        {
-            if public_ip_mode_allowed(config) {
-                USE_PUBLIC_IP.store(true, Ordering::SeqCst);
-            } else {
-                warn!(
-                    "The control connection reached a node by its public address; public/private \
-                     address switching is not supported with verify-full or an endpoint policy, \
-                     so discovered nodes are dialled through the trusted endpoint policy only"
-                );
-            }
-        }
-
-        if !failed_host_list.contains_key(&host) {
-            if nodetype == "primary" {
-                if !host_list_primary.contains(&host) {
-                    host_list_primary.push(host.clone());
-                    public_host_map.insert(host.clone(), public_ip.clone());
-                    debug!("Added {} to host list primary", host_label(&host));
-                }
-            } else {
-                if !host_list_rr.contains(&host) {
-                    host_list_rr.push(host.clone());
-                    public_host_map.insert(host.clone(), public_ip.clone());
-                    debug!("Added {} to host list RR", host_label(&host));
-                }
-            }
-        } else {
-            if failed_host_list.get(&host).unwrap().elapsed()
-                > config.failed_host_reconnect_delay_secs
-            {
-                failed_host_list.remove(&host);
-                debug!(
-                    "Marking {} as UP since failed-host-reconnect-delay-secs has elapsed",
-                    host_label(&host)
-                );
-                if nodetype == "primary" {
-                    if !host_list_primary.contains(&host) {
-                        host_list_primary.push(host.clone());
-                        public_host_map.insert(host.clone(), public_ip.clone());
-                        debug!("Added {} to host list primary", host_label(&host));
-                    }
-                } else {
-                    if !host_list_rr.contains(&host) {
-                        host_list_rr.push(host.clone());
-                        public_host_map.insert(host.clone(), public_ip.clone());
-                        debug!("Added {} to host list RR", host_label(&host));
-                    }
-                }
-                make_connection_count_zero(host.clone());
-            } else if host_list_primary.contains(&host) || host_list_rr.contains(&host) {
-                debug!(
-                    "Treating {} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
-                    host_label(&host)
-                );
-                if host_list_primary.contains(&host) {
-                    let index = host_list_primary.iter().position(|x| *x == host).unwrap();
-                    host_list_primary.remove(index);
-                } else {
-                    let index = host_list_rr.iter().position(|x| *x == host).unwrap();
-                    host_list_rr.remove(index);
-                }
-                public_host_map.remove(&host);
-            }
-        }
-
-        if nodetype == "primary" {
-            if placement_info_map_primary.contains_key(&placement_zone) {
-                let mut present_hosts = placement_info_map_primary.get(&placement_zone).unwrap().to_vec();
-                if !present_hosts.contains(&host) {
-                    present_hosts.push(host.clone());
-                    placement_info_map_primary.insert(placement_zone.clone(), present_hosts.to_vec());
-                }
-            } else {
-                let mut host_vec: Vec<Host> = Vec::new();
-                host_vec.push(host.clone());
-                placement_info_map_primary.insert(placement_zone.clone(), host_vec);
-            }
-
-            if placement_info_map_primary.contains_key(&star_placement_zone) {
-                let mut star_present_hosts = placement_info_map_primary
-                    .get(&star_placement_zone)
-                    .unwrap()
-                    .to_vec();
-                if !star_present_hosts.contains(&host) {
-                    star_present_hosts.push(host.clone());
-                    placement_info_map_primary.insert(star_placement_zone.clone(), star_present_hosts.to_vec());
-                }
-            } else {
-                let mut star_host_vec: Vec<Host> = Vec::new();
-                star_host_vec.push(host.clone());
-                placement_info_map_primary.insert(star_placement_zone.clone(), star_host_vec);
-            }
-        } else {
-            if placement_info_map_rr.contains_key(&placement_zone) {
-                let mut present_hosts = placement_info_map_rr.get(&placement_zone).unwrap().to_vec();
-                if !present_hosts.contains(&host) {
-                    present_hosts.push(host.clone());
-                    placement_info_map_rr.insert(placement_zone, present_hosts.to_vec());
-                }
-            } else {
-                let mut host_vec: Vec<Host> = Vec::new();
-                host_vec.push(host.clone());
-                placement_info_map_rr.insert(placement_zone, host_vec);
-            }
-
-            if placement_info_map_rr.contains_key(&star_placement_zone) {
-                let mut star_present_hosts = placement_info_map_rr
-                    .get(&star_placement_zone)
-                    .unwrap()
-                    .to_vec();
-                if !star_present_hosts.contains(&host) {
-                    star_present_hosts.push(host.clone());
-                    placement_info_map_rr.insert(star_placement_zone, star_present_hosts.to_vec());
-                }
-            } else {
-                let mut star_host_vec: Vec<Host> = Vec::new();
-                star_host_vec.push(host.clone());
-                placement_info_map_rr.insert(star_placement_zone, star_host_vec);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn make_connection_count_zero(host: Host) {
-    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
-    let count = conn_map.get(&host);
-    if count.is_none() {
-        return;
-    }
-    conn_map.insert(host.clone(), 0);
-    debug!("Resetting connection count for {} to zero", host_label(&host));
-}
-
-
-async fn connect_host<T>(
+pub(crate) async fn connect_host<T>(
     host: Host,
     hostname: Option<String>,
     port: u16,

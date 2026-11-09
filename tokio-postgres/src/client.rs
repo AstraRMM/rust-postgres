@@ -182,6 +182,9 @@ pub struct Client {
     inner: Arc<InnerClient>,
     #[cfg(feature = "runtime")]
     socket_config: Option<SocketConfig>,
+    /// Releases this connection's node accounting when the client is dropped.
+    #[cfg(feature = "runtime")]
+    lease: Option<Box<dyn std::any::Any + Send + Sync>>,
     ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
@@ -202,6 +205,8 @@ impl Client {
             }),
             #[cfg(feature = "runtime")]
             socket_config: None,
+            #[cfg(feature = "runtime")]
+            lease: None,
             ssl_mode,
             process_id,
             secret_key,
@@ -219,6 +224,11 @@ impl Client {
 
     pub(crate) fn get_socket_config(&self) -> Option<SocketConfig> {
         self.socket_config.clone()
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn set_lease(&mut self, lease: Box<dyn std::any::Any + Send + Sync>) {
+        self.lease = Some(lease);
     }
 
     /// The canonical identity of the node this client is connected to, as

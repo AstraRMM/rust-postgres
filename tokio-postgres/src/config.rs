@@ -12,6 +12,8 @@ use crate::tls::TlsConnect;
 #[cfg(feature = "runtime")]
 use crate::Socket;
 use crate::endpoint::EndpointPolicy;
+#[cfg(feature = "runtime")]
+use crate::realm::Realm;
 use crate::{Client, Connection, Error};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -269,6 +271,12 @@ pub struct Config {
     pub(crate) yb_servers_refresh_interval: Duration,
     pub(crate) fallback_to_topology_keys_only: bool,
     pub(crate) failed_host_reconnect_delay_secs: Duration,
+    pub(crate) yb_acquire_timeout: Duration,
+    pub(crate) yb_attempt_timeout: Duration,
+    pub(crate) yb_max_attempts: usize,
+    pub(crate) yb_topology_max_staleness: Duration,
+    #[cfg(feature = "runtime")]
+    pub(crate) realm: Option<Realm>,
 }
 
 impl Default for Config {
@@ -312,6 +320,12 @@ impl Config {
             yb_servers_refresh_interval: Duration::new(300, 0),
             fallback_to_topology_keys_only: false,
             failed_host_reconnect_delay_secs: Duration::new(5, 0),
+            yb_acquire_timeout: Duration::from_secs(30),
+            yb_attempt_timeout: Duration::from_secs(10),
+            yb_max_attempts: 3,
+            yb_topology_max_staleness: Duration::from_secs(900),
+            #[cfg(feature = "runtime")]
+            realm: None,
         }
     }
 
@@ -750,6 +764,69 @@ impl Config {
 
     /// YugabyteDB Specific.
     ///
+    /// Sets the realm whose owned topology, failure and accounting state
+    /// load-balanced connections use. Without one, an implicit realm keyed by
+    /// the complete trusted seed and TLS configuration is used.
+    #[cfg(feature = "runtime")]
+    pub fn realm(&mut self, realm: Realm) -> &mut Config {
+        self.realm = Some(realm);
+        self
+    }
+
+    /// Gets the configured realm.
+    #[cfg(feature = "runtime")]
+    pub fn get_realm(&self) -> Option<&Realm> {
+        self.realm.as_ref()
+    }
+
+    /// Sets the overall budget for one load-balanced acquisition: discovery,
+    /// DNS, TCP, TLS, authentication and every retry. Defaults to 30 seconds.
+    pub fn yb_acquire_timeout(&mut self, timeout: Duration) -> &mut Config {
+        self.yb_acquire_timeout = timeout;
+        self
+    }
+
+    /// Gets the acquisition budget.
+    pub fn get_yb_acquire_timeout(&self) -> Duration {
+        self.yb_acquire_timeout
+    }
+
+    /// Sets the bound on one node attempt (DNS, TCP, TLS and authentication).
+    /// Defaults to 10 seconds.
+    pub fn yb_attempt_timeout(&mut self, timeout: Duration) -> &mut Config {
+        self.yb_attempt_timeout = timeout;
+        self
+    }
+
+    /// Gets the per-attempt bound.
+    pub fn get_yb_attempt_timeout(&self) -> Duration {
+        self.yb_attempt_timeout
+    }
+
+    /// Sets how many eligible discovered nodes one acquisition may try after
+    /// transport failures. Defaults to 3; at least 1.
+    pub fn yb_max_attempts(&mut self, attempts: usize) -> &mut Config {
+        self.yb_max_attempts = attempts.max(1);
+        self
+    }
+
+    /// Gets the attempt limit.
+    pub fn get_yb_max_attempts(&self) -> usize {
+        self.yb_max_attempts
+    }
+
+    /// Sets how old a topology snapshot may be and still be used when a
+    /// refresh fails. Defaults to 15 minutes.
+    pub fn yb_topology_max_staleness(&mut self, staleness: Duration) -> &mut Config {
+        self.yb_topology_max_staleness = staleness;
+        self
+    }
+
+    /// Gets the maximum staleness.
+    pub fn get_yb_topology_max_staleness(&self) -> Duration {
+        self.yb_topology_max_staleness
+    }
+
     /// Gets the failed_host_reconnect_delay_secs value.
     pub fn get_failed_host_reconnect_delay_secs(&self) -> Duration {
         self.failed_host_reconnect_delay_secs
@@ -996,6 +1073,29 @@ impl Config {
                         failed_host_reconnect_delay_secs as u64,
                     ));
                 }
+            }
+            "yb_acquire_timeout" | "yb_attempt_timeout" | "yb_topology_max_staleness" => {
+                let seconds = value.parse::<u64>().ok().filter(|s| *s > 0).ok_or_else(|| {
+                    Error::config_parse(Box::new(InvalidValue(match key {
+                        "yb_acquire_timeout" => "yb_acquire_timeout",
+                        "yb_attempt_timeout" => "yb_attempt_timeout",
+                        _ => "yb_topology_max_staleness",
+                    })))
+                })?;
+                let duration = Duration::from_secs(seconds);
+                match key {
+                    "yb_acquire_timeout" => self.yb_acquire_timeout(duration),
+                    "yb_attempt_timeout" => self.yb_attempt_timeout(duration),
+                    _ => self.yb_topology_max_staleness(duration),
+                };
+            }
+            "yb_max_attempts" => {
+                let attempts = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|a| (1..=32).contains(a))
+                    .ok_or_else(|| Error::config_parse(Box::new(InvalidValue("yb_max_attempts"))))?;
+                self.yb_max_attempts(attempts);
             }
             key => {
                 return Err(Error::config_parse(Box::new(UnknownOption(
