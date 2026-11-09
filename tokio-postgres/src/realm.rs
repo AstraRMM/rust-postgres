@@ -588,7 +588,14 @@ impl Realm {
             );
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let discovered = time::timeout(remaining, self.discover(tls, config, snapshot.as_deref(), deadline)).await;
+        // AST-2133 hook: discovery (the control connections `discover` opens
+        // and the `yb_servers()` exchange in `query_topology`) is attributed
+        // to `Class::Discovery`, including control-socket bytes.
+        let discovery = crate::observe::with_class(
+            crate::observe::Class::Discovery,
+            self.discover(tls, config, snapshot.as_deref(), deadline),
+        );
+        let discovered = time::timeout(remaining, discovery).await;
         match &discovered {
             Ok(Ok(_)) => *self.inner.last_failure.lock() = None,
             Ok(Err(e)) => *self.inner.last_failure.lock() = Some(error_chain(e)),
