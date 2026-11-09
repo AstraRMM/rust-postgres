@@ -217,9 +217,21 @@ pub struct Wire {
     /// When set, the next `COMMIT` is forwarded to the server and then both
     /// sides are disconnected before the reply reaches the client.
     pub kill_after_commit: AtomicBool,
+    /// While set, nothing is relayed in either direction (a server that
+    /// stops answering, including cancel requests).
+    pub freeze: AtomicBool,
+    injectors: parking_lot::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
 impl Wire {
+    /// Writes `bytes` to every proxied client, as if the server sent them.
+    /// Only safe while the connections are idle.
+    pub fn inject(&self, bytes: &[u8]) -> usize {
+        let mut injectors = self.injectors.lock();
+        injectors.retain(|tx| tx.send(bytes.to_vec()).is_ok());
+        injectors.len()
+    }
+
     pub fn snapshot(&self) -> WireCounts {
         let counts = self.counts.lock();
         let c = |t: u8| counts.get(&t).copied().unwrap_or(0);
@@ -274,8 +286,30 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     server.set_nodelay(true)?;
     let (mut from_client, mut to_client) = client.into_split();
     let (mut from_server, mut to_server) = server.into_split();
+    let (inject_tx, mut inject_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    wire.injectors.lock().push(inject_tx);
+    let down_wire = wire.clone();
     let down = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                read = from_server.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if !down_wire.freeze.load(Ordering::SeqCst)
+                            && to_client.write_all(&buf[..n]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                Some(bytes) = inject_rx.recv() => {
+                    if to_client.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         let _ = to_client.shutdown().await;
     });
     // Startup or cancel packet: length then body, no type byte.
@@ -285,6 +319,9 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     let code = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
     if code == 80877102 {
         wire.cancels.fetch_add(1, Ordering::SeqCst);
+        if wire.freeze.load(Ordering::SeqCst) {
+            return Ok(());
+        }
     } else {
         wire.startups.fetch_add(1, Ordering::SeqCst);
     }
@@ -312,6 +349,9 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
             to_server.write_all(&frame).await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
             return Ok(());
+        }
+        if wire.freeze.load(Ordering::SeqCst) {
+            continue;
         }
         to_server.write_all(&frame).await?;
     }
@@ -343,4 +383,17 @@ pub fn unused_config(addr: SocketAddr) -> Config {
     )
     .parse()
     .unwrap()
+}
+
+/// A backend `ParameterStatus` message.
+pub fn parameter_status(name: &str, value: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    let mut out = vec![b'S'];
+    out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
 }

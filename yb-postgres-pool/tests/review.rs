@@ -235,3 +235,123 @@ fn invalid_pool_config() -> PoolConfig {
     config.max_size = 0;
     config
 }
+
+/// Re-review finding 1: a return whose cleanup fails (a cancelled query on
+/// a server that never answers, cancel request included) aborts the
+/// connection task, so its capacity and process permits are released and a
+/// `max_size = 1` pool can open a replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rereview_1_failed_cleanup_releases_capacity() {
+    for e in engines() {
+        let app = format!("pt_rereview1_{}", e.name);
+        let (addr, wire) = proxy(e.addr).await;
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        config.cleanup_grace = Duration::from_millis(100);
+        config.cleanup_timeout = Duration::from_millis(500);
+        let pool = Pool::new(e.config_at(addr), NoTls, config).unwrap();
+        let pid = backend_pid(&pool.get().await.unwrap()).await;
+        {
+            let client = pool.get().await.unwrap();
+            wire.freeze.store(true, Ordering::SeqCst);
+            let stuck = client.simple_query("SELECT 1");
+            assert!(tokio::time::timeout(Duration::from_millis(200), stuck)
+                .await
+                .is_err());
+        }
+        assert!(
+            eventually(Duration::from_secs(3), || pool
+                .state()
+                .stats
+                .retired_cleanup_failed
+                == 1)
+            .await
+        );
+        assert!(eventually(Duration::from_secs(3), || pool.state().physical == 0).await);
+        wire.freeze.store(false, Ordering::SeqCst);
+        let client = pool.get_within(Duration::from_secs(3)).await.unwrap();
+        let replacement = backend_pid(&client).await;
+        println!(
+            "[{}] rereview 1: stuck session {pid} retired and aborted; replacement {replacement}",
+            e.name
+        );
+        assert_ne!(replacement, pid);
+        drop(client);
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+/// Re-review finding 2: a checkout racing shutdown either is registered
+/// (and force-closed by a zero-drain shutdown) or sees the closure; no live
+/// client leaves a closed pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rereview_2_no_live_client_from_closed_pool() {
+    for e in engines() {
+        let app = format!("pt_rereview2_{}", e.name);
+        let mut leaked = 0;
+        let mut handed_out = 0;
+        for round in 0..30 {
+            let mut config = pool_config(&app);
+            config.max_size = 4;
+            let pool = Pool::new(e.config(), NoTls, config).unwrap();
+            let warm = [
+                pool.get().await.unwrap(),
+                pool.get().await.unwrap(),
+                pool.get().await.unwrap(),
+                pool.get().await.unwrap(),
+            ];
+            drop(warm);
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let pool = pool.clone();
+                    tokio::spawn(
+                        async move { pool.get_within(Duration::from_millis(500)).await.ok() },
+                    )
+                })
+                .collect();
+            for _ in 0..(round % 5) {
+                tokio::task::yield_now().await;
+            }
+            pool.shutdown(Duration::ZERO).await;
+            for task in tasks {
+                if let Some(client) = task.await.unwrap() {
+                    handed_out += 1;
+                    if !eventually(Duration::from_secs(1), || client.is_closed()).await {
+                        leaked += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "[{}] rereview 2: {handed_out} clients handed out around shutdown, {leaked} still open",
+            e.name
+        );
+        assert_eq!(leaked, 0);
+    }
+}
+
+/// Re-review finding 3: a `ParameterStatus` that arrives while a connection
+/// is idle makes checkout retire it instead of handing it out as clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rereview_3_idle_parameter_change_retires() {
+    for e in engines() {
+        let app = format!("pt_rereview3_{}", e.name);
+        let (addr, wire) = proxy(e.addr).await;
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(addr), NoTls, config).unwrap();
+        let pid = backend_pid(&pool.get().await.unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(wire.inject(&parameter_status("TimeZone", "Injected/Zone")) >= 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = pool.get().await.unwrap();
+        let replacement = backend_pid(&client).await;
+        assert_ne!(
+            replacement, pid,
+            "idle session with a changed parameter was handed out"
+        );
+        assert_eq!(pool.state().stats.retired_dirty_session, 1);
+        drop(client);
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
