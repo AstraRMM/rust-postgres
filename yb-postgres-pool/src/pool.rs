@@ -26,6 +26,7 @@ pub struct NativeConnection {
     pub(crate) cache: StatementCache,
     pub(crate) stats: Arc<Stats>,
     terminal: Arc<Mutex<Option<PoolError>>>,
+    task: AbortHandle,
     id: u64,
     generation: Option<u64>,
     created: Instant,
@@ -48,8 +49,15 @@ impl Drop for NativeConnection {
     fn drop(&mut self) {
         self.stats.retired(self.retire);
         // Dropping the client (right after this) releases the driver's
-        // per-node lease (AST-2129) and ends the connection task, which
-        // closes the socket and returns the process-wide permit.
+        // per-node lease (AST-2129) and lets the connection task finish its
+        // outstanding requests, terminate and close the socket, returning
+        // its permits. A connection whose cleanup failed, or that still has
+        // requests in flight, may never get those responses (a cancelled
+        // query on a dead or stalled server): abort its task so the socket
+        // and the permits are released now.
+        if self.retire == Some(Retire::CleanupFailed) || self.client.pending_requests() > 0 {
+            self.task.abort();
+        }
     }
 }
 
@@ -262,6 +270,7 @@ impl<T: PoolTls> Shared<T> {
         let terminal: Arc<Mutex<Option<PoolError>>> = Arc::new(Mutex::new(None));
         let terminal_slot = terminal.clone();
         let mut connection = connection;
+        let task;
         {
             // Hold the registry lock across spawn so the task cannot remove
             // its entry before it is inserted.
@@ -279,6 +288,7 @@ impl<T: PoolTls> Shared<T> {
                 drop(connection);
             });
             live.insert(id, handle.abort_handle());
+            task = handle.abort_handle();
         }
         let mut conn = NativeConnection {
             client,
@@ -288,6 +298,7 @@ impl<T: PoolTls> Shared<T> {
             ),
             stats: self.stats.clone(),
             terminal,
+            task,
             id,
             generation,
             created: Instant::now(),
@@ -329,6 +340,10 @@ impl<T: PoolTls> Shared<T> {
             Some(Retire::Idle)
         } else if conn.client.pending_requests() != 0
             || conn.client.transaction_status() != TransactionStatus::Idle
+            // A ParameterStatus that arrived while the connection was idle
+            // (for example a server-side setting change) means the session
+            // no longer matches what was returned.
+            || conn.client.parameter_status_changes() != conn.param_baseline
         {
             Some(Retire::DirtySession)
         } else {
@@ -362,7 +377,6 @@ impl<T: PoolTls> Shared<T> {
         if conn.cache.sync_epoch(self.epoch.load(Ordering::SeqCst)) {
             bump(&self.stats.statement_invalidations);
         }
-        conn.param_baseline = conn.client.parameter_status_changes();
         Ok(())
     }
 
@@ -784,15 +798,27 @@ impl<T: PoolTls> Pool<T> {
             },
             e = shared.fatal_after(fatal_seq) => Err(e),
         };
-        let conn = result?;
+        let mut conn = result?;
+        // Register the lease before re-checking closure. With `shutdown`
+        // storing `closed` before it reads `borrowed` (both SeqCst), either
+        // shutdown sees this borrower (and waits for or force-closes it) or
+        // this check sees the closure; a live client never leaves a closed
+        // pool.
         shared.borrowed.fetch_add(1, Ordering::SeqCst);
+        let lease = Lease {
+            shared: shared.clone(),
+        };
+        if shared.is_closed() {
+            conn.retire = Some(Retire::Shutdown);
+            drop(conn);
+            drop(lease);
+            return Err(PoolError::kind_only(ErrorKind::PoolClosed));
+        }
         bump(&shared.stats.checkouts);
         shared.touch();
         Ok(PooledClient {
             conn: Some(conn),
-            lease: Some(Lease {
-                shared: shared.clone(),
-            }),
+            lease: Some(lease),
             shared: shared.clone(),
         })
     }
