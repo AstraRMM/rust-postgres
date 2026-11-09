@@ -159,6 +159,8 @@ struct RealmInner {
     snapshot: RwLock<Option<Arc<Topology>>>,
     refresh_gate: tokio::sync::Mutex<()>,
     refresh_epoch: AtomicU64,
+    attempt_epoch: AtomicU64,
+    last_failure: Mutex<Option<String>>,
     discoveries: AtomicU64,
     failures: Mutex<HashMap<String, Instant>>,
     counts: Mutex<HashMap<String, usize>>,
@@ -223,6 +225,8 @@ impl Realm {
                 snapshot: RwLock::new(None),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 refresh_epoch: AtomicU64::new(0),
+                attempt_epoch: AtomicU64::new(0),
+                last_failure: Mutex::new(None),
                 discoveries: AtomicU64::new(0),
                 failures: Mutex::new(HashMap::new()),
                 counts: Mutex::new(HashMap::new()),
@@ -256,7 +260,17 @@ impl Realm {
             return realm.clone();
         }
         if realms.len() >= MAX_IMPLICIT_REALMS {
-            realms.remove(0);
+            // Reclaim the oldest realm nobody uses: leases and in-flight
+            // acquisitions hold references, so an active realm is never
+            // evicted (and duplicated). If every realm is active, grow.
+            if let Some(index) = realms
+                .iter()
+                .position(|(_, realm)| Arc::strong_count(&realm.inner) == 1)
+            {
+                realms.remove(index);
+            } else {
+                warn!("More than {} implicit realms are active; pass explicit realms with Config::realm", MAX_IMPLICIT_REALMS);
+            }
         }
         let realm = Realm::new(format!("implicit-{}", realms.len()));
         realms.push((key, realm.clone()));
@@ -534,6 +548,7 @@ impl Realm {
             }
         }
         let epoch = self.inner.refresh_epoch.load(Ordering::SeqCst);
+        let attempts = self.inner.attempt_epoch.load(Ordering::SeqCst);
         let remaining = deadline.saturating_duration_since(Instant::now());
         let _gate = match time::timeout(remaining, self.inner.refresh_gate.lock()).await {
             Ok(gate) => gate,
@@ -554,8 +569,35 @@ impl Realm {
                 return Ok(topology);
             }
         }
+        // Coalesce failures too: a refresh attempted while this caller
+        // waited failed, so share its outcome instead of repeating it.
+        if self.inner.attempt_epoch.load(Ordering::SeqCst) != attempts {
+            let reason = self
+                .inner
+                .last_failure
+                .lock()
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            return self.stale_or(
+                self.inner.snapshot.read().clone(),
+                config,
+                Error::connect(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("a concurrent topology refresh failed: {}", reason),
+                )),
+            );
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let discovered = time::timeout(remaining, self.discover(tls, config, snapshot.as_deref(), deadline)).await;
+        match &discovered {
+            Ok(Ok(_)) => *self.inner.last_failure.lock() = None,
+            Ok(Err(e)) => *self.inner.last_failure.lock() = Some(error_chain(e)),
+            Err(_) => {
+                *self.inner.last_failure.lock() =
+                    Some("discovery exceeded the acquisition budget".to_string())
+            }
+        }
+        self.inner.attempt_epoch.fetch_add(1, Ordering::SeqCst);
         match discovered {
             Ok(Ok(topology)) => {
                 let topology = Arc::new(topology);
@@ -615,7 +657,8 @@ impl Realm {
         T: MakeTlsConnect<Socket>,
     {
         let control = control_connection_config(config);
-        let attempt = cmp::min(LOGIN_TIMEOUT, deadline.saturating_duration_since(Instant::now()));
+        let attempt_bound = cmp::min(LOGIN_TIMEOUT, config.yb_attempt_timeout);
+        let attempt = cmp::min(attempt_bound, deadline.saturating_duration_since(Instant::now()));
         let mut last = match connect_with_tls_ref(tls, &control, Some(attempt)).await {
             Ok((client, connection)) => {
                 info!("Control connection created to one of the configured host(s) {}", seeds_label(config));
@@ -644,13 +687,22 @@ impl Realm {
                 if remaining.is_zero() {
                     break;
                 }
-                let target = match resolve_node(config, &node.identity, node.port) {
+                let mut target = match resolve_node(config, &node.identity, node.port) {
                     Some(target) => target,
                     None => continue,
                 };
+                if public_ip_mode_allowed(config) && self.inner.public_mode.load(Ordering::SeqCst) {
+                    match &node.public_ip {
+                        Some(public) => {
+                            target.dial = public.clone();
+                            target.tls_name = public.clone();
+                        }
+                        None => continue,
+                    }
+                }
                 let label = endpoint::label(&node.identity);
                 let attempt = time::timeout(
-                    cmp::min(LOGIN_TIMEOUT, remaining),
+                    cmp::min(attempt_bound, remaining),
                     connect_host(
                         Host::Tcp(target.dial.clone()),
                         Some(target.tls_name.clone()),

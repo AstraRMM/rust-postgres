@@ -41,6 +41,7 @@ enum Discovery {
     Empty,
     Stall,
     Slow(u64),
+    SlowError(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +273,11 @@ async fn session(
                         discard_until_sync = true;
                     }
                     Discovery::Stall => tokio::time::sleep(Duration::from_secs(3600)).await,
+                    Discovery::SlowError(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        error(&mut socket, "XX000", "metadata unavailable").await?;
+                        discard_until_sync = true;
+                    }
                     Discovery::Slow(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
                         message(&mut socket, b'1', &[]).await?;
@@ -563,6 +569,48 @@ async fn concurrent_refreshes_coalesce_per_realm() {
     }
     assert_eq!(realm.discovery_count(), 1);
     assert_eq!(cluster.discoveries.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_refreshes_coalesce_and_serve_the_stale_snapshot() {
+    let cluster = Cluster::new("g");
+    let n1 = Node::start(&cluster).await;
+    cluster.publish(&[(&n1, "primary", "z1")]);
+    let realm = Realm::new("coalesce-failure");
+    let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=1");
+    let _held = connect(&conf, &realm).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    cluster.set_discovery(Discovery::SlowError(300));
+    let before = cluster.discoveries.load(Ordering::SeqCst);
+    let attempts: Vec<_> = (0..10)
+        .map(|_| {
+            let (conf, realm) = (conf.clone(), realm.clone());
+            tokio::spawn(async move { connect(&conf, &realm).await.map(|_| ()) })
+        })
+        .collect();
+    for attempt in attempts {
+        attempt.await.unwrap().unwrap();
+    }
+    // One refresh attempt (the seed, then the one known node), shared by all.
+    assert_eq!(cluster.discoveries.load(Ordering::SeqCst) - before, 2);
+}
+
+#[tokio::test]
+async fn discovery_seeds_are_bounded_by_the_attempt_timeout() {
+    let cluster = Cluster::new("h");
+    let (stalled, healthy) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&healthy, "primary", "z1")]);
+    stalled.set(Behaviour::Stall);
+    let conf: Config = format!(
+        "host={},{} port={},{} user=test dbname=test sslmode=disable load_balance=only-primary yb_attempt_timeout=1",
+        stalled.ip, healthy.ip, stalled.port, healthy.port
+    )
+    .parse()
+    .unwrap();
+    let started = Instant::now();
+    let s = connect(&conf, &Realm::new("seed-bound")).await.unwrap();
+    assert_eq!(node_of(&s).await, healthy.ip);
+    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
 }
 
 // ------------------------------------------------ deadlines and cancellation
