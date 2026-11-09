@@ -375,12 +375,7 @@ fn read_log_once(text: &str, app: &str) -> LogCounts {
         if let Some(body) = message.strip_prefix("LOG:  duration: ") {
             let kind = body
                 .split_once(" ms  ")
-                .map(|(_, after)| {
-                    after
-                        .split(|c: char| c == ' ' || c == ':')
-                        .next()
-                        .unwrap_or("")
-                })
+                .map(|(_, after)| after.split([' ', ':']).next().unwrap_or(""))
                 .unwrap_or("");
             match kind {
                 "parse" => counts.parse += 1,

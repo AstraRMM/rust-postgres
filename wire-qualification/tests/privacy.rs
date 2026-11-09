@@ -118,7 +118,7 @@ async fn no_sql_parameters_credentials_or_addresses_reach_the_logs() {
     // Failed authentication with a secret password.
     let mut bad = pg_config(pg_port, "wq_privacy_bad");
     bad.password(WRONG_PASSWORD);
-    let err = open(&bad).await.err().expect("wrong password");
+    let err = open(&bad).await.expect_err("wrong password");
     assert!(
         !Redacted(&err).to_string().contains("postgres\""),
         "{}",

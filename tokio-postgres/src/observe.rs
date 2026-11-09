@@ -452,7 +452,8 @@ pub struct Totals {
     pub late_completed: u64,
     /// Cycles abandoned after their scope finished.
     pub late_abandoned: u64,
-    /// Other events recorded after their scope finished.
+    /// Other updates recorded after their scope finished (for example a
+    /// late batch of rows), counted per update.
     pub late_other: u64,
     sockets: [SocketCounts; 3],
     /// Per-route totals (bounded by [`MAX_ROUTES`] plus `"other"`).
@@ -882,16 +883,11 @@ impl Attribution {
                     data.closed
                 };
                 if closed {
+                    if delta.cycles_completed == 0 && delta.cycles_abandoned == 0 {
+                        LATE_OTHER.fetch_add(1, Relaxed);
+                    }
                     LATE_COMPLETED.fetch_add(delta.cycles_completed, Relaxed);
                     LATE_ABANDONED.fetch_add(delta.cycles_abandoned, Relaxed);
-                    let other = values
-                        .iter()
-                        .fold(0u64, |a, b| a.saturating_add(*b))
-                        .saturating_sub(delta.cycles_completed)
-                        .saturating_sub(delta.cycles_abandoned);
-                    if other > 0 {
-                        LATE_OTHER.fetch_add(other, Relaxed);
-                    }
                 }
                 &SCOPED[self.class.index()]
             }

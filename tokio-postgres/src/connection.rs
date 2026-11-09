@@ -331,7 +331,7 @@ where
             && self
                 .responses
                 .back()
-                .map_or(false, |response| response.observation.is_some())
+                .is_some_and(|response| response.observation.is_some())
     }
 
     fn observe_before_write(&self) -> Option<usize> {

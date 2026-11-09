@@ -554,7 +554,7 @@ async fn session_setup_and_preparation_are_separate_classes() {
     // authentication completes, so read every session's lines.
     let log_before = server_log(&admin, "*").await;
     let (result, counts) = observe::scope("wq.badauth", open(&bad)).await;
-    let err = result.err().expect("authentication must fail");
+    let err = result.expect_err("authentication must fail");
     assert_eq!(err.code(), Some(&SqlState::INVALID_PASSWORD));
     assert_eq!(counts.class(Class::SessionSetup).session_failures, 1);
     assert_eq!(counts.class(Class::SessionSetup).sessions_started, 0);

@@ -58,11 +58,12 @@ containers() {
     -c log_min_duration_statement=0 -c 'log_line_prefix=%a|%e|' -c shared_preload_libraries=pg_stat_statements
     -c pg_stat_statements.track=all)
   docker run -d --name wq-pg --network host -e POSTGRES_PASSWORD="$WQ_PG_PASSWORD" "$pg_image" \
-    -c port=55440 -c listen_addresses=127.0.0.1 "${log_args[@]}" >/dev/null
+    -c port=55440 -c listen_addresses='*' "${log_args[@]}" >/dev/null
   docker run -d --name wq-pg-tls --network host -e POSTGRES_PASSWORD="$WQ_PG_PASSWORD" \
     -v "$fix:/fixtures:ro" --entrypoint /fixtures/pg-entry.sh "$pg_image" 55441 server-valid scram >/dev/null
   docker run -d --name wq-yb --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-plain-entry.sh "$yb_image" 127.0.0.4 >/dev/null
-  wait_for wq-pg 120 docker exec wq-pg pg_isready -h 127.0.0.1 -p 55440 || return 1
+  wait_for wq-pg 180 docker exec wq-pg pg_isready -h 127.0.0.1 -p 55440 || {
+    docker exec wq-pg sh -c 'tail -n 60 /var/lib/postgresql/data/log/*'; return 1; }
   wait_for wq-pg-tls 120 docker exec wq-pg-tls pg_isready -h 127.0.0.1 -p 55441 || return 1
   wait_for wq-yb 420 docker exec wq-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select 1' || return 1
   sleep 3
