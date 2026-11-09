@@ -1,0 +1,555 @@
+//! AST-2128 real-engine qualification of `sslmode=verify-full`.
+//!
+//! Requires the rig from `tls-qualification/rig/run.sh`: PostgreSQL 16
+//! fixtures on 55432-55437 and two single-node YugabyteDB 2025.2.5.2-b5
+//! universes ("realms") on 127.0.0.2 and 127.0.0.3. Fixtures are read from
+//! `TLS_QUAL_FIXTURES`.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use yb_tokio_postgres::endpoint::{EndpointPolicy, NodeEndpoint};
+use yb_tokio_postgres::rustls::{
+    MakeRustlsConnect, ProtocolVersions, TlsConfigErrorKind, TlsMaterial, TlsOptions,
+};
+use yb_tokio_postgres::tls::TlsFailureKind;
+use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
+
+const PASSWORD: &str = "qualification-only";
+const PG_VALID: u16 = 55432;
+const PG_MTLS: u16 = 55433;
+const PG_EXPIRED: u16 = 55434;
+const PG_NOSSL: u16 = 55435;
+const PG_TLS12: u16 = 55436;
+const PG_ROTATED: u16 = 55437;
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var("TLS_QUAL_FIXTURES").expect("TLS_QUAL_FIXTURES")).join(name)
+}
+
+fn read(name: &str) -> Vec<u8> {
+    std::fs::read(fixture(name)).unwrap()
+}
+
+fn roots(name: &str) -> TlsMaterial {
+    TlsMaterial::from_pem(read(name))
+}
+
+fn connector(material: &TlsMaterial) -> MakeRustlsConnect {
+    MakeRustlsConnect::new(material, TlsOptions::new()).unwrap()
+}
+
+fn pg(port: u16, host: &str) -> String {
+    format!("host={host} port={port} user=postgres password={PASSWORD} dbname=postgres")
+}
+
+struct Session {
+    client: Client,
+    generation: Option<u64>,
+    protocol: Option<String>,
+    task: JoinHandle<Result<(), Error>>,
+}
+
+async fn open_config(config: &Config, tls: &MakeRustlsConnect) -> Result<Session, Error> {
+    let (client, connection) = config.connect(tls.clone()).await?;
+    let generation = connection.tls_stream().map(|s| s.generation());
+    let protocol = connection.tls_stream().and_then(|s| s.protocol_version());
+    let task = tokio::spawn(connection);
+    Ok(Session {
+        client,
+        generation,
+        protocol,
+        task,
+    })
+}
+
+async fn open(conninfo: &str, tls: &MakeRustlsConnect) -> Result<Session, Error> {
+    open_config(&conninfo.parse::<Config>()?, tls).await
+}
+
+async fn scalar(client: &Client, sql: &str) -> String {
+    for message in client.simple_query(sql).await.unwrap() {
+        if let SimpleQueryMessage::Row(row) = message {
+            return row.get(0).unwrap_or("").to_string();
+        }
+    }
+    panic!("no row for {sql}");
+}
+
+#[track_caller]
+fn expect_tls(result: Result<Session, Error>, kind: TlsFailureKind) -> Error {
+    match result {
+        Ok(_) => panic!("expected {kind:?}, but the connection succeeded"),
+        Err(e) => {
+            assert_eq!(e.tls_failure(), Some(kind), "unexpected error: {e} / {e:?}");
+            assert!(e.is_security_failure(), "{e}");
+            e
+        }
+    }
+}
+
+/// A raw TCP peer that records everything the client sends and answers the
+/// SSLRequest with `reply`.
+async fn fake_server(reply: &'static [u8]) -> (u16, JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        if let Ok(Ok(n)) = timeout(Duration::from_secs(3), socket.read(&mut buf)).await {
+            seen.extend_from_slice(&buf[..n]);
+            if n > 0 && !reply.is_empty() {
+                let _ = socket.write_all(reply).await;
+            }
+        }
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(700), socket.read(&mut buf)).await {
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        seen
+    });
+    (port, task)
+}
+
+// ---------------------------------------------------------------- positive
+
+#[tokio::test]
+async fn valid_dns_san_tls13_and_pg_stat_ssl() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    assert_eq!(s.generation, Some(1));
+    assert_eq!(s.protocol.as_deref(), Some("TLSv1_3"));
+    assert_eq!(
+        scalar(&s.client, "select ssl::text || ' ' || version from pg_stat_ssl where pid = pg_backend_pid()").await,
+        "true TLSv1.3"
+    );
+    assert_eq!(s.client.node_identity(), Some("localhost"));
+}
+
+#[tokio::test]
+async fn valid_ip_san() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&pg(PG_VALID, "127.0.0.1"), &tls).await.unwrap();
+    assert_eq!(scalar(&s.client, "select 1").await, "1");
+}
+
+#[tokio::test]
+async fn expected_name_is_separate_from_dial_address() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "pg.test")), &tls)
+        .await
+        .unwrap();
+    assert_eq!(scalar(&s.client, "select 1").await, "1");
+}
+
+#[tokio::test]
+async fn scram_channel_binding_required() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&format!("{} channel_binding=require", pg(PG_VALID, "localhost")), &tls)
+        .await
+        .unwrap();
+    assert_eq!(scalar(&s.client, "select 1").await, "1");
+}
+
+#[tokio::test]
+async fn mutual_tls_with_valid_client_certificate() {
+    let tls = connector(
+        &roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), read("client-postgres.key")),
+    );
+    assert!(tls.current().has_client_identity());
+    let s = open(&pg(PG_MTLS, "localhost"), &tls).await.unwrap();
+    let dn = scalar(&s.client, "select client_dn from pg_stat_ssl where pid = pg_backend_pid()").await;
+    assert!(dn.ends_with("CN=postgres"), "{dn}");
+}
+
+#[tokio::test]
+async fn cancel_request_uses_verified_tls() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    let token = s.client.cancel_token();
+    let canceller = {
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel_query(tls).await
+        })
+    };
+    let err = s.client.simple_query("select pg_sleep(30)").await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("57014"), "{err}");
+    canceller.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------- negative
+
+#[tokio::test]
+async fn wrong_ca_is_unknown_issuer() {
+    let tls = connector(&roots("ca-b.crt"));
+    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::UnknownIssuer);
+}
+
+#[tokio::test]
+async fn wrong_dns_san_is_identity_mismatch_and_redacted() {
+    let tls = connector(&roots("ca-a.crt"));
+    let e = expect_tls(
+        open(&format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "wrong.test")), &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
+    let rendered = format!("{e} {e:?}");
+    assert!(!rendered.contains("wrong.test"), "endpoint name leaked: {rendered}");
+    assert!(!rendered.contains("127.0.0.1"), "endpoint address leaked: {rendered}");
+    assert!(rendered.contains("endpoint ep-"), "{rendered}");
+}
+
+#[tokio::test]
+async fn wrong_ip_san_is_identity_mismatch() {
+    let tls = connector(&roots("ca-a.crt"));
+    // PostgreSQL listens on every address; the certificate names only 127.0.0.1.
+    expect_tls(open(&pg(PG_VALID, "127.0.0.2"), &tls).await, TlsFailureKind::IdentityMismatch);
+}
+
+#[tokio::test]
+async fn expired_server_certificate() {
+    let tls = connector(&roots("ca-a.crt"));
+    expect_tls(open(&pg(PG_EXPIRED, "localhost"), &tls).await, TlsFailureKind::Expired);
+}
+
+#[tokio::test]
+async fn revoked_server_certificate() {
+    let tls = connector(&roots("ca-a.crt").with_crl(read("crl-a-revokes-server-valid.pem")));
+    assert_eq!(tls.current().crls(), 1);
+    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::Revoked);
+    let clean = connector(&roots("ca-a.crt").with_crl(read("crl-a-empty.pem")));
+    open(&pg(PG_VALID, "localhost"), &clean).await.unwrap();
+}
+
+#[tokio::test]
+async fn real_server_refusing_tls() {
+    let tls = connector(&roots("ca-a.crt"));
+    expect_tls(open(&pg(PG_NOSSL, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+}
+
+#[tokio::test]
+async fn downgrade_answer_n_is_refused_without_plaintext() {
+    let tls = connector(&roots("ca-a.crt"));
+    let (port, peer) = fake_server(b"N").await;
+    expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+    let seen = peer.await.unwrap();
+    assert_eq!(seen.len(), 8, "only the SSLRequest may be sent: {seen:?}");
+}
+
+#[tokio::test]
+async fn downgrade_error_response_is_not_read() {
+    let tls = connector(&roots("ca-a.crt"));
+    let (port, peer) =
+        fake_server(b"E\x00\x00\x00\x1eSFATAL\x00MDowngrade attempt\x00\x00").await;
+    let e = expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+    assert!(!e.to_string().contains("Downgrade attempt"), "{e}");
+    assert_eq!(peer.await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn garbage_after_tls_accept_fails_the_handshake() {
+    let tls = connector(&roots("ca-a.crt"));
+    let (port, peer) = fake_server(b"Sgarbage that is not a TLS record at all......").await;
+    expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::HandshakeFailure);
+    let seen = peer.await.unwrap();
+    assert!(seen.len() > 8 && seen[8] == 0x16, "a ClientHello, never plaintext, follows: {seen:?}");
+}
+
+#[tokio::test]
+async fn default_mode_refuses_unverified_connector_before_any_byte() {
+    let (port, peer) = fake_server(b"S").await;
+    let config: Config = format!("host=localhost port={port} user=postgres").parse().unwrap();
+    assert_eq!(config.get_ssl_mode(), yb_tokio_postgres::config::SslMode::VerifyFull);
+    let e = config.connect(NoTls).await.err().expect("NoTls must be refused");
+    assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnverifiedConnector), "{e}");
+    assert!(peer.await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn verifying_connector_refuses_weaker_modes_before_any_byte() {
+    let tls = connector(&roots("ca-a.crt"));
+    for mode in ["require", "prefer", "disable"] {
+        let (port, peer) = fake_server(b"S").await;
+        let e = expect_tls(
+            open(&format!("{} sslmode={mode}", pg(port, "localhost")), &tls).await,
+            TlsFailureKind::ModeNotVerifyFull,
+        );
+        assert!(peer.await.unwrap().is_empty(), "{mode}: {e}");
+    }
+    for mode in ["verify-ca", "allow", "bogus"] {
+        assert!(format!("host=x sslmode={mode}").parse::<Config>().is_err(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn missing_expected_identity() {
+    let tls = connector(&roots("ca-a.crt"));
+    let conninfo =
+        format!("hostaddr=127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres");
+    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::NoExpectedIdentity);
+}
+
+#[tokio::test]
+async fn tls12_only_server_needs_explicit_opt_in() {
+    let tls = connector(&roots("ca-a.crt"));
+    expect_tls(open(&pg(PG_TLS12, "localhost"), &tls).await, TlsFailureKind::ProtocolVersion);
+    let tls12 = MakeRustlsConnect::new(
+        &roots("ca-a.crt"),
+        TlsOptions::new().protocol_versions(ProtocolVersions::Tls12AndTls13),
+    )
+    .unwrap();
+    let s = open(&pg(PG_TLS12, "localhost"), &tls12).await.unwrap();
+    assert_eq!(s.protocol.as_deref(), Some("TLSv1_2"));
+}
+
+#[tokio::test]
+async fn absent_required_client_certificate() {
+    let tls = connector(&roots("ca-a.crt"));
+    let e = open(&pg(PG_MTLS, "localhost"), &tls).await.err().expect("must fail");
+    assert!(e.is_security_failure(), "{e}");
+    assert_eq!(e.code().map(|c| c.code()), Some("28000"), "{e}");
+}
+
+#[tokio::test]
+async fn client_certificate_from_untrusted_ca_is_rejected() {
+    let tls = connector(
+        &roots("ca-a.crt").with_client_identity(read("client-wrong-ca.crt"), read("client-wrong-ca.key")),
+    );
+    expect_tls(open(&pg(PG_MTLS, "localhost"), &tls).await, TlsFailureKind::ClientCertificateRejected);
+}
+
+// ----------------------------------------------------- configuration path
+
+#[tokio::test]
+async fn single_validated_configuration_path_from_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("tls-qual-config-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["ca-a.crt", "client-postgres.crt", "client-postgres.key"] {
+        std::fs::copy(fixture(name), dir.join(name)).unwrap();
+    }
+    let key = dir.join("client-postgres.key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let conninfo = format!(
+        "host=localhost port={PG_MTLS} user=postgres dbname=postgres sslrootcert={} sslcert={} sslkey={}",
+        dir.join("ca-a.crt").display(),
+        dir.join("client-postgres.crt").display(),
+        key.display()
+    );
+    let config: Config = conninfo.parse().unwrap();
+    let debug = format!("{config:?}");
+    assert!(!debug.contains(dir.to_str().unwrap()), "paths leaked: {debug}");
+
+    let tls = MakeRustlsConnect::from_config(&config, TlsOptions::new()).unwrap();
+    let s = open_config(&config, &tls).await.unwrap();
+    assert_eq!(scalar(&s.client, "select current_user").await, "postgres");
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let e = MakeRustlsConnect::from_config(&config, TlsOptions::new()).unwrap_err();
+    assert_eq!(e.kind(), TlsConfigErrorKind::KeyPermissions);
+    assert!(!e.to_string().contains(dir.to_str().unwrap()), "{e}");
+
+    let half: Config = format!("host=localhost sslrootcert={} sslcert={}", dir.join("ca-a.crt").display(), dir.join("client-postgres.crt").display()).parse().unwrap();
+    assert_eq!(MakeRustlsConnect::from_config(&half, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::IncompleteClientIdentity);
+    let require: Config = format!("host=localhost sslmode=require sslrootcert={}", dir.join("ca-a.crt").display()).parse().unwrap();
+    assert_eq!(MakeRustlsConnect::from_config(&require, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::ModeNotVerifyFull);
+    let missing: Config = "host=localhost".parse().unwrap();
+    assert_eq!(MakeRustlsConnect::from_config(&missing, TlsOptions::new()).unwrap_err().kind(), TlsConfigErrorKind::MissingRootCert);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------- rotation
+
+#[tokio::test]
+async fn invalid_reloads_keep_the_current_generation() {
+    let tls = connector(&roots("ca-a.crt"));
+    let keys = [read("client-postgres.key"), read("unrelated.key")].concat();
+    let cases: Vec<(&str, TlsMaterial, TlsConfigErrorKind)> = vec![
+        ("malformed root", TlsMaterial::from_pem(&b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"[..]), TlsConfigErrorKind::InvalidRootCertificate),
+        ("empty root", TlsMaterial::from_pem(Vec::new()), TlsConfigErrorKind::NoRootCertificates),
+        ("expired root", roots("server-expired.crt"), TlsConfigErrorKind::CertificateNotCurrentlyValid),
+        ("key mismatch", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), read("unrelated.key")), TlsConfigErrorKind::KeyMismatch),
+        ("expired client", roots("ca-a.crt").with_client_identity(read("client-expired.crt"), read("client-expired.key")), TlsConfigErrorKind::CertificateNotCurrentlyValid),
+        ("two keys", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), keys), TlsConfigErrorKind::MultiplePrivateKeys),
+        ("cert without key", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), Vec::new()), TlsConfigErrorKind::InvalidPrivateKey),
+        ("garbage crl", roots("ca-a.crt").with_crl(&b"garbage"[..]), TlsConfigErrorKind::InvalidCrl),
+    ];
+    let total = cases.len() as u64;
+    for (name, material, kind) in cases {
+        let e = tls.reload(&material).unwrap_err();
+        assert_eq!(e.kind(), kind, "{name}: {e}");
+        assert_eq!(tls.current().id(), 1, "{name}");
+    }
+    assert_eq!(tls.reload_failures(), total);
+    let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    assert_eq!(s.generation, Some(1));
+}
+
+#[tokio::test]
+async fn rotation_keeps_old_sessions_until_revoked_and_revocation_is_prompt() {
+    let tls = connector(&roots("ca-a.crt"));
+    let old = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    assert_eq!(old.generation, Some(1));
+
+    let info = tls.reload(&roots("ca-a2.crt")).unwrap();
+    assert_eq!(info.id(), 2);
+    assert!(!tls.is_current(1));
+    // New connections use only the new generation's roots.
+    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::UnknownIssuer);
+    let new = open(&pg(PG_ROTATED, "localhost"), &tls).await.unwrap();
+    assert_eq!(new.generation, Some(2));
+    // The authenticated old session keeps working until it is retired.
+    assert_eq!(scalar(&old.client, "select 1").await, "1");
+
+    // Emergency revocation closes the idle, still-borrowed session promptly.
+    let started = Instant::now();
+    assert_eq!(tls.revoke_superseded(), 1);
+    assert!(tls.is_revoked(1));
+    let ended = timeout(Duration::from_secs(2), old.task).await.expect("revoked session must close").unwrap();
+    let e = ended.unwrap_err();
+    assert_eq!(e.tls_failure(), Some(TlsFailureKind::GenerationRevoked), "{e}");
+    println!("revoked idle session closed after {:?}", started.elapsed());
+    assert!(old.client.simple_query("select 1").await.unwrap_err().is_closed());
+    assert_eq!(scalar(&new.client, "select 2").await, "2");
+
+    // Overlapping roots during a CA rotation accept both servers.
+    tls.reload(&roots("ca-a-and-a2.crt")).unwrap();
+    open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    open(&pg(PG_ROTATED, "localhost"), &tls).await.unwrap();
+}
+
+#[tokio::test]
+async fn reload_and_drain_bounds_old_sessions() {
+    let tls = connector(&roots("ca-a.crt"));
+    let old = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    let drain = Duration::from_millis(700);
+    let started = Instant::now();
+    tls.reload_and_drain(&roots("ca-a-and-a2.crt"), drain).unwrap();
+    assert_eq!(scalar(&old.client, "select 1").await, "1");
+    let ended = timeout(Duration::from_secs(5), old.task).await.expect("drain bound").unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= drain, "closed before the drain bound: {elapsed:?}");
+    assert!(elapsed < drain + Duration::from_secs(2), "drain overran: {elapsed:?}");
+    assert_eq!(ended.unwrap_err().tls_failure(), Some(TlsFailureKind::GenerationRevoked));
+    println!("drained session closed after {elapsed:?} (bound {drain:?})");
+    let fresh = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    assert_eq!(fresh.generation, Some(2));
+}
+
+#[tokio::test]
+async fn revoking_the_current_generation_refuses_new_connections() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    assert!(tls.revoke_generation(1));
+    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::GenerationRevoked);
+    timeout(Duration::from_secs(2), s.task).await.expect("revoked session must close").unwrap().unwrap_err();
+    tls.reload(&roots("ca-a.crt")).unwrap();
+    open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+}
+
+// -------------------------------------------------- YugabyteDB smart driver
+
+fn yb(host: &str, hostaddr: &str, extra: &str) -> Config {
+    format!("host={host} hostaddr={hostaddr} port=5433 user=yugabyte dbname=yugabyte {extra}")
+        .parse()
+        .unwrap()
+}
+
+async fn servers(client: &Client) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for message in client.simple_query("select host from yb_servers() order by host").await.unwrap() {
+        if let SimpleQueryMessage::Row(row) = message {
+            hosts.push(row.get(0).unwrap().to_string());
+        }
+    }
+    hosts
+}
+
+#[tokio::test]
+async fn yb_balancing_disabled_paths() {
+    let tls = connector(&roots("ca-a.crt"));
+    for config in [yb("yb-a.test", "127.0.0.2", ""), "host=127.0.0.2 port=5433 user=yugabyte dbname=yugabyte".parse().unwrap()] {
+        let s = open_config(&config, &tls).await.unwrap();
+        assert_eq!(servers(&s.client).await, vec!["127.0.0.2"]);
+    }
+    let wrong = connector(&roots("ca-b.crt"));
+    expect_tls(open_config(&yb("yb-a.test", "127.0.0.2", ""), &wrong).await, TlsFailureKind::UnknownIssuer);
+    expect_tls(open_config(&yb("yb-a.test", "127.0.0.3", ""), &tls).await, TlsFailureKind::IdentityMismatch);
+}
+
+#[tokio::test]
+async fn yb_discovered_node_dialled_through_seed_mapping() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &tls)
+        .await
+        .unwrap();
+    // Accounting uses the discovered canonical identity; TLS verified yb-a.test.
+    assert_eq!(s.client.node_identity(), Some("127.0.0.2"));
+}
+
+#[tokio::test]
+async fn yb_discovered_identity_mismatch_is_terminal() {
+    let tls = connector(&roots("ca-a.crt"));
+    let mut config = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    // Admit the discovered identity but verify it as itself: realm B's
+    // certificate has no IP SAN, so the node must be refused rather than
+    // verified against the seed name or silently replaced by the seed.
+    config.endpoint_policy(EndpointPolicy::new().admit_node("127.0.0.3", NodeEndpoint::new()).unwrap());
+    expect_tls(open_config(&config, &tls).await, TlsFailureKind::IdentityMismatch);
+}
+
+#[tokio::test]
+async fn yb_policy_maps_identity_to_tls_name() {
+    let tls = connector(&roots("ca-a.crt"));
+    let mut config = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    config.endpoint_policy(
+        EndpointPolicy::new()
+            .admit_node("127.0.0.3", NodeEndpoint::new().dial("127.0.0.3").tls_name("yb-b.test").port(5433))
+            .unwrap(),
+    );
+    let s = open_config(&config, &tls).await.unwrap();
+    assert_eq!(s.client.node_identity(), Some("127.0.0.3"));
+
+    let mut wrong = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    wrong.endpoint_policy(
+        EndpointPolicy::new()
+            .admit_node("127.0.0.3", NodeEndpoint::new().tls_name("yb-a.test"))
+            .unwrap(),
+    );
+    expect_tls(open_config(&wrong, &tls).await, TlsFailureKind::IdentityMismatch);
+}
+
+#[tokio::test]
+async fn yb_discovery_never_crosses_realms() {
+    let tls = connector(&roots("ca-a.crt"));
+    // Realm A refreshes the (still process-global) topology.
+    let a = open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &tls)
+        .await
+        .unwrap();
+    assert_eq!(servers(&a.client).await, vec!["127.0.0.2"]);
+    // Realm B reuses that snapshot (no refresh). Its trusted configuration
+    // does not admit 127.0.0.2, whose certificate would otherwise verify.
+    for _ in 0..5 {
+        let b = open_config(&yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=600"), &tls)
+            .await
+            .unwrap();
+        assert_ne!(b.client.node_identity(), Some("127.0.0.2"));
+        assert_eq!(servers(&b.client).await, vec!["127.0.0.3"]);
+    }
+}
+
+#[tokio::test]
+async fn yb_discovery_tls_failure_does_not_fall_back() {
+    let wrong = connector(&roots("ca-b.crt"));
+    expect_tls(
+        open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &wrong).await,
+        TlsFailureKind::UnknownIssuer,
+    );
+}

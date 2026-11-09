@@ -1,0 +1,15 @@
+[package]
+name = "tls-qualification"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Real-engine qualification of verify-full TLS, rotation and endpoint admission (AST-2128)"
+
+[dependencies]
+rcgen = { version = "0.13", features = ["pem", "crypto", "aws_lc_rs"], default-features = false }
+time = "0.3"
+
+[dev-dependencies]
+yb-tokio-postgres = { path = "../tokio-postgres", features = ["rustls-aws-lc-rs"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "io-util"] }
+futures-util = "0.3"

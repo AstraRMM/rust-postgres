@@ -9,6 +9,7 @@ members = [
     "postgres-protocol",
     "postgres-types",
     "tokio-postgres",
+    "tls-qualification",
 ]
 resolver = "2"
 
