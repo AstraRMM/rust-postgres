@@ -400,6 +400,7 @@ async fn two_realms_share_no_hosts_counts_failures_or_fallback() {
     ra.invalidate_topology();
     let e = connect(&conf_a, &ra).await.err().expect("realm A is down");
     assert!(!e.is_security_failure(), "{}", e);
+    assert!(e.is_transport(), "{}", e);
     assert_eq!(b1.logins() + b2.logins(), b_logins, "realm A touched realm B");
     assert!(rb.failed_nodes().is_empty());
     assert_eq!(total(&ra), 4, "failed attempts must not leak counts");
@@ -739,6 +740,7 @@ async fn authentication_failure_is_terminal_and_not_a_quarantine() {
     let before = n1.logins() + n2.logins();
     let e = connect(&conf, &realm).await.err().expect("authentication fails");
     assert!(e.is_security_failure(), "{}", e);
+    assert!(!e.is_transport(), "{}", e);
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"));
     assert_eq!(n1.logins() + n2.logins() - before, 1, "no second endpoint may be tried");
     assert!(realm.failed_nodes().is_empty());

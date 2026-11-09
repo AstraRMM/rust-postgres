@@ -878,7 +878,8 @@ fn classify(e: &Error) -> AttemptFailure {
     match e.code().map(|c| c.code()) {
         Some("53300") | Some("57P03") | Some("53400") => AttemptFailure::Busy,
         Some(_) => AttemptFailure::Terminal,
-        None => AttemptFailure::Transport,
+        None if e.is_transport() => AttemptFailure::Transport,
+        None => AttemptFailure::Terminal,
     }
 }
 
