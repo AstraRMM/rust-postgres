@@ -544,6 +544,13 @@ async fn probe_blames_a_limiter_full_of_stalled_dials() {
         ErrorKind::Transport,
         "the only permit is held by a stalled dial, not a connection: {err}"
     );
+    let text = err.to_string();
+    assert!(text.contains("no connection within 300ms"), "{text}");
+    assert!(
+        text.contains("1 of 1 process permits in use (1 dialing)"),
+        "{text}"
+    );
+    assert_eq!(pool.state().stats.acquire_timeouts, 1);
     pending.abort();
     sibling.shutdown(Duration::from_secs(1)).await;
     pool.shutdown(Duration::from_secs(1)).await;

@@ -120,6 +120,14 @@ impl PoolError {
         self
     }
 
+    pub(crate) fn append_message(mut self, detail: &str) -> PoolError {
+        self.message = Some(match self.message.take() {
+            Some(message) => format!("{}; {}", message, detail).into(),
+            None => detail.into(),
+        });
+        self
+    }
+
     /// Classifies a driver error.
     pub fn from_driver(error: yb_tokio_postgres::Error) -> PoolError {
         PoolError {

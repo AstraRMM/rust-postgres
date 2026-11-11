@@ -160,6 +160,18 @@ pub(crate) fn probe_timeout_kind(
     }
 }
 
+fn probe_detail(kind: ErrorKind, start: &Occupancy, end: &Occupancy) -> String {
+    let verdict = if kind == ErrorKind::AcquireTimeout {
+        "pool saturated"
+    } else {
+        "pool not saturated or its connect path stalled"
+    };
+    format!(
+        "probe: {} (wait began: {}; deadline: {})",
+        verdict, start, end
+    )
+}
+
 /// Counts a checkout in progress (activity for pool-set eviction).
 struct Waiting<'a>(&'a AtomicU64);
 
@@ -957,6 +969,12 @@ impl<T: PoolTls> Pool<T> {
     /// driver error's kind. Whether a saturated pool counts as ready is the
     /// service's decision.
     ///
+    /// A classified timeout keeps the checkout's own message (budget,
+    /// borrowed count, last connect failure) and appends both occupancy
+    /// samples. [`PoolStats::acquire_timeouts`] counts every checkout that
+    /// timed out, including one a probe then reports as
+    /// [`ErrorKind::Transport`].
+    ///
     /// A probe is a checkout, so it counts as activity: a [`PoolSet`]
     /// pool that is probed periodically is never evicted for idleness.
     ///
@@ -981,12 +999,10 @@ impl<T: PoolTls> Pool<T> {
             Ok(client) => client,
             Err(error) if error.kind() == ErrorKind::AcquireTimeout => {
                 let after = shared.occupancy();
-                return Err(match probe_timeout_kind(&before, &after, started.elapsed()) {
-                    ErrorKind::AcquireTimeout => error,
-                    kind => error.with_kind(kind).with_message(
-                        "no connection within the probe budget, and this pool's connect path rather than saturation held it up",
-                    ),
-                });
+                let kind = probe_timeout_kind(&before, &after, started.elapsed());
+                return Err(error
+                    .with_kind(kind)
+                    .append_message(&probe_detail(kind, &before, &after)));
             }
             Err(error) => return Err(error),
         };
@@ -1002,7 +1018,8 @@ impl<T: PoolTls> Pool<T> {
                         "checkout used the probe budget of {:?}; no query was sent",
                         budget
                     ),
-                ));
+                )
+                .append_message(&probe_detail(kind, &before, &after)));
             }
         };
         client.native_mut().retire = Some(Retire::ProbeFailed);
