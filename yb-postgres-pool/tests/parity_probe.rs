@@ -131,6 +131,133 @@ async fn session_parameters_apply_and_retire_on_change() {
     }
 }
 
+async fn direct(pg: &yb_postgres_pool::yb_tokio_postgres::Config) -> Result<Client, String> {
+    match pg.connect(NoTls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(connection);
+            Ok(client)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_applies_the_spellings_the_pool_rejects() {
+    for e in engines() {
+        for (options, name, value) in [
+            ("-c TimeZone=America/Chicago", "TimeZone", "America/Chicago"),
+            ("-cTimeZone=America/Chicago", "TimeZone", "America/Chicago"),
+            ("--timezone=America/Chicago", "TimeZone", "America/Chicago"),
+            (
+                "-c Time\\Zone=America/Chicago",
+                "TimeZone",
+                "America/Chicago",
+            ),
+            ("--extra-float-digits=3", "extra_float_digits", "3"),
+            ("-e", "DateStyle", "ISO, DMY"),
+        ] {
+            let mut pg = e.config();
+            pg.options(options);
+            let client = direct(&pg).await.unwrap();
+            assert_eq!(
+                setting(&client, name).await,
+                value,
+                "[{}] {options}",
+                e.name
+            );
+            let err = Pool::new(
+                pg,
+                NoTls,
+                parity("pt_spelling", SessionInit::StartupOptions),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Config, "{options}: {err}");
+        }
+        let mut pg = e.config();
+        pg.options("--time-zone=America/Chicago");
+        let outcome = match direct(&pg).await {
+            Ok(client) => {
+                let zone = setting(&client, "TimeZone").await;
+                assert_ne!(zone, "America/Chicago", "--time-zone set TimeZone");
+                format!("accepted, TimeZone {zone}")
+            }
+            Err(err) => format!("refused: {err}"),
+        };
+        println!("[{}] --time-zone=America/Chicago: {outcome}", e.name);
+        let pool = Pool::new(
+            pg,
+            NoTls,
+            parity("pt_spelling", SessionInit::StartupOptions),
+        )
+        .unwrap();
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_parameters_win_over_role_defaults() {
+    for e in engines() {
+        let admin = e.admin().await;
+        admin
+            .batch_execute(&format!(
+                "DO $$ BEGIN CREATE ROLE pool_parity_login LOGIN PASSWORD '{PG_PASSWORD}'; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+                 ALTER ROLE pool_parity_login SET TimeZone = 'America/Chicago'; \
+                 ALTER ROLE pool_parity_login SET DateStyle = 'SQL, DMY'; \
+                 ALTER ROLE pool_parity_login SET extra_float_digits = 0"
+            ))
+            .await
+            .unwrap();
+        let mut pg = e.config();
+        pg.user("pool_parity_login");
+        let plain = direct(&pg).await.unwrap();
+        assert_eq!(setting(&plain, "TimeZone").await, "America/Chicago");
+        assert_eq!(setting(&plain, "DateStyle").await, "SQL, DMY");
+        assert_eq!(setting(&plain, "extra_float_digits").await, "0");
+        drop(plain);
+
+        for init in [SessionInit::StartupOptions, SessionInit::AfterConnect] {
+            let app = format!("pt_parity_role_{}_{:?}", e.name, init).to_lowercase();
+            let pool = Pool::new(pg.clone(), NoTls, parity(&app, init)).unwrap();
+            let client = pool.get().await.unwrap();
+            assert_eq!(setting(&client, "TimeZone").await, "UTC", "{init:?}");
+            assert_eq!(setting(&client, "DateStyle").await, "ISO, MDY", "{init:?}");
+            assert_eq!(
+                setting(&client, "extra_float_digits").await,
+                "2",
+                "{init:?}"
+            );
+            let pid = backend_pid(&client).await;
+
+            client
+                .batch_execute("SET extra_float_digits = 3; RESET ALL")
+                .await
+                .unwrap();
+            let after_reset = (
+                setting(&client, "TimeZone").await,
+                setting(&client, "extra_float_digits").await,
+            );
+            drop(client);
+            let next = backend_pid(&pool.get().await.unwrap()).await;
+            match init {
+                SessionInit::StartupOptions => {
+                    assert_eq!(after_reset, ("UTC".into(), "2".into()));
+                    assert_eq!(next, pid, "RESET ALL kept the pool's values");
+                }
+                _ => {
+                    assert_eq!(after_reset, ("America/Chicago".into(), "0".into()));
+                    assert_ne!(next, pid, "the reverted TimeZone retired the session");
+                }
+            }
+            println!(
+                "[{}] {:?} over role defaults: RESET ALL gives {:?}",
+                e.name, init, after_reset
+            );
+            pool.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caller_options_cannot_override_session_parameters() {
     let addr = refused_addr();
