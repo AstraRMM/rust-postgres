@@ -1,5 +1,6 @@
 //! Prometheus text rendering of pool state and counters.
 
+use crate::error::PoolError;
 use crate::pool::PoolState;
 use std::fmt::Write;
 use std::time::Duration;
@@ -148,22 +149,29 @@ fn escape(value: &str) -> String {
     out
 }
 
-fn label_set(labels: &[(&str, &str)]) -> String {
+fn label_set(labels: &[(&str, &str)]) -> Result<String, PoolError> {
     let mut seen: Vec<&str> = Vec::new();
     let mut out = String::new();
     for (name, value) in labels {
-        assert!(
-            valid_name(name) && !name.starts_with("__") && !RESERVED_LABELS.contains(name),
-            "invalid pool metric label name"
-        );
-        assert!(!seen.contains(name), "duplicate pool metric label name");
+        if !valid_name(name) || name.starts_with("__") || RESERVED_LABELS.contains(name) {
+            return Err(PoolError::config(format!(
+                "invalid or reserved pool metric label name {:?}",
+                name
+            )));
+        }
+        if seen.contains(name) {
+            return Err(PoolError::config(format!(
+                "pool metric label {:?} is repeated",
+                name
+            )));
+        }
         seen.push(name);
         if !out.is_empty() {
             out.push(',');
         }
         let _ = write!(out, "{}=\"{}\"", name, escape(value));
     }
-    out
+    Ok(out)
 }
 
 /// Renders several pools in the Prometheus text format under `namespace`,
@@ -177,17 +185,26 @@ fn label_set(labels: &[(&str, &str)]) -> String {
 /// The limiter gauges describe the process-wide limiter the pool shares, so
 /// pools sharing one report the same values.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `namespace` is not a valid metric name prefix, or if a label
-/// name is invalid, reserved (`__*`, `kind`, `reason`) or repeated within a
-/// pool's labels.
-pub fn render_pools_prometheus(namespace: &str, pools: &[(&[(&str, &str)], &PoolState)]) -> String {
-    assert!(valid_name(namespace), "invalid metric namespace");
-    let rendered: Vec<(String, Vec<Family>)> = pools
-        .iter()
-        .map(|(labels, state)| (label_set(labels), families(state)))
-        .collect();
+/// [`ErrorKind::Config`](crate::ErrorKind::Config) if `namespace` is not a
+/// valid metric name prefix, or if a label name is invalid, reserved
+/// (`__*`, `kind`, `reason`) or repeated within a pool's labels. Nothing is
+/// rendered then.
+pub fn render_pools_prometheus(
+    namespace: &str,
+    pools: &[(&[(&str, &str)], &PoolState)],
+) -> Result<String, PoolError> {
+    if !valid_name(namespace) {
+        return Err(PoolError::config(format!(
+            "invalid metric namespace {:?}",
+            namespace
+        )));
+    }
+    let mut rendered: Vec<(String, Vec<Family>)> = Vec::with_capacity(pools.len());
+    for (labels, state) in pools {
+        rendered.push((label_set(labels)?, families(state)));
+    }
     let mut out = String::new();
     let count = rendered.first().map_or(0, |(_, families)| families.len());
     for index in 0..count {
@@ -221,7 +238,7 @@ pub fn render_pools_prometheus(namespace: &str, pools: &[(&[(&str, &str)], &Pool
             }
         }
     }
-    out
+    Ok(out)
 }
 
 impl PoolState {
@@ -229,10 +246,14 @@ impl PoolState {
     /// with `labels` on every series. See [`render_pools_prometheus`] for
     /// the metric names and for exporting several pools in one scrape.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// As [`render_pools_prometheus`].
-    pub fn render_prometheus(&self, namespace: &str, labels: &[(&str, &str)]) -> String {
+    pub fn render_prometheus(
+        &self,
+        namespace: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<String, PoolError> {
         render_pools_prometheus(namespace, &[(labels, self)])
     }
 }

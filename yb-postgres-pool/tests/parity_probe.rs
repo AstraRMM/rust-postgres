@@ -270,7 +270,7 @@ async fn probe_reuses_on_success_and_retires_on_timeout_or_drop() {
         assert_eq!(stats.checkouts, 6, "{stats:?}");
         assert_eq!(stats.probes, 0, "{stats:?}");
 
-        let text = state.render_prometheus("pt", &[("pool", "probe")]);
+        let text = state.render_prometheus("pt", &[("pool", "probe")]).unwrap();
         for line in [
             "pt_pool_probes_total{pool=\"probe\",kind=\"readiness\"} 6",
             "pt_pool_probe_failures_total{pool=\"probe\",kind=\"readiness\"} 2",
@@ -303,7 +303,7 @@ async fn prometheus_export_is_grouped_and_bounded() {
     let (sa, sb) = (a.state(), b.state());
     let a_labels: &[(&str, &str)] = &[("service", "git-storage"), ("pool", "primary")];
     let b_labels: &[(&str, &str)] = &[("service", "git-storage"), ("pool", "q\"d\\\n")];
-    let text = render_pools_prometheus("git_storage", &[(a_labels, &sa), (b_labels, &sb)]);
+    let text = render_pools_prometheus("git_storage", &[(a_labels, &sa), (b_labels, &sb)]).unwrap();
 
     let mut families = HashSet::new();
     let mut current = String::new();
@@ -339,14 +339,15 @@ async fn prometheus_export_is_grouped_and_bounded() {
         assert!(text.lines().any(|l| l == line), "{line} missing from\n{text}");
     }
     assert_eq!(
-        sa.render_prometheus("git_storage", a_labels),
-        render_pools_prometheus("git_storage", &[(a_labels, &sa)])
+        sa.render_prometheus("git_storage", a_labels).unwrap(),
+        render_pools_prometheus("git_storage", &[(a_labels, &sa)]).unwrap()
     );
     assert!(sa
         .render_prometheus("ns", &[])
+        .unwrap()
         .lines()
         .any(|l| l == "ns_pool_physical_connections 0"));
-    assert_eq!(render_pools_prometheus("ns", &[]), "");
+    assert_eq!(render_pools_prometheus("ns", &[]).unwrap(), "");
     a.shutdown(Duration::from_secs(1)).await;
     b.shutdown(Duration::from_secs(1)).await;
 }
@@ -362,21 +363,12 @@ async fn prometheus_export_rejects_unbounded_label_names() {
         &[("bad-name", "x")][..],
         &[("pool", "a"), ("pool", "b")][..],
     ] {
-        let state = state.clone();
-        let labels: Vec<(String, String)> = labels
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let rendered = std::panic::catch_unwind(move || {
-            let labels: Vec<(&str, &str)> = labels
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            state.render_prometheus("ns", &labels)
-        });
-        assert!(rendered.is_err());
+        let err = state.render_prometheus("ns", labels).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config, "{labels:?}: {err}");
     }
-    let rendered = std::panic::catch_unwind(move || state.render_prometheus("9ns", &[]));
-    assert!(rendered.is_err());
+    for namespace in ["", "9ns", "a-b", "a:b"] {
+        let err = state.render_prometheus(namespace, &[]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config, "{namespace:?}: {err}");
+    }
     pool.shutdown(Duration::from_secs(1)).await;
 }
