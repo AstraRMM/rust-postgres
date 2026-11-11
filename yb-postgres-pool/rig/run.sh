@@ -50,7 +50,7 @@ pool() {
     --entrypoint /fixtures/yb-plain-entry.sh "$yb_image" 127.0.0.4 5434 >/dev/null
   wait_for pool-pg 120 docker exec pool-pg pg_isready -h 127.0.0.1 -p 55440 || return 1
   wait_for pool-pg-tls 120 docker exec pool-pg-tls pg_isready -h 127.0.0.1 -p 55441 || return 1
-  wait_for pool-yb 420 docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -c 'select 1' || { status=1; return 1; }
+  wait_for pool-yb 420 docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -c 'select 1' || return 1
   docker exec pool-pg psql -U postgres -h 127.0.0.1 -p 55440 -Atc 'select version()'
   docker exec pool-yb /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -p 5434 -U yugabyte -Atc 'select version()'
   docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' "$pg_image" "$yb_image"
@@ -66,7 +66,7 @@ legacy() {
   docker rm -f legacy-pg >/dev/null 2>&1
   docker run -d --name legacy-pg -p 5433:5433 -e POSTGRES_PASSWORD=postgres \
     -v "$root/docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh:ro" postgres:14 >/dev/null
-  wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || { status=1; return 1; }
+  wait_for legacy-pg 120 docker exec legacy-pg psql -U postgres -p 5433 -h localhost -c 'select 1' || return 1
   record legacy-tokio-postgres cargo test -p yb-tokio-postgres --test test
   record legacy-postgres cargo test -p yb-postgres
   docker rm -f legacy-pg >/dev/null
@@ -74,9 +74,9 @@ legacy() {
 
 case $mode in
   check) check ;;
-  pool) pool ;;
-  legacy) legacy ;;
-  all) check; pool; legacy ;;
+  pool) pool || status=1 ;;
+  legacy) legacy || status=1 ;;
+  all) check; pool || status=1; legacy || status=1 ;;
 esac
 step "summary status=$status"
 exit $status
