@@ -204,7 +204,7 @@ async fn probe_times_out_while_connecting() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn probe_reuses_on_success_and_retires_on_query_timeout() {
+async fn probe_reuses_on_success_and_retires_on_timeout_or_drop() {
     for e in engines() {
         let app = format!("pt_probe_ready_{}", e.name);
         let (addr, wire) = proxy(e.addr).await;
@@ -233,22 +233,39 @@ async fn probe_reuses_on_success_and_retires_on_query_timeout() {
         wire.freeze.store(false, Ordering::SeqCst);
 
         pool.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(pool.state().stats.connects, 2);
+
+        wire.freeze.store(true, Ordering::SeqCst);
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(300),
+            pool.probe(Duration::from_secs(5)),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the probe future was dropped mid-query");
+        let stats = pool.state().stats;
+        assert_eq!(stats.readiness_probes, 5, "{stats:?}");
+        assert_eq!(stats.readiness_probe_failures, 2, "{stats:?}");
+        assert!(stats.readiness_probe_time >= Duration::from_millis(780));
+        assert!(eventually(Duration::from_secs(5), || pool.state().physical == 0).await);
+        wire.freeze.store(false, Ordering::SeqCst);
+
+        pool.probe(Duration::from_secs(5)).await.unwrap();
         let state = pool.state();
         let stats = &state.stats;
-        assert_eq!(stats.readiness_probes, 4, "{stats:?}");
-        assert_eq!(stats.readiness_probe_failures, 1, "{stats:?}");
-        assert_eq!(stats.retired_probe_failed, 1, "{stats:?}");
-        assert_eq!(stats.connects, 2, "{stats:?}");
-        assert_eq!(stats.checkouts, 4, "{stats:?}");
+        assert_eq!(stats.readiness_probes, 6, "{stats:?}");
+        assert_eq!(stats.readiness_probe_failures, 2, "{stats:?}");
+        assert_eq!(stats.retired_probe_failed, 2, "{stats:?}");
+        assert_eq!(stats.connects, 3, "{stats:?}");
+        assert_eq!(stats.checkouts, 6, "{stats:?}");
         assert_eq!(stats.probes, 0, "{stats:?}");
 
         let text = state.render_prometheus("pt", &[("pool", "probe")]);
         for line in [
-            "pt_pool_probes_total{pool=\"probe\",kind=\"readiness\"} 4",
-            "pt_pool_probe_failures_total{pool=\"probe\",kind=\"readiness\"} 1",
-            "pt_pool_retirements_total{pool=\"probe\",reason=\"probe_failed\"} 1",
-            "pt_pool_connects_total{pool=\"probe\"} 2",
-            "pt_pool_checkouts_total{pool=\"probe\"} 4",
+            "pt_pool_probes_total{pool=\"probe\",kind=\"readiness\"} 6",
+            "pt_pool_probe_failures_total{pool=\"probe\",kind=\"readiness\"} 2",
+            "pt_pool_retirements_total{pool=\"probe\",reason=\"probe_failed\"} 2",
+            "pt_pool_connects_total{pool=\"probe\"} 3",
+            "pt_pool_checkouts_total{pool=\"probe\"} 6",
         ] {
             assert!(
                 text.lines().any(|l| l == line),

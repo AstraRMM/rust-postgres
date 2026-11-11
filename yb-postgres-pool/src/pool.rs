@@ -830,18 +830,14 @@ impl<T: PoolTls> Pool<T> {
     /// Readiness probe. Borrows a client within `min(budget,
     /// acquire_timeout)` and runs one empty simple query within what is left
     /// of `budget`. The client goes back to the pool only when the query
-    /// succeeds; a failed, timed-out or abandoned probe retires it. Counted in
-    /// [`PoolStats::readiness_probes`] and
+    /// succeeds; a failed, timed-out or abandoned probe retires it. Every
+    /// call is counted in [`PoolStats::readiness_probes`], and every call
+    /// that does not succeed, including one whose future is dropped, in
     /// [`PoolStats::readiness_probe_failures`].
     pub async fn probe(&self, budget: Duration) -> Result<(), PoolError> {
-        let stats = &self.inner.shared.stats;
-        bump(&stats.readiness_probes);
-        let started = Instant::now();
-        let result = self.run_probe(started, budget).await;
-        add_duration(&stats.readiness_probe_nanos, started.elapsed());
-        if result.is_err() {
-            bump(&stats.readiness_probe_failures);
-        }
+        let mut record = ProbeRecord::start(&self.inner.shared.stats);
+        let result = self.run_probe(record.started, budget).await;
+        record.succeeded = result.is_ok();
         result
     }
 
@@ -1017,6 +1013,32 @@ impl<T: PoolTls> Pool<T> {
             borrowed_at_deadline,
             forced_closes,
             physical_after: shared.live.lock().len() as u32,
+        }
+    }
+}
+
+struct ProbeRecord<'a> {
+    stats: &'a Stats,
+    started: Instant,
+    succeeded: bool,
+}
+
+impl<'a> ProbeRecord<'a> {
+    fn start(stats: &'a Stats) -> ProbeRecord<'a> {
+        bump(&stats.readiness_probes);
+        ProbeRecord {
+            stats,
+            started: Instant::now(),
+            succeeded: false,
+        }
+    }
+}
+
+impl Drop for ProbeRecord<'_> {
+    fn drop(&mut self) {
+        add_duration(&self.stats.readiness_probe_nanos, self.started.elapsed());
+        if !self.succeeded {
+            bump(&self.stats.readiness_probe_failures);
         }
     }
 }
