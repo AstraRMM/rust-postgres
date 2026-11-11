@@ -121,6 +121,7 @@ pub(crate) struct Occupancy {
     pub(crate) permits_dialing: u32,
     pub(crate) permits_max: u32,
     pub(crate) oldest_dial: Option<Duration>,
+    pub(crate) mean_connect: Option<Duration>,
     pub(crate) connect_errors: u64,
 }
 
@@ -151,7 +152,10 @@ pub(crate) fn probe_timeout_kind(
     end: &Occupancy,
     waited: Duration,
 ) -> ErrorKind {
-    let stalled_dial = end.oldest_dial.is_some_and(|age| age >= waited / 2);
+    let threshold = end
+        .mean_connect
+        .map_or(waited / 2, |mean| (waited / 2).max(mean * 2));
+    let stalled_dial = end.oldest_dial.is_some_and(|age| age >= threshold);
     let failed_dial = end.connect_errors > start.connect_errors;
     if stalled_dial || failed_dial || !(start.saturated() || end.saturated()) {
         ErrorKind::Transport
@@ -622,6 +626,13 @@ impl<T: PoolTls> Shared<T> {
                 .values()
                 .map(|started| now.duration_since(*started))
                 .max(),
+            mean_connect: match self.stats.connects.load(Ordering::Relaxed) {
+                0 => None,
+                connects => Some(
+                    Duration::from_nanos(self.stats.connect_nanos.load(Ordering::Relaxed))
+                        / u32::try_from(connects).unwrap_or(u32::MAX),
+                ),
+            },
             connect_errors: self.connect_error_seq.load(Ordering::SeqCst),
         }
     }
@@ -949,7 +960,9 @@ impl<T: PoolTls> Pool<T> {
     /// case it reports [`ErrorKind::Transport`]. The evidence is:
     ///
     /// * one of this pool's dials was still in flight at the deadline after
-    ///   running for at least half the wait;
+    ///   running for at least half the wait, or for twice the pool's mean
+    ///   successful connect time if that is longer (half the wait alone
+    ///   until the pool has connected once);
     /// * one of this pool's dials failed during the wait;
     /// * the pool had room both when the wait began and at the deadline:
     ///   fewer than `max_size` clients borrowed, and process-wide permits
@@ -1548,6 +1561,7 @@ mod tests {
             permits_dialing: 0,
             permits_max: 4,
             oldest_dial: None,
+            mean_connect: None,
             connect_errors: 7,
         };
         let full = Occupancy {
@@ -1581,6 +1595,32 @@ mod tests {
             ..full
         };
         assert_eq!(kind(&full, &stalled), ErrorKind::Transport);
+        let slow_endpoint = Occupancy {
+            mean_connect: Some(Duration::from_millis(300)),
+            ..replacing
+        };
+        let replacing_slowly = Occupancy {
+            oldest_dial: Some(Duration::from_millis(250)),
+            ..slow_endpoint
+        };
+        assert_eq!(
+            kind(&full, &replacing_slowly),
+            ErrorKind::AcquireTimeout,
+            "a budget under twice the connect latency while replacing a connection"
+        );
+        let stalled_slow_endpoint = Occupancy {
+            oldest_dial: Some(Duration::from_millis(600)),
+            ..slow_endpoint
+        };
+        assert_eq!(kind(&full, &stalled_slow_endpoint), ErrorKind::Transport);
+        let replacing_without_history = Occupancy {
+            oldest_dial: Some(Duration::from_millis(250)),
+            ..replacing
+        };
+        assert_eq!(
+            kind(&full, &replacing_without_history),
+            ErrorKind::Transport
+        );
         let failed = Occupancy {
             connect_errors: 8,
             ..full
