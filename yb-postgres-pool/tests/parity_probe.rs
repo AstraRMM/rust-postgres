@@ -183,6 +183,17 @@ async fn probe_of_a_pool_that_cannot_connect() {
     pool.shutdown(Duration::from_secs(1)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_rejects_a_zero_budget() {
+    let pool = Pool::new(unused_config(refused_addr()), NoTls, PoolConfig::default()).unwrap();
+    let err = pool.probe(Duration::ZERO).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Config, "{err}");
+    let stats = pool.state().stats;
+    assert_eq!(stats.readiness_probes, 0);
+    assert_eq!(stats.connects + stats.connect_failures, 0);
+    pool.shutdown(Duration::from_secs(1)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_times_out_while_connecting() {
     let addr = stall_listener().await;

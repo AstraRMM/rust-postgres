@@ -830,11 +830,18 @@ impl<T: PoolTls> Pool<T> {
     /// Readiness probe. Borrows a client within `min(budget,
     /// acquire_timeout)` and runs one empty simple query within what is left
     /// of `budget`. The client goes back to the pool only when the query
-    /// succeeds; a failed, timed-out or abandoned probe retires it. Every
+    /// succeeds; a failed, timed-out or abandoned query retires it. When
+    /// less than 5 ms of the budget is left after the checkout, no query is
+    /// sent, the probe fails and the client goes back to the pool unchanged.
+    /// A zero `budget` is rejected with [`ErrorKind::Config`] and not
+    /// counted. Otherwise every
     /// call is counted in [`PoolStats::readiness_probes`], and every call
     /// that does not succeed, including one whose future is dropped, in
     /// [`PoolStats::readiness_probe_failures`].
     pub async fn probe(&self, budget: Duration) -> Result<(), PoolError> {
+        if budget.is_zero() {
+            return Err(PoolError::config("probe budget must be non-zero"));
+        }
         let mut record = ProbeRecord::start(&self.inner.shared.stats);
         let result = self.run_probe(record.started, budget).await;
         record.succeeded = result.is_ok();
@@ -843,8 +850,19 @@ impl<T: PoolTls> Pool<T> {
 
     async fn run_probe(&self, started: Instant, budget: Duration) -> Result<(), PoolError> {
         let mut client = self.get_within(budget).await?;
+        let remaining = match probe_query_budget(budget, started.elapsed()) {
+            Some(remaining) => remaining,
+            None => {
+                return Err(PoolError::new(
+                    ErrorKind::AcquireTimeout,
+                    format!(
+                        "checkout used the probe budget of {:?}; no query was sent",
+                        budget
+                    ),
+                ))
+            }
+        };
         client.native_mut().retire = Some(Retire::ProbeFailed);
-        let remaining = budget.saturating_sub(started.elapsed());
         let outcome = tokio::time::timeout(remaining, client.client().simple_query("")).await;
         match outcome {
             Ok(Ok(_)) => {
@@ -1015,6 +1033,12 @@ impl<T: PoolTls> Pool<T> {
             physical_after: shared.live.lock().len() as u32,
         }
     }
+}
+
+pub(crate) const PROBE_QUERY_FLOOR: Duration = Duration::from_millis(5);
+
+pub(crate) fn probe_query_budget(budget: Duration, elapsed: Duration) -> Option<Duration> {
+    Some(budget.saturating_sub(elapsed)).filter(|left| *left >= PROBE_QUERY_FLOOR)
 }
 
 struct ProbeRecord<'a> {
@@ -1352,6 +1376,26 @@ mod tests {
         SessionConfig, SessionInit, SessionParameters,
     };
     use std::time::Duration;
+
+    #[test]
+    fn probe_sends_its_query_only_with_budget_left() {
+        use crate::pool::{probe_query_budget, PROBE_QUERY_FLOOR};
+        let budget = Duration::from_secs(1);
+        assert_eq!(
+            probe_query_budget(budget, Duration::from_millis(400)),
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(
+            probe_query_budget(budget, budget - PROBE_QUERY_FLOOR),
+            Some(PROBE_QUERY_FLOOR)
+        );
+        assert_eq!(
+            probe_query_budget(budget, budget - Duration::from_millis(4)),
+            None
+        );
+        assert_eq!(probe_query_budget(budget, budget), None);
+        assert_eq!(probe_query_budget(budget, budget * 2), None);
+    }
 
     #[test]
     fn session_parameters_render_last() {
