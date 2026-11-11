@@ -488,18 +488,18 @@ async fn probe_keeps_saturation_through_a_hand_off() {
         let waiter = {
             let pool = pool.clone();
             tokio::spawn(async move {
-                let mut client = pool.get_within(Duration::from_secs(5)).await.unwrap();
+                let mut client = pool.get_within(Duration::from_secs(10)).await.unwrap();
                 client.mark_session_dirty();
-                tokio::time::sleep(Duration::from_millis(350)).await;
+                tokio::time::sleep(Duration::from_millis(850)).await;
                 drop(client);
             })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(eventually(Duration::from_secs(5), || pool.state().waiting == 1).await);
         let probe = {
             let pool = pool.clone();
-            tokio::spawn(async move { pool.probe(Duration::from_millis(500)).await })
+            tokio::spawn(async move { pool.probe(Duration::from_secs(1)).await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(eventually(Duration::from_secs(5), || pool.state().waiting == 2).await);
         drop(held);
         let err = probe.await.unwrap().unwrap_err();
         assert_eq!(
