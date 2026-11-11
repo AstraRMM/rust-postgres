@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use yb_postgres_pool::yb_tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use yb_postgres_pool::{
-    render_pools_prometheus, DateOrder, DateOutput, DateStyle, ErrorKind, PlanCacheMode, Pool,
-    PoolConfig, SessionInit, SessionParameters,
+    render_pools_prometheus, ConnectionLimiter, DateOrder, DateOutput, DateStyle, ErrorKind,
+    PlanCacheMode, Pool, PoolConfig, SessionInit, SessionParameters,
 };
 
 async fn first(client: &Client, sql: &str) -> String {
@@ -197,21 +197,29 @@ async fn probe_rejects_a_zero_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_times_out_while_connecting() {
     let addr = stall_listener().await;
-    let pool = Pool::new(unused_config(addr), NoTls, PoolConfig::default()).unwrap();
-    let started = Instant::now();
-    let err = pool.probe(Duration::from_millis(300)).await.unwrap_err();
-    let waited = started.elapsed();
-    assert_eq!(err.kind(), ErrorKind::AcquireTimeout, "{err}");
-    assert!(
-        (Duration::from_millis(280)..Duration::from_millis(1500)).contains(&waited),
-        "{waited:?}"
-    );
-    let stats = pool.state().stats;
-    assert_eq!(stats.readiness_probes, 1);
-    assert_eq!(stats.readiness_probe_failures, 1);
-    assert_eq!(stats.acquire_timeouts, 1);
-    assert!(stats.readiness_probe_time >= Duration::from_millis(280));
-    pool.shutdown(Duration::from_secs(1)).await;
+    for max_size in [10, 1] {
+        let mut config = PoolConfig::default();
+        config.max_size = max_size;
+        let pool = Pool::new(unused_config(addr), NoTls, config).unwrap();
+        let started = Instant::now();
+        let err = pool.probe(Duration::from_millis(300)).await.unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Transport,
+            "a stalled connect is not saturation: {err}"
+        );
+        assert!(
+            (Duration::from_millis(280)..Duration::from_millis(1500)).contains(&waited),
+            "{waited:?}"
+        );
+        let stats = pool.state().stats;
+        assert_eq!(stats.readiness_probes, 1);
+        assert_eq!(stats.readiness_probe_failures, 1);
+        assert_eq!(stats.acquire_timeouts, 1);
+        assert!(stats.readiness_probe_time >= Duration::from_millis(280));
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -291,6 +299,47 @@ async fn probe_reuses_on_success_and_retires_on_timeout_or_drop() {
             stats.readiness_probe_time
         );
         pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_reports_saturation_apart_from_failures() {
+    for e in engines() {
+        let app = format!("pt_probe_saturated_{}", e.name);
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config(), NoTls, config).unwrap();
+        let held = pool.get().await.unwrap();
+        let err = pool.probe(Duration::from_millis(300)).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AcquireTimeout,
+            "pool saturated: {err}"
+        );
+        drop(held);
+        pool.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(pool.state().stats.retired_probe_failed, 0);
+        pool.shutdown(Duration::from_secs(1)).await;
+
+        let limiter = ConnectionLimiter::new(1);
+        let one = pool_config(&format!("{app}_l1"));
+        let two = pool_config(&format!("{app}_l2"));
+        let p1 = Pool::with_limiter(e.config(), NoTls, one, limiter.clone(), "l1").unwrap();
+        let p2 = Pool::with_limiter(e.config(), NoTls, two, limiter.clone(), "l2").unwrap();
+        let held = p1.get().await.unwrap();
+        let err = p2.probe(Duration::from_millis(300)).await.unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::AcquireTimeout | ErrorKind::ProcessLimit
+            ),
+            "process limit saturated: {err}"
+        );
+        drop(held);
+        p1.shutdown(Duration::from_secs(1)).await;
+        p2.probe(Duration::from_secs(5)).await.unwrap();
+        p2.shutdown(Duration::from_secs(1)).await;
+        println!("[{}] saturated probes report {:?}", e.name, err.kind());
     }
 }
 

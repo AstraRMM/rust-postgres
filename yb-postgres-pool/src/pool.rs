@@ -126,6 +126,7 @@ pub(crate) struct Shared<T: PoolTls> {
     shutdown_signal: Notify,
     /// Dials in progress.
     opening: AtomicU64,
+    dialing: AtomicU64,
     /// Checkouts in progress.
     waiting: AtomicU64,
     /// Connect failures and shutdown wake waiters: a failed connect is
@@ -231,6 +232,7 @@ impl<T: PoolTls> Shared<T> {
             _process: process,
         };
         let remaining = budget.saturating_sub(started.elapsed());
+        let _dialing = Opening::start(&self.dialing);
         match tokio::time::timeout(remaining, self.dial(permits)).await {
             Ok(result) => result,
             Err(_) => Err(PoolError::new(
@@ -711,6 +713,7 @@ impl<T: PoolTls> Pool<T> {
             closed: AtomicBool::new(false),
             shutdown_signal: Notify::new(),
             opening: AtomicU64::new(0),
+            dialing: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             fatal: Notify::new(),
             fatal_seq: AtomicU64::new(0),
@@ -838,6 +841,23 @@ impl<T: PoolTls> Pool<T> {
     /// call is counted in [`PoolStats::readiness_probes`], and every call
     /// that does not succeed, including one whose future is dropped, in
     /// [`PoolStats::readiness_probe_failures`].
+    ///
+    /// # Saturation
+    ///
+    /// The probe competes for a client like any borrower. When every client
+    /// is borrowed, or the process-wide limit is used up by established
+    /// connections, it fails with [`ErrorKind::AcquireTimeout`] or
+    /// [`ErrorKind::ProcessLimit`]. Any other failure means the pool could
+    /// not reach a usable session: a connect that stalled or failed while
+    /// the pool had room is reported as [`ErrorKind::Transport`] (or the
+    /// connect's own [`ErrorKind::Security`] or [`ErrorKind::Config`]), as
+    /// is a query that failed or timed out. Whether a saturated pool counts
+    /// as ready is the service's decision.
+    ///
+    /// A probe is a checkout, so it counts as activity: a [`PoolSet`]
+    /// pool that is probed periodically is never evicted for idleness.
+    ///
+    /// [`PoolSet`]: crate::PoolSet
     pub async fn probe(&self, budget: Duration) -> Result<(), PoolError> {
         if budget.is_zero() {
             return Err(PoolError::config("probe budget must be non-zero"));
@@ -849,17 +869,25 @@ impl<T: PoolTls> Pool<T> {
     }
 
     async fn run_probe(&self, started: Instant, budget: Duration) -> Result<(), PoolError> {
-        let mut client = self.get_within(budget).await?;
+        let mut client = match self.get_within(budget).await {
+            Ok(client) => client,
+            Err(error) => return Err(self.probe_checkout_error(error)),
+        };
         let remaining = match probe_query_budget(budget, started.elapsed()) {
             Some(remaining) => remaining,
             None => {
+                let kind = if client.connection_age() <= started.elapsed() {
+                    ErrorKind::Transport
+                } else {
+                    ErrorKind::AcquireTimeout
+                };
                 return Err(PoolError::new(
-                    ErrorKind::AcquireTimeout,
+                    kind,
                     format!(
                         "checkout used the probe budget of {:?}; no query was sent",
                         budget
                     ),
-                ))
+                ));
             }
         };
         client.native_mut().retire = Some(Retire::ProbeFailed);
@@ -875,6 +903,22 @@ impl<T: PoolTls> Pool<T> {
                 format!("probe did not complete within {:?}", budget),
             )),
         }
+    }
+
+    fn saturated(&self) -> bool {
+        let shared = &self.inner.shared;
+        shared.borrowed.load(Ordering::SeqCst) >= u64::from(shared.config.max_size)
+            || (shared.limiter.in_use() >= shared.limiter.max()
+                && shared.dialing.load(Ordering::SeqCst) == 0)
+    }
+
+    fn probe_checkout_error(&self, error: PoolError) -> PoolError {
+        if error.kind() == ErrorKind::AcquireTimeout && !self.saturated() {
+            return error.with_kind(ErrorKind::Transport).with_message(
+                "no connection within the probe budget while the pool was not saturated",
+            );
+        }
+        error
     }
 
     /// Opens connections until the pool holds `warm_floor` physical
