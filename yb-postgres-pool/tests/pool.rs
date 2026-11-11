@@ -328,9 +328,6 @@ async fn cancellation_and_automatic_rollback() {
     }
 }
 
-/// AST-2314: a lease whose only requests in flight are the `Close` of
-/// dropped statements returns straight to idle, without cleanup, and the
-/// next borrower's requests are answered after that `Close`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn statement_close_in_flight_returns_clean() {
     for e in engines() {
@@ -400,8 +397,6 @@ async fn statement_close_in_flight_returns_clean() {
     }
 }
 
-/// AST-2314: concurrent borrowers running uncached queries keep the pool at
-/// the size their concurrency needs and never trigger cleanup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn uncached_queries_stay_within_concurrency() {
     const TASKS: u32 = 4;
@@ -455,9 +450,6 @@ async fn uncached_queries_stay_within_concurrency() {
     }
 }
 
-/// AST-2314 regression: a lease dropped with an uncached query in flight
-/// outside a transaction (its statement's `Close` queued behind it) still
-/// goes through cleanup, and the next borrower gets a settled session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_uncached_query_still_cleans_up() {
     for e in engines() {
@@ -493,6 +485,79 @@ async fn dropped_uncached_query_still_cleans_up() {
         assert_eq!(stats.cleanup_cancels, 1, "{stats:?}");
         assert_eq!(stats.connects, 1, "{stats:?}");
         assert_eq!(wire.snapshot().cancels, 1);
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_close_with_close_in_flight_retires() {
+    for e in engines() {
+        let app = format!("pt_close_killed_{}", e.name);
+        let admin = e.admin().await;
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = short(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+
+        let client = pool.get().await.unwrap();
+        let (p1, id1) = (backend_pid(&client).await, client.connection_id());
+        let statement = client.client().prepare("SELECT 1").await.unwrap();
+        wire.hold_replies.store(true, Ordering::SeqCst);
+        drop(statement);
+        let in_flight = (client.pending_requests(), client.pending_caller_requests());
+        assert_eq!(in_flight, (1, 0));
+        terminate(&admin, p1).await;
+        assert!(eventually(Duration::from_secs(5), || client.is_closed()).await);
+        drop(client);
+        wire.hold_replies.store(false, Ordering::SeqCst);
+
+        let mut client = pool.get().await.unwrap();
+        assert_ne!(client.connection_id(), id1, "a closed lease is retired");
+        let p2 = backend_pid(&client).await;
+        assert_ne!(p2, p1);
+        let got: i64 = client
+            .query_one("SELECT $1::int8", &[&5i64])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(got, 5);
+        let id2 = client.connection_id();
+        let statement = client.client().prepare("SELECT 1").await.unwrap();
+        wire.hold_replies.store(true, Ordering::SeqCst);
+        drop(statement);
+        drop(client);
+        assert_eq!(pool.state().stats.cleanups, 0, "returned idle");
+        terminate(&admin, p2).await;
+        assert!(eventually(Duration::from_secs(5), || pool.state().physical == 0).await);
+        wire.hold_replies.store(false, Ordering::SeqCst);
+
+        let mut client = pool.get().await.unwrap();
+        assert_ne!(
+            client.connection_id(),
+            id2,
+            "a closed idle connection is retired"
+        );
+        let p3 = backend_pid(&client).await;
+        assert_ne!(p3, p2);
+        let got: i64 = client
+            .query_one("SELECT $1::int8", &[&6i64])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(got, 6);
+        drop(client);
+
+        let stats = pool.state().stats;
+        assert_eq!(stats.retired_closed, 2, "{stats:?}");
+        assert_eq!(stats.connects, 3, "{stats:?}");
+        assert_eq!(stats.cleanups, 0, "{stats:?}");
+        assert_eq!(stats.retired_cleanup_failed, 0, "{stats:?}");
+        assert_eq!(stats.retired_dirty_session, 0, "{stats:?}");
+        assert_eq!(wire.snapshot().cancels, 0);
+        println!(
+            "[{}] server close with a Close in flight: retired_closed {}, connects {}",
+            e.name, stats.retired_closed, stats.connects
+        );
         pool.shutdown(Duration::from_secs(1)).await;
     }
 }

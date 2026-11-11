@@ -34,7 +34,7 @@
 //! requests in flight ([`Client::transaction_status`],
 //! [`Client::pending_requests`]). A returned client that is idle outside a
 //! transaction goes straight back to the pool, even while the `Close` of a
-//! dropped statement is still in flight
+//! dropped statement or portal is still in flight
 //! ([`Client::pending_caller_requests`]). One with an open or failed
 //! transaction or a request in flight (a cancelled query future) is cleaned
 //! up first: wait briefly, cancel, wait, `ROLLBACK`; failing that it is

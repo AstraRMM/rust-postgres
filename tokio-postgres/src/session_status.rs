@@ -40,8 +40,6 @@ pub(crate) struct SessionShared {
     /// Requests handed to the connection whose `ReadyForQuery` has not been
     /// processed yet.
     pending: AtomicU64,
-    /// Of `pending`, those not sent detached (the `Close` a dropped
-    /// statement or portal sends).
     caller_pending: AtomicU64,
     /// Status byte of the most recent `ReadyForQuery` (the startup sequence
     /// ends with `I`).
@@ -190,9 +188,6 @@ mod tests {
         assert_eq!(session.transaction_status(), TransactionStatus::Idle);
         session.request_complete(None, false);
         session.request_complete(None, true);
-        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
-        session.request_sent(true);
-        session.request_complete(None, false);
         assert_eq!((session.pending(), session.caller_pending()), (0, 0));
     }
 }

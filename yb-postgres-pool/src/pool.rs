@@ -1276,8 +1276,8 @@ impl<T: PoolTls> Drop for Lease<T> {
 /// Dropping the guard returns the client:
 ///
 /// * idle, outside a transaction, with no request in flight other than the
-///   `Close` of a dropped statement, and no reported session-state change:
-///   back to the pool with no round trip;
+///   `Close` of a dropped statement or portal, and no reported
+///   session-state change: back to the pool with no round trip;
 /// * other requests in flight (a dropped/cancelled query future) or a
 ///   transaction open: return cleanup waits `cleanup_grace`, sends a cancel
 ///   request if still busy, waits, and issues `ROLLBACK`, all within

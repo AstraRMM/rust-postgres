@@ -220,7 +220,6 @@ pub struct Wire {
     /// While set, nothing is relayed in either direction (a server that
     /// stops answering, including cancel requests).
     pub freeze: AtomicBool,
-    /// While set, server replies are held back, then delivered in order.
     pub hold_replies: AtomicBool,
     injectors: parking_lot::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 }
