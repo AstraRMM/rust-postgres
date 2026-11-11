@@ -18,7 +18,7 @@ pub(crate) enum Retire {
     DirtySession,
     /// Return cleanup (cancel/rollback) failed or ran out of budget.
     CleanupFailed,
-    /// The checkout probe failed.
+    /// A checkout or readiness probe failed.
     ProbeFailed,
     /// The borrower asked for it.
     Explicit,
@@ -37,6 +37,9 @@ pub(crate) struct Stats {
     pub probes: AtomicU64,
     pub probe_failures: AtomicU64,
     pub probe_nanos: AtomicU64,
+    pub readiness_probes: AtomicU64,
+    pub readiness_probe_failures: AtomicU64,
+    pub readiness_probe_nanos: AtomicU64,
     pub terminal_failures: AtomicU64,
     pub retired_closed: AtomicU64,
     pub retired_superseded_tls: AtomicU64,
@@ -98,6 +101,9 @@ impl Stats {
             probes: l(&self.probes),
             probe_failures: l(&self.probe_failures),
             probe_time: Duration::from_nanos(l(&self.probe_nanos)),
+            readiness_probes: l(&self.readiness_probes),
+            readiness_probe_failures: l(&self.readiness_probe_failures),
+            readiness_probe_time: Duration::from_nanos(l(&self.readiness_probe_nanos)),
             terminal_failures: l(&self.terminal_failures),
             retired_closed: l(&self.retired_closed),
             retired_superseded_tls: l(&self.retired_superseded_tls),
@@ -130,6 +136,8 @@ impl Stats {
 /// `session_init_round_trips` (one per connect with
 /// [`SessionInit::AfterConnect`](crate::SessionInit::AfterConnect)),
 /// `probes` (only with [`HealthCheck::AfterIdle`](crate::HealthCheck)),
+/// `readiness_probes` (one empty query each, only when
+/// [`Pool::probe`](crate::Pool::probe) is called and a client was borrowed),
 /// `cleanup_cancels` (one cancel request on a separate connection each),
 /// `cleanup_rollbacks` (one `ROLLBACK` each) and `statement_prepares` (one
 /// Parse/Describe/Sync exchange each, plus `Close` for evictions). A clean
@@ -155,6 +163,13 @@ pub struct PoolStats {
     pub probe_failures: u64,
     /// Total probe latency.
     pub probe_time: Duration,
+    /// [`Pool::probe`](crate::Pool::probe) calls.
+    pub readiness_probes: u64,
+    /// [`Pool::probe`](crate::Pool::probe) calls that failed, including
+    /// checkout failures and timeouts.
+    pub readiness_probe_failures: u64,
+    /// Total time spent in [`Pool::probe`](crate::Pool::probe).
+    pub readiness_probe_time: Duration,
     /// Connection tasks that ended with an error.
     pub terminal_failures: u64,
     /// Retired because the transport was closed.
@@ -169,7 +184,7 @@ pub struct PoolStats {
     pub retired_dirty_session: u64,
     /// Retired because return cleanup failed.
     pub retired_cleanup_failed: u64,
-    /// Retired because the checkout probe failed.
+    /// Retired because a checkout or readiness probe failed.
     pub retired_probe_failed: u64,
     /// Retired on request.
     pub retired_explicit: u64,

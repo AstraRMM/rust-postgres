@@ -39,6 +39,8 @@ pub struct SessionConfig {
     pub role: Option<String>,
     /// `search_path` schemas, each a lowercase unquoted identifier.
     pub search_path: Option<Vec<String>>,
+    /// Parameters the pool owns over the caller's `Config::options`.
+    pub parameters: SessionParameters,
     /// How the settings are applied.
     pub init: SessionInit,
 }
@@ -52,9 +54,257 @@ impl Default for SessionConfig {
             application_name: None,
             role: None,
             search_path: None,
+            parameters: SessionParameters::default(),
             init: SessionInit::StartupOptions,
         }
     }
+}
+
+/// The output-format half of `DateStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateOutput {
+    /// `ISO` (ISO 8601).
+    Iso,
+    /// `Postgres`.
+    Postgres,
+    /// `SQL`.
+    Sql,
+    /// `German`.
+    German,
+}
+
+/// The field-order half of `DateStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateOrder {
+    /// Month, day, year.
+    Mdy,
+    /// Day, month, year.
+    Dmy,
+    /// Year, month, day.
+    Ymd,
+}
+
+/// A `DateStyle` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateStyle {
+    /// Output format.
+    pub output: DateOutput,
+    /// Field order for input and for the non-ISO output formats.
+    pub order: DateOrder,
+}
+
+impl DateStyle {
+    /// `DateStyle` from its two halves.
+    pub fn new(output: DateOutput, order: DateOrder) -> DateStyle {
+        DateStyle { output, order }
+    }
+
+    fn render(self) -> String {
+        let output = match self.output {
+            DateOutput::Iso => "ISO",
+            DateOutput::Postgres => "Postgres",
+            DateOutput::Sql => "SQL",
+            DateOutput::German => "German",
+        };
+        let order = match self.order {
+            DateOrder::Mdy => "MDY",
+            DateOrder::Dmy => "DMY",
+            DateOrder::Ymd => "YMD",
+        };
+        format!("{},{}", output, order)
+    }
+}
+
+/// A `plan_cache_mode` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanCacheMode {
+    /// `auto`: generic plans after five custom ones when not costlier.
+    Auto,
+    /// `force_generic_plan`.
+    ForceGenericPlan,
+    /// `force_custom_plan`.
+    ForceCustomPlan,
+}
+
+impl PlanCacheMode {
+    fn render(self) -> &'static str {
+        match self {
+            PlanCacheMode::Auto => "auto",
+            PlanCacheMode::ForceGenericPlan => "force_generic_plan",
+            PlanCacheMode::ForceCustomPlan => "force_custom_plan",
+        }
+    }
+}
+
+/// Session parameters the pool sets on every connection and that callers
+/// cannot override.
+///
+/// They are applied after the caller's `Config::options`, so the pool's
+/// values win. A pool refuses to start (with [`ErrorKind::Config`]) when
+/// `Config::options` names a parameter set here, in any spelling the server
+/// accepts (`-c name=value`, `-cname=value`, `--name=value`, any case,
+/// dashes for underscores, and `-e` for `DateStyle`).
+///
+/// `DateStyle` and `TimeZone` are reported by the server (`GUC_REPORT`):
+/// the values set here are the session's baseline, and a later change (for
+/// example a session-level `SET TimeZone`) retires the session on return.
+///
+/// [`ErrorKind::Config`]: crate::ErrorKind::Config
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionParameters {
+    /// `DateStyle`.
+    pub date_style: Option<DateStyle>,
+    /// `TimeZone`: a zone name, abbreviation or POSIX zone of ASCII
+    /// letters, digits and `/_+-:.`.
+    pub time_zone: Option<String>,
+    /// `extra_float_digits`, from -15 to 3.
+    pub extra_float_digits: Option<i8>,
+    /// `plan_cache_mode`.
+    pub plan_cache_mode: Option<PlanCacheMode>,
+}
+
+impl SessionParameters {
+    /// The values SQLx sends at startup: `DateStyle=ISO, MDY`,
+    /// `TimeZone=UTC`, `extra_float_digits=2`.
+    pub fn sqlx_parity() -> SessionParameters {
+        SessionParameters {
+            date_style: Some(DateStyle::new(DateOutput::Iso, DateOrder::Mdy)),
+            time_zone: Some("UTC".to_string()),
+            extra_float_digits: Some(2),
+            plan_cache_mode: None,
+        }
+    }
+
+    /// Validates the values.
+    pub fn validate(&self) -> Result<(), PoolError> {
+        if let Some(zone) = &self.time_zone {
+            if zone.is_empty()
+                || zone.len() > 64
+                || !zone
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/_+-:.".contains(c))
+            {
+                return Err(PoolError::config(
+                    "TimeZone must be 1 to 64 ASCII letters, digits or /_+-:.",
+                ));
+            }
+        }
+        if let Some(digits) = self.extra_float_digits {
+            if !(-15..=3).contains(&digits) {
+                return Err(PoolError::config(
+                    "extra_float_digits must be between -15 and 3",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn settings(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(style) = self.date_style {
+            out.push(("DateStyle", style.render()));
+        }
+        if let Some(zone) = &self.time_zone {
+            out.push(("TimeZone", zone.clone()));
+        }
+        if let Some(digits) = self.extra_float_digits {
+            out.push(("extra_float_digits", digits.to_string()));
+        }
+        if let Some(mode) = self.plan_cache_mode {
+            out.push(("plan_cache_mode", mode.render().to_string()));
+        }
+        out
+    }
+
+    pub(crate) fn reject_overrides(&self, options: Option<&str>) -> Result<(), PoolError> {
+        let owned: Vec<String> = self
+            .settings()
+            .into_iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        if owned.is_empty() {
+            return Ok(());
+        }
+        for name in option_setting_names(options.unwrap_or("")) {
+            if owned.contains(&name) {
+                return Err(PoolError::config(format!(
+                    "Config::options sets {}, which the pool's session parameters own",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_option_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
+}
+
+fn split_options(options: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = options.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| is_option_space(*c)) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            return out;
+        }
+        let mut arg = String::new();
+        while let Some(c) = chars.next() {
+            if is_option_space(c) {
+                break;
+            }
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    arg.push(escaped);
+                }
+            } else {
+                arg.push(c);
+            }
+        }
+        out.push(arg);
+    }
+}
+
+pub(crate) fn option_setting_names(options: &str) -> Vec<String> {
+    const WITH_ARGUMENT: &str = "BCcDdfhkNprStvW-";
+    let args = split_options(options);
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        let switches = match arg.strip_prefix('-') {
+            Some(switches) if !switches.is_empty() => switches,
+            _ => continue,
+        };
+        for (at, switch) in switches.char_indices() {
+            if switch == 'e' {
+                names.push("datestyle".to_string());
+            }
+            if !WITH_ARGUMENT.contains(switch) {
+                continue;
+            }
+            let rest = &switches[at + switch.len_utf8()..];
+            let value = if !rest.is_empty() {
+                rest.to_string()
+            } else if i < args.len() {
+                i += 1;
+                args[i - 1].clone()
+            } else {
+                String::new()
+            };
+            if switch == 'c' || switch == '-' {
+                let name = value.split('=').next().unwrap_or("").trim();
+                names.push(name.replace('-', "_").to_ascii_lowercase());
+            }
+            break;
+        }
+    }
+    names
 }
 
 fn identifier_ok(name: &str) -> bool {
@@ -106,6 +356,7 @@ impl SessionConfig {
                 ));
             }
         }
+        self.parameters.validate()?;
         for d in [
             self.statement_timeout,
             self.lock_timeout,
@@ -142,6 +393,7 @@ impl SessionConfig {
         if let Some(role) = &self.role {
             out.push(("role", role.clone()));
         }
+        out.extend(self.parameters.settings());
         Ok(out)
     }
 
@@ -163,6 +415,7 @@ impl SessionConfig {
             .map(|(k, v)| match k {
                 "role" => format!("SET ROLE {}", v),
                 "search_path" => format!("SET search_path = {}", v),
+                "DateStyle" | "TimeZone" => format!("SET {} = '{}'", k, v),
                 _ => format!("SET {} = {}", k, v),
             })
             .collect::<Vec<_>>()

@@ -658,6 +658,10 @@ impl<T: PoolTls> Pool<T> {
         label: &str,
     ) -> Result<Pool<T>, PoolError> {
         config.validate()?;
+        config
+            .session
+            .parameters
+            .reject_overrides(pg.get_options())?;
         if config.warm_floor > limiter.max() || config.min_idle.unwrap_or(0) > limiter.max() {
             return Err(PoolError::config(
                 "warm_floor and min_idle must not exceed the process-wide limit",
@@ -821,6 +825,42 @@ impl<T: PoolTls> Pool<T> {
             lease: Some(lease),
             shared: shared.clone(),
         })
+    }
+
+    /// Readiness probe. Borrows a client within `min(budget,
+    /// acquire_timeout)` and runs one empty simple query within what is left
+    /// of `budget`. The client goes back to the pool only when the query
+    /// succeeds; a failed, timed-out or abandoned probe retires it. Counted in
+    /// [`PoolStats::readiness_probes`] and
+    /// [`PoolStats::readiness_probe_failures`].
+    pub async fn probe(&self, budget: Duration) -> Result<(), PoolError> {
+        let stats = &self.inner.shared.stats;
+        bump(&stats.readiness_probes);
+        let started = Instant::now();
+        let result = self.run_probe(started, budget).await;
+        add_duration(&stats.readiness_probe_nanos, started.elapsed());
+        if result.is_err() {
+            bump(&stats.readiness_probe_failures);
+        }
+        result
+    }
+
+    async fn run_probe(&self, started: Instant, budget: Duration) -> Result<(), PoolError> {
+        let mut client = self.get_within(budget).await?;
+        client.native_mut().retire = Some(Retire::ProbeFailed);
+        let remaining = budget.saturating_sub(started.elapsed());
+        let outcome = tokio::time::timeout(remaining, client.client().simple_query("")).await;
+        match outcome {
+            Ok(Ok(_)) => {
+                client.native_mut().retire = None;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(client.classify_error(e)),
+            Err(_) => Err(PoolError::new(
+                ErrorKind::Transport,
+                format!("probe did not complete within {:?}", budget),
+            )),
+        }
     }
 
     /// Opens connections until the pool holds `warm_floor` physical
@@ -1285,8 +1325,80 @@ impl<T: PoolTls> Drop for PooledClient<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{PoolConfig, SessionConfig, SessionInit};
+    use crate::config::{
+        option_setting_names, DateOrder, DateOutput, DateStyle, PlanCacheMode, PoolConfig,
+        SessionConfig, SessionInit, SessionParameters,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn session_parameters_render_last() {
+        let mut session = SessionConfig {
+            statement_timeout: Some(Duration::from_secs(5)),
+            role: Some("app_runtime".into()),
+            parameters: SessionParameters::sqlx_parity(),
+            ..SessionConfig::default()
+        };
+        assert_eq!(
+            session.startup_options().unwrap(),
+            "-c statement_timeout=5000 -c role=app_runtime -c DateStyle=ISO,MDY -c TimeZone=UTC -c extra_float_digits=2"
+        );
+        session.parameters.date_style = Some(DateStyle::new(DateOutput::Sql, DateOrder::Dmy));
+        session.parameters.time_zone = Some("America/New_York".into());
+        session.parameters.plan_cache_mode = Some(PlanCacheMode::ForceCustomPlan);
+        session.init = SessionInit::AfterConnect;
+        assert_eq!(
+            session.init_sql().unwrap(),
+            "SET statement_timeout = 5000; SET ROLE app_runtime; SET DateStyle = 'SQL,DMY'; SET TimeZone = 'America/New_York'; SET extra_float_digits = 2; SET plan_cache_mode = force_custom_plan"
+        );
+        for zone in ["", "UTC'; DROP", "a b", "x\\y"] {
+            let mut parameters = SessionParameters::sqlx_parity();
+            parameters.time_zone = Some(zone.into());
+            assert!(parameters.validate().is_err(), "{zone}");
+        }
+        for digits in [-16, 4] {
+            let mut parameters = SessionParameters::sqlx_parity();
+            parameters.extra_float_digits = Some(digits);
+            assert!(parameters.validate().is_err(), "{digits}");
+        }
+    }
+
+    #[test]
+    fn option_names_follow_server_switch_parsing() {
+        let cases: &[(&str, &[&str])] = &[
+            ("", &[]),
+            ("-c TimeZone=UTC", &["timezone"]),
+            ("-cTIMEZONE=UTC", &["timezone"]),
+            ("--DateStyle=SQL", &["datestyle"]),
+            ("-c extra-float-digits=3", &["extra_float_digits"]),
+            ("-c Time\\Zone=x", &["timezone"]),
+            ("-c\\ timezone=x", &["timezone"]),
+            ("-e", &["datestyle"]),
+            ("-Fe", &["datestyle"]),
+            ("-d e", &[]),
+            ("-c -e", &["_e"]),
+            (
+                "\t-c  work_mem=8MB\n--plan_cache_mode=auto ",
+                &["work_mem", "plan_cache_mode"],
+            ),
+            ("-c", &[""]),
+        ];
+        for (options, want) in cases {
+            assert_eq!(option_setting_names(options), *want, "{options:?}");
+        }
+        let parity = SessionParameters::sqlx_parity();
+        assert!(parity
+            .reject_overrides(Some("-c timezone=PST8PDT"))
+            .is_err());
+        assert!(parity.reject_overrides(Some("-c work_mem=8MB")).is_ok());
+        assert!(parity.reject_overrides(None).is_ok());
+        assert!(parity
+            .reject_overrides(Some("-c plan_cache_mode=auto"))
+            .is_ok());
+        assert!(SessionParameters::default()
+            .reject_overrides(Some("-c TimeZone=UTC"))
+            .is_ok());
+    }
 
     #[test]
     fn session_settings_render_without_quoting() {
