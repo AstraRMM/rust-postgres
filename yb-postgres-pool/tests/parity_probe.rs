@@ -329,12 +329,12 @@ async fn prometheus_export_is_grouped_and_bounded() {
     assert_eq!(families.len(), 30, "{text}");
     assert_eq!(series, 2 * 42, "{text}");
     for line in [
-        "git_storage_pool_probes_total{service=\"git-storage\",pool=\"primary\",kind=\"readiness\"} 1",
-        "git_storage_pool_probe_failures_total{service=\"git-storage\",pool=\"primary\",kind=\"readiness\"} 1",
-        "git_storage_pool_acquire_timeouts_total{service=\"git-storage\",pool=\"primary\"} 1",
-        "git_storage_pool_probes_total{service=\"git-storage\",pool=\"q\\\"d\\\\\\n\",kind=\"readiness\"} 0",
-        "git_storage_pool_retirements_total{service=\"git-storage\",pool=\"primary\",reason=\"reaped\"} 0",
-        "git_storage_pool_limiter_max_connections{service=\"git-storage\",pool=\"primary\"} 10",
+        "git_storage_pool_probes_total{pool=\"primary\",service=\"git-storage\",kind=\"readiness\"} 1",
+        "git_storage_pool_probe_failures_total{pool=\"primary\",service=\"git-storage\",kind=\"readiness\"} 1",
+        "git_storage_pool_acquire_timeouts_total{pool=\"primary\",service=\"git-storage\"} 1",
+        "git_storage_pool_probes_total{pool=\"q\\\"d\\\\\\n\",service=\"git-storage\",kind=\"readiness\"} 0",
+        "git_storage_pool_retirements_total{pool=\"primary\",service=\"git-storage\",reason=\"reaped\"} 0",
+        "git_storage_pool_limiter_max_connections{pool=\"primary\",service=\"git-storage\"} 10",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} missing from\n{text}");
     }
@@ -348,6 +348,20 @@ async fn prometheus_export_is_grouped_and_bounded() {
         .lines()
         .any(|l| l == "ns_pool_physical_connections 0"));
     assert_eq!(render_pools_prometheus("ns", &[]).unwrap(), "");
+    let reordered: &[(&str, &str)] = &[("pool", "primary"), ("service", "git-storage")];
+    assert_eq!(
+        sa.render_prometheus("git_storage", reordered).unwrap(),
+        sa.render_prometheus("git_storage", a_labels).unwrap()
+    );
+    let empty: &[(&str, &str)] = &[];
+    for pools in [
+        &[(a_labels, &sa), (a_labels, &sb)][..],
+        &[(a_labels, &sa), (reordered, &sb)][..],
+        &[(empty, &sa), (empty, &sb)][..],
+    ] {
+        let err = render_pools_prometheus("git_storage", pools).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config, "{err}");
+    }
     a.shutdown(Duration::from_secs(1)).await;
     b.shutdown(Duration::from_secs(1)).await;
 }

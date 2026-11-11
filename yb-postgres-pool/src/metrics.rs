@@ -150,9 +150,11 @@ fn escape(value: &str) -> String {
 }
 
 fn label_set(labels: &[(&str, &str)]) -> Result<String, PoolError> {
+    let mut sorted = labels.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut seen: Vec<&str> = Vec::new();
     let mut out = String::new();
-    for (name, value) in labels {
+    for (name, value) in &sorted {
         if !valid_name(name) || name.starts_with("__") || RESERVED_LABELS.contains(name) {
             return Err(PoolError::config(format!(
                 "invalid or reserved pool metric label name {:?}",
@@ -176,11 +178,12 @@ fn label_set(labels: &[(&str, &str)]) -> Result<String, PoolError> {
 
 /// Renders several pools in the Prometheus text format under `namespace`,
 /// one `# TYPE` line per metric family, so pools of one process can share
-/// a scrape. Each pool carries its own `labels`, which must tell the pools
-/// apart and must come from a bounded set (service, pool or realm names,
-/// never SQL text, tenant identifiers or connection strings). Metric names
-/// are `{namespace}_pool_*`; the only labels added are `kind` (probes) and
-/// `reason` (retirements), each with a fixed set of values.
+/// a scrape. Each pool carries its own `labels`, rendered sorted by name,
+/// which must tell the pools apart and must come from a bounded set
+/// (service, pool or realm names, never SQL text, tenant identifiers or
+/// connection strings). Metric names are `{namespace}_pool_*`; the only
+/// labels added are `kind` (probes) and `reason` (retirements), each with a
+/// fixed set of values, after the pool's own.
 ///
 /// The limiter gauges describe the process-wide limiter the pool shares, so
 /// pools sharing one report the same values.
@@ -189,8 +192,8 @@ fn label_set(labels: &[(&str, &str)]) -> Result<String, PoolError> {
 ///
 /// [`ErrorKind::Config`](crate::ErrorKind::Config) if `namespace` is not a
 /// valid metric name prefix, or if a label name is invalid, reserved
-/// (`__*`, `kind`, `reason`) or repeated within a pool's labels. Nothing is
-/// rendered then.
+/// (`__*`, `kind`, `reason`) or repeated within a pool's labels, or if two
+/// pools have the same label set in any order. Nothing is rendered then.
 pub fn render_pools_prometheus(
     namespace: &str,
     pools: &[(&[(&str, &str)], &PoolState)],
@@ -203,7 +206,14 @@ pub fn render_pools_prometheus(
     }
     let mut rendered: Vec<(String, Vec<Family>)> = Vec::with_capacity(pools.len());
     for (labels, state) in pools {
-        rendered.push((label_set(labels)?, families(state)));
+        let set = label_set(labels)?;
+        if rendered.iter().any(|(other, _)| *other == set) {
+            return Err(PoolError::config(format!(
+                "two pools have the same metric labels {{{}}}",
+                set
+            )));
+        }
+        rendered.push((set, families(state)));
     }
     let mut out = String::new();
     let count = rendered.first().map_or(0, |(_, families)| families.len());
