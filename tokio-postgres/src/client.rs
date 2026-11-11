@@ -124,12 +124,13 @@ impl InnerClient {
             messages,
             sender,
             observation: RequestObservation::start(purpose, detached),
+            detached,
         };
         // Count before handing over: the connection may complete the request
         // before `unbounded_send` returns.
-        self.session.request_sent();
+        self.session.request_sent(detached);
         if self.sender.unbounded_send(request).is_err() {
-            self.session.request_complete(None);
+            self.session.request_complete(None, detached);
             return Err(Error::closed());
         }
 
@@ -663,6 +664,23 @@ impl Client {
     /// pending until the server finishes it.
     pub fn pending_requests(&self) -> u64 {
         self.inner.session.pending()
+    }
+
+    /// Of [`pending_requests`](Self::pending_requests), those other than the
+    /// fire-and-forget `Close` a dropped [`Statement`] or [`Portal`] sends.
+    /// The `ROLLBACK` of a dropped [`Transaction`] and a dropped (cancelled)
+    /// query future's request are counted.
+    ///
+    /// A `Close` changes no session state and the connection writes later
+    /// requests after it, so a client whose count is zero and whose
+    /// [`transaction_status`](Self::transaction_status) is
+    /// [`TransactionStatus::Idle`] can be reused at once. Read this count
+    /// first: once it is zero, `transaction_status` reflects the
+    /// `ReadyForQuery` of every request it counted.
+    ///
+    /// [`Portal`]: crate::Portal
+    pub fn pending_caller_requests(&self) -> u64 {
+        self.inner.session.caller_pending()
     }
 
     /// The number of `ParameterStatus` messages received after startup.

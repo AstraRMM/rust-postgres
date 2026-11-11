@@ -68,6 +68,10 @@ struct Permits {
     _process: OwnedSemaphorePermit,
 }
 
+fn reusable(client: &Client) -> bool {
+    client.pending_caller_requests() == 0 && client.transaction_status() == TransactionStatus::Idle
+}
+
 /// Removes a connection from the live registry and returns its permits when
 /// its task ends, completes or is aborted.
 struct LiveGuard {
@@ -432,8 +436,7 @@ impl<T: PoolTls> Shared<T> {
             .is_some_and(|it| now.duration_since(conn.idle_since) >= it)
         {
             Some(Retire::Idle)
-        } else if conn.client.pending_requests() != 0
-            || conn.client.transaction_status() != TransactionStatus::Idle
+        } else if !reusable(&conn.client)
             // A ParameterStatus that arrived while the connection was idle
             // (for example a server-side setting change) means the session
             // no longer matches what was returned.
@@ -493,10 +496,7 @@ impl<T: PoolTls> Shared<T> {
         if conn.generation.is_some_and(|g| !self.tls.is_current(g)) {
             return Err(Retire::SupersededTls);
         }
-        Ok(
-            client.pending_requests() != 0
-                || client.transaction_status() != TransactionStatus::Idle,
-        )
+        Ok(!reusable(client))
     }
 
     /// bb8's return hook (`has_broken`): the final, synchronous gate.
@@ -557,7 +557,7 @@ impl<T: PoolTls> Shared<T> {
             }
             _ => return false,
         }
-        client.pending_requests() == 0 && client.transaction_status() == TransactionStatus::Idle
+        reusable(client)
     }
 
     fn close(&self) {
@@ -1275,9 +1275,10 @@ impl<T: PoolTls> Drop for Lease<T> {
 ///
 /// Dropping the guard returns the client:
 ///
-/// * idle, outside a transaction, with no request in flight and no reported
+/// * idle, outside a transaction, with no request in flight other than the
+///   `Close` of a dropped statement or portal, and no reported
 ///   session-state change: back to the pool with no round trip;
-/// * requests in flight (a dropped/cancelled query future) or a
+/// * other requests in flight (a dropped/cancelled query future) or a
 ///   transaction open: return cleanup waits `cleanup_grace`, sends a cancel
 ///   request if still busy, waits, and issues `ROLLBACK`, all within
 ///   `cleanup_timeout`, then re-checks; failure retires the connection;

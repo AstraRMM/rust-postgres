@@ -31,6 +31,7 @@ check() {
   record clippy-fork cargo clippy -p yb-tokio-postgres --features rustls-aws-lc-rs --all-targets
   record build-fork cargo build -p yb-tokio-postgres --all-targets --features rustls-aws-lc-rs
   record unit cargo test -p yb-postgres-pool --lib --features rustls-aws-lc-rs
+  record unit-fork cargo test -p yb-tokio-postgres --lib --features rustls-aws-lc-rs
 }
 
 pool() {

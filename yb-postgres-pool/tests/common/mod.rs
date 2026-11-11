@@ -220,6 +220,7 @@ pub struct Wire {
     /// While set, nothing is relayed in either direction (a server that
     /// stops answering, including cancel requests).
     pub freeze: AtomicBool,
+    pub hold_replies: AtomicBool,
     injectors: parking_lot::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
@@ -291,11 +292,21 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     let down_wire = wire.clone();
     let down = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
+        let mut held = Vec::new();
         loop {
             tokio::select! {
                 read = from_server.read(&mut buf) => match read {
                     Ok(0) | Err(_) => break,
+                    Ok(n) if down_wire.hold_replies.load(Ordering::SeqCst) => {
+                        held.extend_from_slice(&buf[..n]);
+                    }
                     Ok(n) => {
+                        if !held.is_empty() {
+                            if to_client.write_all(&held).await.is_err() {
+                                break;
+                            }
+                            held.clear();
+                        }
                         if !down_wire.freeze.load(Ordering::SeqCst)
                             && to_client.write_all(&buf[..n]).await.is_err()
                         {
@@ -303,6 +314,14 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
                         }
                     }
                 },
+                _ = tokio::time::sleep(Duration::from_millis(5)), if !held.is_empty() => {
+                    if !down_wire.hold_replies.load(Ordering::SeqCst) {
+                        if to_client.write_all(&held).await.is_err() {
+                            break;
+                        }
+                        held.clear();
+                    }
+                }
                 Some(bytes) = inject_rx.recv() => {
                     if to_client.write_all(&bytes).await.is_err() {
                         break;
