@@ -136,14 +136,21 @@ impl fmt::Display for Occupancy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} of {} borrowed, {} of {} process permits in use ({} dialing), oldest own dial {:?}",
+            "{} of {} borrowed, {} of {} process permits in use ({} dialing), ",
             self.borrowed,
             self.max_size,
             self.permits_in_use,
             self.permits_max,
-            self.permits_dialing,
-            self.oldest_dial
-        )
+            self.permits_dialing
+        )?;
+        match self.oldest_dial {
+            Some(age) => write!(f, "oldest own dial in flight for {:?}", age)?,
+            None => f.write_str("no own dial in flight")?,
+        }
+        if let Some(mean) = self.mean_connect {
+            write!(f, ", mean connect {:?}", mean)?;
+        }
+        Ok(())
     }
 }
 
@@ -948,8 +955,9 @@ impl<T: PoolTls> Pool<T> {
     /// less than 5 ms of the budget is left after the checkout, no query is
     /// sent, the probe fails and the client goes back to the pool unchanged.
     /// A `budget` under 5 ms is rejected with [`ErrorKind::Config`] and not
-    /// counted. Otherwise every call is counted in [`PoolStats::readiness_probes`], and every call
-    /// that does not succeed, including one whose future is dropped, in
+    /// counted. Otherwise every call is counted in
+    /// [`PoolStats::readiness_probes`], and every call that does not
+    /// succeed, including one whose future is dropped, in
     /// [`PoolStats::readiness_probe_failures`].
     ///
     /// # Saturation
@@ -981,6 +989,13 @@ impl<T: PoolTls> Pool<T> {
     /// query that fails or times out is [`ErrorKind::Transport`] or the
     /// driver error's kind. Whether a saturated pool counts as ready is the
     /// service's decision.
+    ///
+    /// Pools that share a [`ConnectionLimiter`] (every pool of a
+    /// [`PoolSet`]) affect each other: when one pool's stalled dials hold
+    /// the shared permits, a probe of a healthy sibling that cannot get a
+    /// permit reports [`ErrorKind::Transport`]. For readiness per realm or
+    /// endpoint, give those pools separate limiters, or treat a sibling's
+    /// failures as that sibling's.
     ///
     /// A classified timeout keeps the checkout's own message (budget,
     /// borrowed count, last connect failure) and appends both occupancy
