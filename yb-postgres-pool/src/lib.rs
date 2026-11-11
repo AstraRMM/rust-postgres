@@ -33,7 +33,9 @@
 //! The fork's client tracks the `ReadyForQuery` transaction status and
 //! requests in flight ([`Client::transaction_status`],
 //! [`Client::pending_requests`]). A returned client that is idle outside a
-//! transaction goes straight back to the pool. One with an open or failed
+//! transaction goes straight back to the pool, even while the `Close` of a
+//! dropped statement is still in flight
+//! ([`Client::pending_caller_requests`]). One with an open or failed
 //! transaction or a request in flight (a cancelled query future) is cleaned
 //! up first: wait briefly, cancel, wait, `ROLLBACK`; failing that it is
 //! closed. Sessions whose `GUC_REPORT` settings changed, that were marked
@@ -66,6 +68,7 @@
 //!
 //! [`Client::transaction_status`]: yb_tokio_postgres::Client::transaction_status
 //! [`Client::pending_requests`]: yb_tokio_postgres::Client::pending_requests
+//! [`Client::pending_caller_requests`]: yb_tokio_postgres::Client::pending_caller_requests
 
 #![warn(missing_docs, rust_2018_idioms)]
 

@@ -328,6 +328,175 @@ async fn cancellation_and_automatic_rollback() {
     }
 }
 
+/// AST-2314: a lease whose only requests in flight are the `Close` of
+/// dropped statements returns straight to idle, without cleanup, and the
+/// next borrower's requests are answered after that `Close`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statement_close_in_flight_returns_clean() {
+    for e in engines() {
+        let app = format!("pt_close_clean_{}", e.name);
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = short(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+        let (pid, id) = {
+            let client = pool.get().await.unwrap();
+            (backend_pid(&client).await, client.connection_id())
+        };
+        for i in 0..20i64 {
+            let client = pool.get().await.unwrap();
+            assert_eq!(client.connection_id(), id);
+            let got: i64 = client
+                .client()
+                .query_one("SELECT $1::int8", &[&i])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(got, i);
+            assert_eq!(client.pending_caller_requests(), 0);
+        }
+        assert_eq!(pool.state().stats.cleanups, 0, "{:?}", pool.state().stats);
+
+        let client = pool.get().await.unwrap();
+        let statement = client
+            .client()
+            .prepare("SELECT pg_backend_pid()")
+            .await
+            .unwrap();
+        wire.hold_replies.store(true, Ordering::SeqCst);
+        drop(statement);
+        assert_eq!(client.pending_requests(), 1);
+        assert_eq!(client.pending_caller_requests(), 0);
+        assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+        drop(client);
+        let started = Instant::now();
+        let client = pool.get().await.unwrap();
+        let checkout = started.elapsed();
+        assert_eq!(client.connection_id(), id, "returned without cleanup");
+        assert_eq!(client.pending_requests(), 1, "the Close is still in flight");
+        let mut next = Box::pin(backend_pid(&client));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next.as_mut())
+                .await
+                .is_err(),
+            "replies are held"
+        );
+        wire.hold_replies.store(false, Ordering::SeqCst);
+        assert_eq!(next.await, pid, "answered after the Close, same session");
+        assert!(eventually(Duration::from_secs(5), || client.pending_requests() == 0).await);
+        drop(client);
+
+        let state = pool.state();
+        assert_eq!(state.physical, 1, "{state:?}");
+        assert_eq!(state.stats.connects, 1, "{:?}", state.stats);
+        assert_eq!(state.stats.cleanups, 0, "{:?}", state.stats);
+        assert_eq!(state.stats.retired_dirty_session, 0, "{:?}", state.stats);
+        assert_eq!(wire.snapshot().cancels, 0);
+        println!(
+            "[{}] close in flight: checkout {:?}, cleanups {}, connects {}",
+            e.name, checkout, state.stats.cleanups, state.stats.connects
+        );
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+/// AST-2314: concurrent borrowers running uncached queries keep the pool at
+/// the size their concurrency needs and never trigger cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn uncached_queries_stay_within_concurrency() {
+    const TASKS: u32 = 4;
+    for e in engines() {
+        let app = format!("pt_close_concurrent_{}", e.name);
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = short(&app);
+        config.max_size = 8;
+        config.acquire_timeout = Duration::from_secs(20);
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+        let max_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut tasks = Vec::new();
+        for t in 0..i64::from(TASKS) {
+            let pool = pool.clone();
+            let max_seen = max_seen.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..50i64 {
+                    let client = pool.get().await.unwrap();
+                    max_seen.fetch_max(pool.state().physical, Ordering::SeqCst);
+                    let v = t * 1000 + i;
+                    let got: i64 = client
+                        .client()
+                        .query_one("SELECT $1::int8", &[&v])
+                        .await
+                        .unwrap()
+                        .get(0);
+                    assert_eq!(got, v);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let state = pool.state();
+        let max_seen = max_seen.load(Ordering::SeqCst);
+        assert!(max_seen <= TASKS, "physical {max_seen} > {TASKS}");
+        assert!(
+            state.stats.connects <= u64::from(TASKS),
+            "{:?}",
+            state.stats
+        );
+        assert_eq!(state.stats.checkouts, 50 * u64::from(TASKS));
+        assert_eq!(state.stats.cleanups, 0, "{:?}", state.stats);
+        assert_eq!(state.stats.retired_dirty_session, 0, "{:?}", state.stats);
+        assert_eq!(wire.snapshot().cancels, 0);
+        println!(
+            "[{}] uncached concurrency: {} tasks, max physical {}, connects {}, cleanups {}",
+            e.name, TASKS, max_seen, state.stats.connects, state.stats.cleanups
+        );
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+/// AST-2314 regression: a lease dropped with an uncached query in flight
+/// outside a transaction (its statement's `Close` queued behind it) still
+/// goes through cleanup, and the next borrower gets a settled session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_uncached_query_still_cleans_up() {
+    for e in engines() {
+        let app = format!("pt_close_cancel_{}", e.name);
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = short(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+        let pid;
+        {
+            let client = pool.get().await.unwrap();
+            pid = backend_pid(&client).await;
+            let slow = client.client().query("SELECT 1 FROM pg_sleep(30)", &[]);
+            assert!(tokio::time::timeout(Duration::from_secs(1), slow)
+                .await
+                .is_err());
+            assert!(client.pending_caller_requests() >= 1);
+            assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+        }
+        let mut client = pool.get().await.unwrap();
+        assert_eq!(backend_pid(&client).await, pid, "cleanup kept the session");
+        assert_eq!(client.pending_caller_requests(), 0);
+        assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+        let got: i64 = client
+            .query_one("SELECT $1::int8", &[&7i64])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(got, 7, "the next borrower got its own reply");
+        drop(client);
+        let stats = pool.state().stats;
+        assert_eq!(stats.cleanups, 1, "{stats:?}");
+        assert_eq!(stats.cleanup_cancels, 1, "{stats:?}");
+        assert_eq!(stats.connects, 1, "{stats:?}");
+        assert_eq!(wire.snapshot().cancels, 1);
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
 async fn text(client: &yb_postgres_pool::yb_tokio_postgres::Client, sql: &str) -> String {
     for message in client.simple_query(sql).await.unwrap() {
         if let SimpleQueryMessage::Row(row) = message {

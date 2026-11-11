@@ -40,6 +40,9 @@ pub(crate) struct SessionShared {
     /// Requests handed to the connection whose `ReadyForQuery` has not been
     /// processed yet.
     pending: AtomicU64,
+    /// Of `pending`, those not sent detached (the `Close` a dropped
+    /// statement or portal sends).
+    caller_pending: AtomicU64,
     /// Status byte of the most recent `ReadyForQuery` (the startup sequence
     /// ends with `I`).
     status: AtomicU8,
@@ -54,6 +57,7 @@ impl SessionShared {
     pub(crate) fn new() -> SessionShared {
         SessionShared {
             pending: AtomicU64::new(0),
+            caller_pending: AtomicU64::new(0),
             status: AtomicU8::new(b'I'),
             parameter_changes: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -61,19 +65,25 @@ impl SessionShared {
         }
     }
 
-    pub(crate) fn request_sent(&self) {
+    pub(crate) fn request_sent(&self, detached: bool) {
+        if !detached {
+            self.caller_pending.fetch_add(1, Ordering::SeqCst);
+        }
         self.pending.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub(crate) fn request_complete(&self, ready_status: Option<u8>) {
+    /// Publishes the status before the counts drop, so a reader that sees
+    /// no caller request pending reads a status at least that recent.
+    pub(crate) fn request_complete(&self, ready_status: Option<u8>, detached: bool) {
         if let Some(byte) = ready_status {
             self.status.store(byte, Ordering::SeqCst);
         }
         // Saturating: a response without a matching counted request would be
         // a protocol error the connection reports anyway.
-        let _ = self
-            .pending
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if !detached {
+            decrement(&self.caller_pending);
+        }
+        decrement(&self.pending);
         self.waker.wake();
     }
 
@@ -88,6 +98,10 @@ impl SessionShared {
 
     pub(crate) fn pending(&self) -> u64 {
         self.pending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn caller_pending(&self) -> u64 {
+        self.caller_pending.load(Ordering::SeqCst)
     }
 
     pub(crate) fn transaction_status(&self) -> TransactionStatus {
@@ -118,5 +132,67 @@ impl SessionShared {
             }
         })
         .await
+    }
+}
+
+fn decrement(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionShared, TransactionStatus};
+
+    #[test]
+    fn detached_requests_are_pending_but_not_caller_pending() {
+        let session = SessionShared::new();
+        session.request_sent(true);
+        session.request_sent(true);
+        assert_eq!(session.pending(), 2);
+        assert_eq!(session.caller_pending(), 0);
+        session.request_complete(Some(b'I'), true);
+        assert_eq!((session.pending(), session.caller_pending()), (1, 0));
+        session.request_complete(Some(b'I'), true);
+        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
+        assert!(session.settled());
+    }
+
+    #[test]
+    fn caller_requests_count_until_their_ready_for_query() {
+        let session = SessionShared::new();
+        session.request_sent(false);
+        session.request_sent(true);
+        assert_eq!((session.pending(), session.caller_pending()), (2, 1));
+        session.request_complete(Some(b'T'), false);
+        assert_eq!((session.pending(), session.caller_pending()), (1, 0));
+        assert_eq!(
+            session.transaction_status(),
+            TransactionStatus::InTransaction
+        );
+        session.request_complete(Some(b'T'), true);
+        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
+
+        session.request_sent(true);
+        session.request_sent(false);
+        session.request_complete(Some(b'I'), true);
+        assert_eq!((session.pending(), session.caller_pending()), (1, 1));
+        assert!(!session.settled());
+        session.request_complete(Some(b'E'), false);
+        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+    }
+
+    #[test]
+    fn unsent_and_unmatched_completions_saturate() {
+        let session = SessionShared::new();
+        session.request_sent(false);
+        session.request_complete(None, false);
+        assert_eq!(session.transaction_status(), TransactionStatus::Idle);
+        session.request_complete(None, false);
+        session.request_complete(None, true);
+        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
+        session.request_sent(true);
+        session.request_complete(None, false);
+        assert_eq!((session.pending(), session.caller_pending()), (0, 0));
     }
 }

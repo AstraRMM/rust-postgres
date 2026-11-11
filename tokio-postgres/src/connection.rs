@@ -31,11 +31,13 @@ pub struct Request {
     /// Wire accounting for the issuing context; `None` while observation is
     /// off. Dropping it before `ReadyForQuery` counts the cycle as abandoned.
     pub observation: Option<RequestObservation>,
+    pub detached: bool,
 }
 
 pub struct Response {
     sender: mpsc::Sender<BackendMessages>,
     observation: Option<RequestObservation>,
+    detached: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -189,7 +191,8 @@ where
                     // response, so a caller that has read ReadyForQuery
                     // never sees a stale status.
                     if request_complete {
-                        self.session.request_complete(ready_status);
+                        self.session
+                            .request_complete(ready_status, response.detached);
                     }
                     let _ = response.sender.start_send(messages);
                     if !request_complete {
@@ -202,7 +205,8 @@ where
                     self.observe_response(&mut response, &messages, request_complete);
                     // we need to keep paging through the rest of the messages even if the receiver's hung up
                     if request_complete {
-                        self.session.request_complete(ready_status);
+                        self.session
+                            .request_complete(ready_status, response.detached);
                     } else {
                         self.responses.push_front(response);
                     }
@@ -236,6 +240,7 @@ where
                 self.responses.push_back(Response {
                     sender: request.sender,
                     observation: request.observation,
+                    detached: request.detached,
                 });
                 Poll::Ready(Some(request.messages))
             }
