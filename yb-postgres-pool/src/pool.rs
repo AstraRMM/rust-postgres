@@ -92,6 +92,74 @@ impl Drop for Opening<'_> {
     }
 }
 
+struct Dialing<'a, T: PoolTls> {
+    shared: &'a Shared<T>,
+    id: u64,
+}
+
+impl<'a, T: PoolTls> Dialing<'a, T> {
+    fn start(shared: &'a Shared<T>) -> Dialing<'a, T> {
+        let id = shared.next_dial.fetch_add(1, Ordering::SeqCst);
+        shared.dials.lock().insert(id, Instant::now());
+        shared.limiter.dial_started();
+        Dialing { shared, id }
+    }
+}
+
+impl<T: PoolTls> Drop for Dialing<'_, T> {
+    fn drop(&mut self) {
+        self.shared.dials.lock().remove(&self.id);
+        self.shared.limiter.dial_ended();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Occupancy {
+    pub(crate) borrowed: u64,
+    pub(crate) max_size: u32,
+    pub(crate) permits_in_use: u32,
+    pub(crate) permits_dialing: u32,
+    pub(crate) permits_max: u32,
+    pub(crate) oldest_dial: Option<Duration>,
+    pub(crate) connect_errors: u64,
+}
+
+impl Occupancy {
+    fn saturated(&self) -> bool {
+        self.borrowed >= u64::from(self.max_size)
+            || self.permits_in_use.saturating_sub(self.permits_dialing) >= self.permits_max
+    }
+}
+
+impl fmt::Display for Occupancy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} of {} borrowed, {} of {} process permits in use ({} dialing), oldest own dial {:?}",
+            self.borrowed,
+            self.max_size,
+            self.permits_in_use,
+            self.permits_max,
+            self.permits_dialing,
+            self.oldest_dial
+        )
+    }
+}
+
+pub(crate) fn probe_timeout_kind(
+    start: &Occupancy,
+    end: &Occupancy,
+    waited: Duration,
+) -> ErrorKind {
+    let stalled_dial = end.oldest_dial.is_some_and(|age| age >= waited / 2);
+    let failed_dial = end.connect_errors > start.connect_errors;
+    if stalled_dial || failed_dial || !(start.saturated() || end.saturated()) {
+        ErrorKind::Transport
+    } else {
+        ErrorKind::AcquireTimeout
+    }
+}
+
 /// Counts a checkout in progress (activity for pool-set eviction).
 struct Waiting<'a>(&'a AtomicU64);
 
@@ -126,7 +194,8 @@ pub(crate) struct Shared<T: PoolTls> {
     shutdown_signal: Notify,
     /// Dials in progress.
     opening: AtomicU64,
-    dialing: AtomicU64,
+    dials: Mutex<HashMap<u64, Instant>>,
+    next_dial: AtomicU64,
     /// Checkouts in progress.
     waiting: AtomicU64,
     /// Connect failures and shutdown wake waiters: a failed connect is
@@ -232,7 +301,7 @@ impl<T: PoolTls> Shared<T> {
             _process: process,
         };
         let remaining = budget.saturating_sub(started.elapsed());
-        let _dialing = Opening::start(&self.dialing);
+        let _dialing = Dialing::start(self.as_ref());
         match tokio::time::timeout(remaining, self.dial(permits)).await {
             Ok(result) => result,
             Err(_) => Err(PoolError::new(
@@ -526,6 +595,24 @@ impl<T: PoolTls> Shared<T> {
     fn touch(&self) {
         *self.last_activity.lock() = Instant::now();
     }
+
+    fn occupancy(&self) -> Occupancy {
+        let now = Instant::now();
+        Occupancy {
+            borrowed: self.borrowed.load(Ordering::SeqCst),
+            max_size: self.config.max_size,
+            permits_in_use: self.limiter.in_use(),
+            permits_dialing: self.limiter.dialing(),
+            permits_max: self.limiter.max(),
+            oldest_dial: self
+                .dials
+                .lock()
+                .values()
+                .map(|started| now.duration_since(*started))
+                .max(),
+            connect_errors: self.connect_error_seq.load(Ordering::SeqCst),
+        }
+    }
 }
 
 /// The bb8 manager.
@@ -713,7 +800,8 @@ impl<T: PoolTls> Pool<T> {
             closed: AtomicBool::new(false),
             shutdown_signal: Notify::new(),
             opening: AtomicU64::new(0),
-            dialing: AtomicU64::new(0),
+            dials: Mutex::new(HashMap::new()),
+            next_dial: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             fatal: Notify::new(),
             fatal_seq: AtomicU64::new(0),
@@ -844,15 +932,29 @@ impl<T: PoolTls> Pool<T> {
     ///
     /// # Saturation
     ///
-    /// The probe competes for a client like any borrower. When every client
-    /// is borrowed, or the process-wide limit is used up by established
-    /// connections, it fails with [`ErrorKind::AcquireTimeout`] or
-    /// [`ErrorKind::ProcessLimit`]. Any other failure means the pool could
-    /// not reach a usable session: a connect that stalled or failed while
-    /// the pool had room is reported as [`ErrorKind::Transport`] (or the
-    /// connect's own [`ErrorKind::Security`] or [`ErrorKind::Config`]), as
-    /// is a query that failed or timed out. Whether a saturated pool counts
-    /// as ready is the service's decision.
+    /// The probe competes for a client like any borrower. A probe that gets
+    /// no client in time reports [`ErrorKind::AcquireTimeout`] (saturation)
+    /// unless there is evidence against this pool's connect path, in which
+    /// case it reports [`ErrorKind::Transport`]. The evidence is:
+    ///
+    /// * one of this pool's dials was still in flight at the deadline after
+    ///   running for at least half the wait;
+    /// * one of this pool's dials failed during the wait;
+    /// * the pool had room both when the wait began and at the deadline:
+    ///   fewer than `max_size` clients borrowed, and process-wide permits
+    ///   free once permits held by dials in progress (of any pool sharing
+    ///   the limiter) are discounted.
+    ///
+    /// Occupancy is sampled at those two points, not traced, so a pool that
+    /// filled and drained between them is not seen. Permits held by sockets
+    /// that are still closing count as established connections. A connect
+    /// failure can also end the wait directly with its own kind
+    /// ([`ErrorKind::Transport`], [`ErrorKind::Security`],
+    /// [`ErrorKind::Config`], or [`ErrorKind::ProcessLimit`] when the
+    /// process-wide limit stayed exhausted for the whole connect budget). A
+    /// query that fails or times out is [`ErrorKind::Transport`] or the
+    /// driver error's kind. Whether a saturated pool counts as ready is the
+    /// service's decision.
     ///
     /// A probe is a checkout, so it counts as activity: a [`PoolSet`]
     /// pool that is probed periodically is never evicted for idleness.
@@ -869,9 +971,20 @@ impl<T: PoolTls> Pool<T> {
     }
 
     async fn run_probe(&self, started: Instant, budget: Duration) -> Result<(), PoolError> {
+        let shared = &self.inner.shared;
+        let before = shared.occupancy();
         let mut client = match self.get_within(budget).await {
             Ok(client) => client,
-            Err(error) => return Err(self.probe_checkout_error(error)),
+            Err(error) if error.kind() == ErrorKind::AcquireTimeout => {
+                let after = shared.occupancy();
+                return Err(match probe_timeout_kind(&before, &after, started.elapsed()) {
+                    ErrorKind::AcquireTimeout => error,
+                    kind => error.with_kind(kind).with_message(
+                        "no connection within the probe budget, and this pool's connect path rather than saturation held it up",
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
         };
         let remaining = match probe_query_budget(budget, started.elapsed()) {
             Some(remaining) => remaining,
@@ -903,22 +1016,6 @@ impl<T: PoolTls> Pool<T> {
                 format!("probe did not complete within {:?}", budget),
             )),
         }
-    }
-
-    fn saturated(&self) -> bool {
-        let shared = &self.inner.shared;
-        shared.borrowed.load(Ordering::SeqCst) >= u64::from(shared.config.max_size)
-            || (shared.limiter.in_use() >= shared.limiter.max()
-                && shared.dialing.load(Ordering::SeqCst) == 0)
-    }
-
-    fn probe_checkout_error(&self, error: PoolError) -> PoolError {
-        if error.kind() == ErrorKind::AcquireTimeout && !self.saturated() {
-            return error.with_kind(ErrorKind::Transport).with_message(
-                "no connection within the probe budget while the pool was not saturated",
-            );
-        }
-        error
     }
 
     /// Opens connections until the pool holds `warm_floor` physical
@@ -1420,6 +1517,71 @@ mod tests {
         SessionConfig, SessionInit, SessionParameters,
     };
     use std::time::Duration;
+
+    #[test]
+    fn probe_timeouts_are_saturation_without_evidence_against_the_pool() {
+        use crate::error::ErrorKind;
+        use crate::pool::{probe_timeout_kind, Occupancy};
+        let idle = Occupancy {
+            borrowed: 0,
+            max_size: 2,
+            permits_in_use: 0,
+            permits_dialing: 0,
+            permits_max: 4,
+            oldest_dial: None,
+            connect_errors: 7,
+        };
+        let full = Occupancy {
+            borrowed: 2,
+            permits_in_use: 2,
+            ..idle
+        };
+        let waited = Duration::from_millis(400);
+        let kind = |start: &Occupancy, end: &Occupancy| probe_timeout_kind(start, end, waited);
+        assert_eq!(kind(&full, &full), ErrorKind::AcquireTimeout);
+        assert_eq!(
+            kind(&full, &idle),
+            ErrorKind::AcquireTimeout,
+            "hand-off at the deadline"
+        );
+        assert_eq!(
+            kind(&idle, &full),
+            ErrorKind::AcquireTimeout,
+            "filled during the wait"
+        );
+        assert_eq!(kind(&idle, &idle), ErrorKind::Transport);
+        let replacing = Occupancy {
+            permits_in_use: 1,
+            permits_dialing: 1,
+            oldest_dial: Some(Duration::from_millis(100)),
+            ..idle
+        };
+        assert_eq!(kind(&full, &replacing), ErrorKind::AcquireTimeout);
+        let stalled = Occupancy {
+            oldest_dial: Some(Duration::from_millis(200)),
+            ..full
+        };
+        assert_eq!(kind(&full, &stalled), ErrorKind::Transport);
+        let failed = Occupancy {
+            connect_errors: 8,
+            ..full
+        };
+        assert_eq!(kind(&full, &failed), ErrorKind::Transport);
+        let shared_full_of_dials = Occupancy {
+            permits_in_use: 4,
+            permits_dialing: 4,
+            ..idle
+        };
+        assert_eq!(
+            kind(&shared_full_of_dials, &shared_full_of_dials),
+            ErrorKind::Transport
+        );
+        let shared_full = Occupancy {
+            permits_in_use: 4,
+            ..idle
+        };
+        assert_eq!(kind(&shared_full, &shared_full), ErrorKind::AcquireTimeout);
+    }
 
     #[test]
     fn probe_sends_its_query_only_with_budget_left() {

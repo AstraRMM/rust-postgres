@@ -471,6 +471,79 @@ async fn probe_reports_saturation_apart_from_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_keeps_saturation_through_a_hand_off() {
+    for e in engines() {
+        let app = format!("pt_probe_hand_off_{}", e.name);
+        let (addr, _wire) = proxy_delayed(e.addr, Duration::from_millis(600)).await;
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(addr), NoTls, config).unwrap();
+        let held = pool.get().await.unwrap();
+        let waiter = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut client = pool.get_within(Duration::from_secs(5)).await.unwrap();
+                client.mark_session_dirty();
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                drop(client);
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let probe = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.probe(Duration::from_millis(500)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let err = probe.await.unwrap().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AcquireTimeout,
+            "saturated when the wait began, then handed off and replaced: {err}"
+        );
+        waiter.await.unwrap();
+        println!("[{}] hand-off probe: {err}", e.name);
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_blames_a_limiter_full_of_stalled_dials() {
+    let stall = stall_listener().await;
+    let limiter = ConnectionLimiter::new(1);
+    let sibling = Pool::with_limiter(
+        unused_config(stall),
+        NoTls,
+        PoolConfig::default(),
+        limiter.clone(),
+        "sibling",
+    )
+    .unwrap();
+    let pending = {
+        let sibling = sibling.clone();
+        tokio::spawn(async move { sibling.get_within(Duration::from_secs(3)).await.is_ok() })
+    };
+    assert!(eventually(Duration::from_secs(2), || limiter.in_use() == 1).await);
+    let pool = Pool::with_limiter(
+        unused_config(refused_addr()),
+        NoTls,
+        PoolConfig::default(),
+        limiter.clone(),
+        "probed",
+    )
+    .unwrap();
+    let err = pool.probe(Duration::from_millis(300)).await.unwrap_err();
+    assert_eq!(
+        err.kind(),
+        ErrorKind::Transport,
+        "the only permit is held by a stalled dial, not a connection: {err}"
+    );
+    pending.abort();
+    sibling.shutdown(Duration::from_secs(1)).await;
+    pool.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prometheus_export_is_grouped_and_bounded() {
     let addr = stall_listener().await;
     let a = Pool::new(unused_config(addr), NoTls, PoolConfig::default()).unwrap();

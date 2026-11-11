@@ -2,6 +2,7 @@
 
 use crate::error::{ErrorKind, PoolError};
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -16,6 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Clone)]
 pub struct ConnectionLimiter {
     semaphore: Arc<Semaphore>,
+    dialing: Arc<AtomicU32>,
     max: u32,
 }
 
@@ -33,6 +35,7 @@ impl ConnectionLimiter {
     pub fn new(max: u32) -> ConnectionLimiter {
         ConnectionLimiter {
             semaphore: Arc::new(Semaphore::new(max as usize)),
+            dialing: Arc::new(AtomicU32::new(0)),
             max,
         }
     }
@@ -46,6 +49,18 @@ impl ConnectionLimiter {
     pub fn in_use(&self) -> u32 {
         self.max
             .saturating_sub(self.semaphore.available_permits() as u32)
+    }
+
+    pub(crate) fn dialing(&self) -> u32 {
+        self.dialing.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn dial_started(&self) {
+        self.dialing.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn dial_ended(&self) {
+        self.dialing.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub(crate) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, PoolError> {
