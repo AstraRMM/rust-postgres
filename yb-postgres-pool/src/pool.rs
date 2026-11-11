@@ -945,6 +945,8 @@ impl<T: PoolTls> Pool<T> {
     ///   free once permits held by dials in progress (of any pool sharing
     ///   the limiter) are discounted.
     ///
+    /// The same rule, not counting the probe's own client, decides the kind
+    /// when the checkout succeeds but leaves less than 5 ms for the query.
     /// Occupancy is sampled at those two points, not traced, so a pool that
     /// filled and drained between them is not seen. Permits held by sockets
     /// that are still closing count as established connections. A connect
@@ -989,11 +991,9 @@ impl<T: PoolTls> Pool<T> {
         let remaining = match probe_query_budget(budget, started.elapsed()) {
             Some(remaining) => remaining,
             None => {
-                let kind = if client.connection_age() <= started.elapsed() {
-                    ErrorKind::Transport
-                } else {
-                    ErrorKind::AcquireTimeout
-                };
+                let mut after = shared.occupancy();
+                after.borrowed = after.borrowed.saturating_sub(1);
+                let kind = probe_timeout_kind(&before, &after, started.elapsed());
                 return Err(PoolError::new(
                     kind,
                     format!(
