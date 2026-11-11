@@ -39,7 +39,8 @@ pub struct SessionConfig {
     pub role: Option<String>,
     /// `search_path` schemas, each a lowercase unquoted identifier.
     pub search_path: Option<Vec<String>>,
-    /// Parameters the pool owns over the caller's `Config::options`.
+    /// Parameters the caller's `Config::options` cannot override; see
+    /// [`SessionParameters`].
     pub parameters: SessionParameters,
     /// How the settings are applied.
     pub init: SessionInit,
@@ -136,18 +137,37 @@ impl PlanCacheMode {
     }
 }
 
-/// Session parameters the pool sets on every connection and that callers
-/// cannot override.
+/// Session parameters the pool sets on every connection and that the
+/// caller's `Config::options` cannot override.
 ///
 /// They are applied after the caller's `Config::options`, so the pool's
-/// values win. A pool refuses to start (with [`ErrorKind::Config`]) when
-/// `Config::options` names a parameter set here, in any spelling the server
-/// accepts (`-c name=value`, `-cname=value`, `--name=value`, any case,
-/// dashes for underscores, and `-e` for `DateStyle`).
+/// values win, and they also win over role and database defaults
+/// (`ALTER ROLE … SET`, `ALTER DATABASE … SET`). A pool refuses to start
+/// (with [`ErrorKind::Config`]) when `Config::options` names a parameter
+/// set here, in any spelling the server accepts (`-c name=value`,
+/// `-cname=value`, `--name=value`, any case, dashes for underscores, and
+/// `-e` for `DateStyle`). Only these parameters fail closed: a caller
+/// option that sets one of the other [`SessionConfig`] settings
+/// (`statement_timeout`, `lock_timeout`,
+/// `idle_in_transaction_session_timeout`, `role`, `search_path`) is
+/// accepted and overridden by ordering alone.
+///
+/// # Changes at run time
 ///
 /// `DateStyle` and `TimeZone` are reported by the server (`GUC_REPORT`):
 /// the values set here are the session's baseline, and a later change (for
 /// example a session-level `SET TimeZone`) retires the session on return.
+/// `extra_float_digits` and `plan_cache_mode` are not reported: a borrower
+/// that runs `SET` or `RESET` on them must call
+/// [`PooledClient::mark_session_dirty`](crate::PooledClient::mark_session_dirty),
+/// or the next borrower gets the changed value.
+///
+/// Prefer [`SessionInit::StartupOptions`] for parity. Startup options become
+/// the session defaults, so `RESET ALL` and `DISCARD ALL` return to the
+/// pool's values. With [`SessionInit::AfterConnect`] the values are plain
+/// session `SET`s: `RESET ALL` or `DISCARD ALL` reverts all four to the
+/// server, role or database default, and only a reverted `DateStyle` or
+/// `TimeZone` is detected.
 ///
 /// [`ErrorKind::Config`]: crate::ErrorKind::Config
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -155,8 +175,9 @@ impl PlanCacheMode {
 pub struct SessionParameters {
     /// `DateStyle`.
     pub date_style: Option<DateStyle>,
-    /// `TimeZone`: a zone name, abbreviation or POSIX zone of ASCII
-    /// letters, digits and `/_+-:.`.
+    /// `TimeZone`, 1 to 64 ASCII letters, digits and `/_+-:.`. Use an IANA
+    /// zone name such as `UTC` or `Etc/UTC`; POSIX zones invert the sign
+    /// (`+05:00` means UTC−5).
     pub time_zone: Option<String>,
     /// `extra_float_digits`, from -15 to 3.
     pub extra_float_digits: Option<i8>,
@@ -371,7 +392,9 @@ impl SessionConfig {
     }
 
     /// `(setting, value)` pairs, in application order. Values are validated
-    /// identifiers or integers, so they need no quoting.
+    /// to contain no whitespace, quote or backslash, so they need no
+    /// escaping in `-c` options; `init_sql` single-quotes `DateStyle` and
+    /// `TimeZone`.
     pub(crate) fn settings(&self) -> Result<Vec<(&'static str, String)>, PoolError> {
         self.validate()?;
         let mut out = Vec::new();

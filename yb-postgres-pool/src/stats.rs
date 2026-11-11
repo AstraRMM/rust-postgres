@@ -136,8 +136,9 @@ impl Stats {
 /// `session_init_round_trips` (one per connect with
 /// [`SessionInit::AfterConnect`](crate::SessionInit::AfterConnect)),
 /// `probes` (only with [`HealthCheck::AfterIdle`](crate::HealthCheck)),
-/// `readiness_probes` (one empty query each, only when
-/// [`Pool::probe`](crate::Pool::probe) is called and a client was borrowed),
+/// `readiness_probes` (one per [`Pool::probe`](crate::Pool::probe) call,
+/// each sending at most one empty query, plus any connect it triggers,
+/// counted in `connects`),
 /// `cleanup_cancels` (one cancel request on a separate connection each),
 /// `cleanup_rollbacks` (one `ROLLBACK` each) and `statement_prepares` (one
 /// Parse/Describe/Sync exchange each, plus `Close` for evictions). A clean
