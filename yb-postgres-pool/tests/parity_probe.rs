@@ -311,10 +311,16 @@ async fn probe_of_a_pool_that_cannot_connect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn probe_rejects_a_zero_budget() {
+async fn probe_rejects_a_budget_below_the_query_floor() {
     let pool = Pool::new(unused_config(refused_addr()), NoTls, PoolConfig::default()).unwrap();
-    let err = pool.probe(Duration::ZERO).await.unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::Config, "{err}");
+    for budget in [
+        Duration::ZERO,
+        Duration::from_micros(1000),
+        Duration::from_micros(4999),
+    ] {
+        let err = pool.probe(budget).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config, "{budget:?}: {err}");
+    }
     let stats = pool.state().stats;
     assert_eq!(stats.readiness_probes, 0);
     assert_eq!(stats.connects + stats.connect_failures, 0);

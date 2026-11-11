@@ -924,9 +924,8 @@ impl<T: PoolTls> Pool<T> {
     /// succeeds; a failed, timed-out or abandoned query retires it. When
     /// less than 5 ms of the budget is left after the checkout, no query is
     /// sent, the probe fails and the client goes back to the pool unchanged.
-    /// A zero `budget` is rejected with [`ErrorKind::Config`] and not
-    /// counted. Otherwise every
-    /// call is counted in [`PoolStats::readiness_probes`], and every call
+    /// A `budget` under 5 ms is rejected with [`ErrorKind::Config`] and not
+    /// counted. Otherwise every call is counted in [`PoolStats::readiness_probes`], and every call
     /// that does not succeed, including one whose future is dropped, in
     /// [`PoolStats::readiness_probe_failures`].
     ///
@@ -963,8 +962,11 @@ impl<T: PoolTls> Pool<T> {
     ///
     /// [`PoolSet`]: crate::PoolSet
     pub async fn probe(&self, budget: Duration) -> Result<(), PoolError> {
-        if budget.is_zero() {
-            return Err(PoolError::config("probe budget must be non-zero"));
+        if budget < PROBE_QUERY_FLOOR {
+            return Err(PoolError::config(format!(
+                "probe budget must be at least {:?}",
+                PROBE_QUERY_FLOOR
+            )));
         }
         let mut record = ProbeRecord::start(&self.inner.shared.stats);
         let result = self.run_probe(record.started, budget).await;
