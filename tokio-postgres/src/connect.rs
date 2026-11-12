@@ -3,7 +3,7 @@ use crate::config::{Host, LoadBalanceHosts, SslMode, TargetSessionAttrs};
 use crate::connect_raw::connect_raw;
 use crate::connect_socket::connect_socket;
 use crate::endpoint::{self, ResolvedEndpoint};
-use crate::realm::Realm;
+use crate::realm::{deadline_after, is_node_scoped_failure, Realm};
 use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
@@ -11,7 +11,7 @@ use log::warn;
 use rand::seq::SliceRandom;
 use std::net::IpAddr;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, io};
 use tokio::net;
 use tokio::time;
@@ -32,20 +32,217 @@ where
     // the same bounds as load-balanced acquisitions: each host attempt
     // (DNS, TCP, TLS, authentication) within `yb_attempt_timeout`, the whole
     // call within `yb_acquire_timeout`.
-    match time::timeout(
-        config.yb_acquire_timeout,
-        connect_with_tls_ref(&mut tls, config, Some(config.yb_attempt_timeout)),
+    let mut pass = SeedPass::new(Some(config.yb_attempt_timeout))
+        .deadline(deadline_after(config.yb_acquire_timeout));
+    let outcome = time::timeout(
+        config.yb_acquire_timeout.saturating_add(BACKSTOP_GRACE),
+        connect_with_tls_ref(&mut tls, config, &mut pass),
     )
-    .await
-    {
+    .await;
+    match outcome {
         Ok(result) => result,
-        Err(_) => Err(Error::connect(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "no connection was established within the {:?} acquisition budget",
-                config.yb_acquire_timeout
-            ),
-        ))),
+        // A TLS or configuration error recorded before the budget ran out is
+        // more useful to the caller than the timeout.
+        Err(_) => Err(pass.take_reportable().unwrap_or_else(|| {
+            Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no connection was established within the {:?} acquisition budget",
+                    config.yb_acquire_timeout
+                ),
+            ))
+        })),
+    }
+}
+
+/// How long after its deadline a timeout around a deadline-bounded attempt
+/// fires. The attempt returns its own recorded error at the deadline; the
+/// timeout is only a backstop and must not pre-empt that.
+pub(crate) const BACKSTOP_GRACE: Duration = Duration::from_millis(50);
+
+/// The bound on one host attempt ([`connect_host`]) and the resolved
+/// addresses whose own endpoint failed in it.
+pub(crate) struct HostAttempt {
+    limit: Option<(Duration, Instant)>,
+    /// Resolved addresses that failed with [`is_node_scoped_failure`].
+    pub(crate) failed_addrs: Vec<String>,
+}
+
+impl HostAttempt {
+    /// An attempt bounded by `limit` from now, if given.
+    pub(crate) fn bounded(limit: Option<Duration>) -> HostAttempt {
+        HostAttempt {
+            limit: limit.map(|limit| (limit, deadline_after(limit))),
+            failed_addrs: Vec::new(),
+        }
+    }
+
+    /// Whether the bound has passed.
+    fn expired(&self) -> bool {
+        self.limit
+            .map_or(false, |(_, deadline)| Instant::now() >= deadline)
+    }
+
+    /// Runs `step` within what is left of the bound.
+    async fn run<F, R>(&self, label: &str, step: F) -> Result<R, Error>
+    where
+        F: Future<Output = Result<R, Error>>,
+    {
+        match self.limit {
+            Some((limit, deadline)) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                establish_control_connection(label, limit, time::timeout(remaining, step).await)
+            }
+            None => step.await,
+        }
+    }
+}
+
+/// Which configured hosts a [`SeedPass`] tries, by whether they are
+/// deferred.
+#[derive(Clone, Copy)]
+pub(crate) enum Seeds {
+    All,
+    Undeferred,
+    Deferred,
+}
+
+/// Bounds and bookkeeping for one pass over the configured hosts.
+pub(crate) struct SeedPass {
+    select: Seeds,
+    /// Bound on each host attempt.
+    attempt_timeout: Option<Duration>,
+    /// No attempt runs past this instant.
+    deadline: Option<Instant>,
+    /// Lower-case seed identities to try after every other seed.
+    deferred: Vec<String>,
+    /// What the caller sees if no host succeeds ([`record_failure`]).
+    pub(crate) failure: Option<Error>,
+    /// The aliases ([`seed_aliases`]) of each seed whose own endpoint
+    /// failed ([`is_node_scoped_failure`]), one entry per failure.
+    pub(crate) node_failures: Vec<Vec<String>>,
+}
+
+impl SeedPass {
+    pub(crate) fn new(attempt_timeout: Option<Duration>) -> SeedPass {
+        SeedPass {
+            select: Seeds::All,
+            attempt_timeout,
+            deadline: None,
+            deferred: Vec::new(),
+            failure: None,
+            node_failures: Vec::new(),
+        }
+    }
+
+    pub(crate) fn deadline(mut self, deadline: Instant) -> SeedPass {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    pub(crate) fn deferring(mut self, deferred: Vec<String>) -> SeedPass {
+        self.deferred = deferred;
+        self
+    }
+
+    pub(crate) fn select(mut self, select: Seeds) -> SeedPass {
+        self.select = select;
+        self
+    }
+
+    /// The recorded failure, or a timeout if none was recorded.
+    pub(crate) fn take_failure(&mut self) -> Error {
+        self.failure.take().unwrap_or_else(|| {
+            Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the acquisition budget ran out before a configured host could be tried",
+            ))
+        })
+    }
+
+    /// The recorded failure if it is a TLS or client configuration error,
+    /// for a caller whose own timeout cut the pass short.
+    pub(crate) fn take_reportable(&mut self) -> Option<Error> {
+        take_reportable(&mut self.failure)
+    }
+}
+
+/// Takes the failure recorded in `slot` ([`record_failure`]) if it is a TLS
+/// or client configuration error, for a caller whose timeout cut an attempt
+/// short: that error is more useful than the timeout.
+pub(crate) fn take_reportable(slot: &mut Option<Error>) -> Option<Error> {
+    match slot {
+        Some(e) if failure_rank(e) > 0 => slot.take(),
+        _ => None,
+    }
+}
+
+/// The accounting identity of configured host `i`: its name, or its
+/// `hostaddr` when it has no TCP name.
+pub(crate) fn seed_identity(config: &Config, i: usize) -> Option<String> {
+    match config.host.get(i) {
+        Some(Host::Tcp(name)) => Some(name.clone()),
+        _ => None,
+    }
+    .or_else(|| config.hostaddr.get(i).map(|addr| addr.to_string()))
+}
+
+/// The identities configured host `i` may be listed under in a topology:
+/// its TCP name and its `hostaddr`.
+pub(crate) fn seed_aliases(config: &Config, i: usize) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(Host::Tcp(name)) = config.host.get(i) {
+        aliases.push(name.clone());
+    }
+    if let Some(addr) = config.hostaddr.get(i) {
+        aliases.push(addr.to_string());
+    }
+    aliases
+}
+
+/// [`seed_aliases`] of every configured host that has any.
+pub(crate) fn all_seed_aliases(config: &Config) -> Vec<Vec<String>> {
+    (0..cmp::max(config.host.len(), config.hostaddr.len()))
+        .map(|i| seed_aliases(config, i))
+        .filter(|aliases| !aliases.is_empty())
+        .collect()
+}
+
+/// Precedence of the errors of a pass over several endpoints when none
+/// succeeds. Credential failures, client certificate and client TLS errors
+/// never get here: they end the pass at once.
+///
+/// 2. A client-side configuration error (for example a password the server
+///    asked for but the configuration lacks). It would repeat on every
+///    endpoint that asks for it and only the caller can fix it, so it wins
+///    over an earlier node-scoped TLS error. The pass still tries the
+///    remaining endpoints, as one of them may not need it.
+/// 1. The first node-scoped TLS failure: verification failed on a reachable
+///    endpoint, and a later transport error or timeout must not hide it.
+/// 0. Otherwise the last other error (transport, timeout, server).
+fn failure_rank(e: &Error) -> u8 {
+    if e.is_client_config() {
+        2
+    } else if e.is_security_failure() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Records `next` in `slot` according to [`failure_rank`]: a higher rank
+/// replaces a lower one, the first error of rank 1 or 2 is kept, and a later
+/// error of rank 0 replaces an earlier one.
+pub(crate) fn record_failure(slot: &mut Option<Error>, next: Error) {
+    let keep = match slot {
+        Some(current) => {
+            let (current, next) = (failure_rank(current), failure_rank(&next));
+            current > next || (current == next && current > 0)
+        }
+        None => false,
+    };
+    if !keep {
+        *slot = Some(next);
     }
 }
 
@@ -53,12 +250,13 @@ where
 /// value. This lets callers that only hold a `&mut T` (such as the control
 /// connection in `check_and_refresh`) reuse the exact host-iteration logic
 /// while still using the caller-provided TLS connector.
-/// `attempt_timeout` bounds each candidate individually, not the loop as a whole,
-/// so that a couple of blackholed candidates do not starve the rest.
+/// `pass.attempt_timeout` bounds each candidate individually, not the loop as
+/// a whole, so that a couple of blackholed candidates do not starve the rest;
+/// `pass.deadline`, if set, bounds the loop.
 pub(crate) async fn connect_with_tls_ref<T>(
     tls: &mut T,
     config: &Config,
-    attempt_timeout: Option<Duration>,
+    pass: &mut SeedPass,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -92,9 +290,35 @@ where
     if config.load_balance_hosts == LoadBalanceHosts::Random {
         indices.shuffle(&mut rand::thread_rng());
     }
+    let deferred = |i: usize| {
+        seed_aliases(config, i)
+            .iter()
+            .any(|alias| pass.deferred.contains(&alias.to_ascii_lowercase()))
+    };
+    match pass.select {
+        Seeds::All => {}
+        Seeds::Undeferred => indices.retain(|&i| !deferred(i)),
+        Seeds::Deferred => indices.retain(|&i| deferred(i)),
+    }
+    if !pass.deferred.is_empty() {
+        // Stable: seeds whose endpoint failed recently go last.
+        indices.sort_by_key(|&i| deferred(i));
+    }
 
-    let mut error = None;
     for i in indices {
+        let attempt_timeout = match pass.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                Some(
+                    pass.attempt_timeout
+                        .map_or(remaining, |limit| cmp::min(limit, remaining)),
+                )
+            }
+            None => pass.attempt_timeout,
+        };
         let host = config.host.get(i);
         let hostaddr = config.hostaddr.get(i);
         let port = config
@@ -121,28 +345,46 @@ where
         };
 
         // A seed's accounting identity is its configured name (or address).
-        let node = hostname
-            .clone()
-            .or_else(|| hostaddr.map(|addr| addr.to_string()));
+        let node = seed_identity(config, i);
         let label = host_label(&addr);
-        let attempt = connect_host(addr, hostname, port, &mut *tls, config, node);
-        let outcome = match attempt_timeout {
-            Some(limit) => {
-                establish_control_connection(&label, limit, time::timeout(limit, attempt).await)
-            }
-            None => attempt.await,
-        };
+        // The host attempt bounds itself, so a TLS error recorded on one of
+        // its resolved addresses is returned rather than lost to a timeout.
+        let mut host = HostAttempt::bounded(attempt_timeout);
+        let outcome = connect_host(
+            addr,
+            hostname,
+            port,
+            &mut *tls,
+            config,
+            node.clone(),
+            &mut host,
+        )
+        .await;
 
         match outcome {
             Ok((client, connection)) => return Ok((client, connection)),
-            // A verification or authentication failure is never hidden by
-            // trying another seed.
-            Err(e) if e.is_security_failure() => return Err(e),
-            Err(e) => error = Some(e),
+            // A credential, client certificate or client TLS failure is never
+            // hidden by trying another seed. A failure of this seed's own TLS
+            // endpoint moves on to the next seed under the same verification
+            // (which error the caller sees: `record_failure`).
+            Err(e) if e.is_security_failure() && !is_node_scoped_failure(&e) => return Err(e),
+            Err(e) => {
+                if is_node_scoped_failure(&e) {
+                    warn!(
+                        "Connection to {} failed: {}; trying the next configured host",
+                        label,
+                        error_chain(&e)
+                    );
+                    let mut aliases = seed_aliases(config, i);
+                    aliases.extend(host.failed_addrs);
+                    pass.node_failures.push(aliases);
+                }
+                record_failure(&mut pass.failure, e);
+            }
         }
     }
 
-    Err(error.unwrap())
+    Err(pass.take_failure())
 }
 
 pub async fn yb_connect<T>(
@@ -379,45 +621,64 @@ pub(crate) async fn connect_host<T>(
     tls: &mut T,
     config: &Config,
     node: Option<String>,
+    attempt: &mut HostAttempt,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
     T: MakeTlsConnect<Socket>,
 {
+    let label = host_label(&host);
     match host {
         Host::Tcp(host) => {
-            let mut addrs = net::lookup_host((&*host, port))
-                .await
-                .map_err(Error::connect)?
-                .collect::<Vec<_>>();
+            let lookup = async {
+                net::lookup_host((&*host, port))
+                    .await
+                    .map_err(Error::connect)
+            };
+            let mut addrs = attempt.run(&label, lookup).await?.collect::<Vec<_>>();
 
             if config.load_balance_hosts == LoadBalanceHosts::Random {
                 addrs.shuffle(&mut rand::thread_rng());
             }
 
-            let mut last_err = None;
+            let mut failure = None;
             for addr in addrs {
-                match connect_once(
+                if failure.is_some() && attempt.expired() {
+                    break;
+                }
+                let once = connect_once(
                     Addr::Tcp(addr.ip()),
                     hostname.as_deref(),
                     port,
                     tls,
                     config,
                     node.clone(),
-                )
-                .await
-                {
+                );
+                match attempt.run(&label, once).await {
                     Ok(stream) => return Ok(stream),
-                    // Never let another resolved address mask a TLS or
-                    // authentication failure.
-                    Err(e) if e.is_security_failure() => return Err(e),
+                    // Never let another resolved address mask a credential
+                    // or client-side failure. A TLS failure of this address's
+                    // endpoint moves on to the next address under the same
+                    // verification (precedence: `record_failure`).
+                    Err(e) if e.is_security_failure() && !is_node_scoped_failure(&e) => {
+                        return Err(e)
+                    }
                     Err(e) => {
-                        last_err = Some(e);
-                        continue;
+                        if is_node_scoped_failure(&e) {
+                            attempt.failed_addrs.push(addr.ip().to_string());
+                        }
+                        if e.is_security_failure() {
+                            warn!(
+                                "Connection to an address of {} failed: {}; trying the next address",
+                                endpoint::label(&host),
+                                error_chain(&e)
+                            );
+                        }
+                        record_failure(&mut failure, e);
                     }
                 };
             }
 
-            Err(last_err.unwrap_or_else(|| {
+            Err(failure.unwrap_or_else(|| {
                 Error::connect(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "could not resolve any addresses",
@@ -426,7 +687,15 @@ where
         }
         #[cfg(unix)]
         Host::Unix(path) => {
-            connect_once(Addr::Unix(path), hostname.as_deref(), port, tls, config, node).await
+            let once = connect_once(
+                Addr::Unix(path),
+                hostname.as_deref(),
+                port,
+                tls,
+                config,
+                node,
+            );
+            attempt.run(&label, once).await
         }
     }
 }
