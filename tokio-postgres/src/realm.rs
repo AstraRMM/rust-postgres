@@ -824,8 +824,10 @@ impl Realm {
 
     /// Refreshes the snapshot by running `yb_servers()` on `client`, an
     /// established session of this realm, instead of opening a control
-    /// connection. Coalesces with other refreshes and applies the same
-    /// staleness rules; returns the current snapshot when it is not due.
+    /// connection. Returns the current snapshot when it is not due (or a
+    /// refresh is in progress and it is within the maximum staleness), and
+    /// the query's error otherwise; the snapshot is left as it was, so a
+    /// caller can fall back to [`refresh`](Self::refresh).
     pub async fn refresh_with(&self, client: &Client, config: &Config) -> Result<TopologyInfo, Error> {
         let snapshot = self.inner.snapshot.read().clone();
         if !self.refresh_due(config) {
@@ -837,8 +839,12 @@ impl Realm {
             Ok(gate) => gate,
             Err(_) => {
                 return match snapshot {
-                    Some(topology) => Ok(self.info(&topology)),
-                    None => Err(Error::connect(io::Error::new(
+                    Some(topology)
+                        if topology.fetched_at.elapsed() <= config.yb_topology_max_staleness =>
+                    {
+                        Ok(self.info(&topology))
+                    }
+                    _ => Err(Error::connect(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "a topology refresh is already in progress",
                     ))),
@@ -873,8 +879,7 @@ impl Realm {
             }
             Err(e) => {
                 *self.inner.last_failure.lock() = Some(error_chain(&e));
-                self.stale_or(snapshot, config, e)
-                    .map(|topology| self.info(&topology))
+                Err(e)
             }
         }
     }

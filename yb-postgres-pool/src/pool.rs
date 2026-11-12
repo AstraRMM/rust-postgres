@@ -1203,11 +1203,13 @@ impl<T: PoolTls> Pool<T> {
             };
             SWEEPING.sync_scope((), || drop(session));
             match outcome {
-                Some(Ok(Ok(_))) => bump(&shared.stats.topology_refreshes),
-                Some(_) => bump(&shared.stats.topology_refresh_failures),
-                None => {}
+                Some(Ok(Ok(_))) => {
+                    bump(&shared.stats.topology_refreshes);
+                    return;
+                }
+                Some(_) => {}
+                None => return,
             }
-            return;
         }
         let permits = match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
             (Ok(pool), Ok(process)) => Permits {
@@ -1295,6 +1297,7 @@ impl<T: PoolTls> Pool<T> {
                 let held = self.take_idle().await;
                 let mut surplus = self.retireable(&held);
                 let mut need = 0u64;
+                let mut stale = std::collections::HashSet::new();
                 let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
                     held.iter()
                         .filter(|conn| conn.retire.is_none())
@@ -1316,11 +1319,13 @@ impl<T: PoolTls> Pool<T> {
                         conn.retire = Some(reason);
                     } else {
                         need += 1;
+                        stale.extend(conn.client.node_identity().map(str::to_string));
                     }
                 }
-                need
+                (need, stale)
             })
             .await;
+        let (need, stale) = need;
         let may_replace = Instant::now() >= shared.rebalance_retry.lock().0;
         let (mut attempted, mut pending) = (false, false);
         if need > 0 && !may_replace {
@@ -1330,7 +1335,7 @@ impl<T: PoolTls> Pool<T> {
             attempted = true;
             let mut opened = 0;
             while opened < need {
-                let replacement = match self.replacement().await {
+                let replacement = match self.replacement(&stale).await {
                     Some(replacement) => replacement,
                     None => {
                         bump(&shared.stats.rebalance_deferrals);
@@ -1423,13 +1428,17 @@ impl<T: PoolTls> Pool<T> {
         held
     }
 
-    /// A connection to a preferred-tier node opened from free permits, or
-    /// `None` when no permit is free or the driver could only reach a
-    /// fallback, departed or seed node. A failure is not published to
+    /// A connection to a preferred-tier node other than the `stale` ones,
+    /// opened from free permits, or `None` when no permit is free or the
+    /// driver could only reach a stale, fallback, departed or seed node. A failure is not published to
     /// waiting checkouts.
-    async fn replacement(&self) -> Option<NativeConnection> {
+    async fn replacement(
+        &self,
+        stale: &std::collections::HashSet<String>,
+    ) -> Option<NativeConnection> {
         let mut conn = self.inner.shared.open_optional().await.ok()?;
-        if conn.client.node_standing() == NodeStanding::Preferred {
+        let identity = conn.client.node_identity().unwrap_or_default();
+        if conn.client.node_standing() == NodeStanding::Preferred && !stale.contains(identity) {
             Some(conn)
         } else {
             conn.retire = Some(Retire::Explicit);
