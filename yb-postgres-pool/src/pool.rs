@@ -1142,7 +1142,12 @@ impl<T: PoolTls> Pool<T> {
             .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
         let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
         let changed = digest.is_some() && *shared.swept.lock() != digest;
-        let surplus = (shared.live.lock().len() as u32).saturating_sub(shared.config.warm_floor);
+        let surplus = self
+            .inner
+            .pool
+            .state()
+            .connections
+            .saturating_sub(shared.config.warm_floor);
         let retry = shared.rebalance_pending.load(Ordering::SeqCst)
             && (surplus > 0
                 || (Instant::now() >= shared.rebalance_retry.lock().0
@@ -1152,6 +1157,13 @@ impl<T: PoolTls> Pool<T> {
             return;
         }
         bump(&shared.stats.idle_sweeps);
+        let epoch_changed = match (&digest, &*shared.swept.lock()) {
+            (Some((epoch, _)), Some((swept, _))) => epoch != swept,
+            _ => false,
+        };
+        if epoch_changed {
+            *shared.rebalance_retry.lock() = (Instant::now(), REBALANCE_BACKOFF_MIN);
+        }
         let may_replace = Instant::now() >= shared.rebalance_retry.lock().0;
         let (attempted, pending) = SWEEPING
             .scope((), async {
@@ -1177,7 +1189,7 @@ impl<T: PoolTls> Pool<T> {
                         conn.retire = Some(reason);
                         continue;
                     }
-                    if !may_replace {
+                    if !may_replace || pending {
                         pending = true;
                         continue;
                     }
@@ -1197,6 +1209,9 @@ impl<T: PoolTls> Pool<T> {
                             bump(&shared.stats.rebalance_deferrals);
                             pending = true;
                         }
+                    }
+                    if pending {
+                        break;
                     }
                 }
                 (attempted, pending)
@@ -1392,7 +1407,7 @@ impl<T: PoolTls> Pool<T> {
 
 pub(crate) const PROBE_QUERY_FLOOR: Duration = Duration::from_millis(5);
 const REBALANCE_BACKOFF_MIN: Duration = Duration::from_secs(1);
-const REBALANCE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+const REBALANCE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 pub(crate) fn probe_query_budget(budget: Duration, elapsed: Duration) -> Option<Duration> {
     Some(budget.saturating_sub(elapsed)).filter(|left| *left >= PROBE_QUERY_FLOOR)
