@@ -39,8 +39,9 @@
 //! transaction or a request in flight (a cancelled query future) is cleaned
 //! up first: wait briefly, cancel, wait, `ROLLBACK`; failing that it is
 //! closed. Sessions whose `GUC_REPORT` settings changed, that were marked
-//! dirty, or whose TLS generation was superseded are closed rather than
-//! reset: `DISCARD ALL` would also drop the statement cache and cannot undo
+//! dirty, whose TLS generation was superseded, or that received a response
+//! its request's protocol does not allow ([`Client::is_poisoned`]) are
+//! closed rather than reset: `DISCARD ALL` would also drop the statement cache and cannot undo
 //! every session change, while a reconnect is paid only on that rare path.
 //! Tenant state belongs in transaction-local settings
 //! ([`PoolTransaction::set_local`]).
@@ -69,6 +70,7 @@
 //! [`Client::transaction_status`]: yb_tokio_postgres::Client::transaction_status
 //! [`Client::pending_requests`]: yb_tokio_postgres::Client::pending_requests
 //! [`Client::pending_caller_requests`]: yb_tokio_postgres::Client::pending_caller_requests
+//! [`Client::is_poisoned`]: yb_tokio_postgres::Client::is_poisoned
 
 #![warn(missing_docs, rust_2018_idioms)]
 

@@ -27,12 +27,12 @@ async fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
 
     match responses.next().await? {
         Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     match responses.next().await? {
         Message::CopyOutResponse(_) => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     Ok(responses)
@@ -56,7 +56,7 @@ impl Stream for CopyOutStream {
         match ready!(this.responses.poll_next(cx)?) {
             Message::CopyData(body) => Poll::Ready(Some(Ok(body.into_bytes()))),
             Message::CopyDone => Poll::Ready(None),
-            _ => Poll::Ready(Some(Err(Error::unexpected_message()))),
+            _ => Poll::Ready(Some(Err(this.responses.unexpected()))),
         }
     }
 }

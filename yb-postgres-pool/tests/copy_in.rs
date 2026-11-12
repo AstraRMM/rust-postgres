@@ -99,5 +99,20 @@ async fn failed_copy_in_leaves_the_next_lease_in_step() {
             stats.terminal_failures
         );
         assert!(wrong.is_empty(), "[{}] {wrong:#?}", e.name);
+        assert_eq!(stats.retired_closed, 0, "[{}] {stats:?}", e.name);
+
+        // A response the request's protocol does not allow (a SELECT's rows
+        // where CopyInResponse belongs) poisons the session: the pool
+        // retires the connection instead of lending it again.
+        let lease = pool.get().await.unwrap();
+        let pid = backend_pid(&lease).await;
+        assert!(lease.copy_in::<_, &'static [u8]>("SELECT 1").await.is_err());
+        assert!(lease.is_poisoned(), "[{}]", e.name);
+        drop(lease);
+        let lease = pool.get().await.unwrap();
+        assert_ne!(backend_pid(&lease).await, pid, "[{}] reused", e.name);
+        assert!(!lease.is_poisoned());
+        assert_eq!(answers(&lease).await, ["first", "second", "third"]);
+        assert_eq!(pool.state().stats.retired_closed, 1, "[{}]", e.name);
     }
 }

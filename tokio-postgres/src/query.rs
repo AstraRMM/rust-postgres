@@ -124,7 +124,7 @@ where
             }
             Message::EmptyQueryResponse => rows = 0,
             Message::ReadyForQuery(_) => return Ok(rows),
-            _ => return Err(Error::unexpected_message()),
+            _ => return Err(responses.unexpected()),
         }
     }
 }
@@ -139,7 +139,7 @@ async fn start(
 
     match responses.next().await? {
         Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     Ok(responses)
@@ -234,7 +234,7 @@ impl Stream for RowStream {
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),
-                _ => return Poll::Ready(Some(Err(Error::unexpected_message()))),
+                _ => return Poll::Ready(Some(Err(this.responses.unexpected()))),
             }
         }
     }

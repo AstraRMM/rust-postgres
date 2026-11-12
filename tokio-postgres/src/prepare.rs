@@ -93,18 +93,18 @@ async fn prepare_in(
 
     match responses.next().await? {
         Message::ParseComplete => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     let parameter_description = match responses.next().await? {
         Message::ParameterDescription(body) => body,
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     };
 
     let row_description = match responses.next().await? {
         Message::RowDescription(body) => Some(body),
         Message::NoData => None,
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     };
 
     let mut parameters = vec![];

@@ -280,6 +280,12 @@ async fn run(engine: Engine, proxy: &Proxy, scenario: Scenario, idle: bool) -> V
     if let Err(e) = outcome {
         failures.push(format!("copy: {e}"));
     }
+    // Only a response the request's protocol does not allow (the SELECT's
+    // rows where CopyInResponse belongs) poisons the session.
+    let poisoned = matches!(scenario, Scenario::NotCopy);
+    if client.is_poisoned() != poisoned {
+        failures.push(format!("is_poisoned() = {}", client.is_poisoned()));
+    }
     if idle {
         let wire = settle(proxy).await.since(&before);
         if !counts.is_complete() {

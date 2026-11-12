@@ -17,12 +17,14 @@
 //!   query performs implicitly is not a separate operation.
 //! * A **protocol cycle** is one driver request handed to the connection task,
 //!   ended by its terminating `ReadyForQuery`. Each request carries exactly one
-//!   `Sync` or simple `Query`, except `COPY FROM STDIN`, whose extra `Sync` is
-//!   ignored by the server. A cycle is *queued* when handed to the connection
-//!   task, *written* when its first frame is encoded into the transport
-//!   buffer, *completed* when a valid `ReadyForQuery` (`I`, `T` or `E`) is
-//!   routed to it, and *abandoned* when the connection ends (or the request
-//!   could not be handed over) before that. A cycle is not a network round
+//!   `Sync` or simple `Query`; `COPY FROM STDIN` sends `Flush` after `Execute`
+//!   and its one `Sync` after `CopyDone`/`CopyFail`, so it is one cycle
+//!   whether or not the statement entered copy-in mode. A cycle is *queued*
+//!   when handed to the connection task, *written* when its first frame is
+//!   encoded into the transport buffer, *completed* when a valid
+//!   `ReadyForQuery` (`I`, `T` or `E`) is routed to it, and *abandoned* when
+//!   the connection ends (or the request could not be handed over) before
+//!   that. A cycle is not a network round
 //!   trip and not a statement count: a simple query with three statements is
 //!   one cycle, and pipelined cycles share round trips.
 //! * **Frontend messages** (`Query`, `Parse`, `Bind`, `Describe`, `Execute`,
