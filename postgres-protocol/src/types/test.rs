@@ -80,12 +80,10 @@ fn hstore_invalid_length() {
         0, 0, 3, 232, // key length: 1000
         b'a', b'b', // only two bytes actually present
     ];
-    assert!(
-        hstore_from_sql(buf)
-            .unwrap()
-            .collect::<HashMap<_, _>>()
-            .is_err()
-    );
+    assert!(hstore_from_sql(buf)
+        .unwrap()
+        .collect::<HashMap<_, _>>()
+        .is_err());
 }
 
 #[test]
