@@ -158,7 +158,7 @@ pub enum CrlExpiration {
     /// [`TlsConfigErrorKind::CrlExpired`] (a failed reload keeps the current
     /// generation in service), and a handshake that consults a CRL that has
     /// expired since it was loaded fails with
-    /// [`TlsFailureKind::CrlExpired`](crate::tls::TlsFailureKind::CrlExpired).
+    /// [`TlsFailureKind::CrlExpired`].
     /// With this policy every new connection fails once a CRL expires until
     /// fresh CRLs are reloaded, so the CRL refresh must be monitored.
     Enforce,
