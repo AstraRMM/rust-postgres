@@ -452,6 +452,30 @@ async fn transaction_future_cancellation() {
 }
 
 #[tokio::test]
+async fn transaction_builder_future_cancellation() {
+    let mut client = connect("user=postgres").await;
+
+    for i in 0.. {
+        let done = {
+            let txn = client.build_transaction().read_only(true).start();
+            let fut = Cancellable {
+                fut: txn,
+                polls_left: i,
+            };
+            fut.await
+                .map(|res| res.expect("transaction failed"))
+                .is_some()
+        };
+
+        assert!(!in_transaction(&client).await);
+
+        if done {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
 async fn transaction_commit_future_cancellation() {
     let mut client = connect("user=postgres").await;
 

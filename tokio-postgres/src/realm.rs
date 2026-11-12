@@ -442,7 +442,7 @@ impl Realm {
                 "the realm has been shut down",
             )));
         }
-        let deadline = Instant::now() + config.yb_acquire_timeout;
+        let deadline = deadline_after(config.yb_acquire_timeout);
         let topology = self.current_topology(&mut tls, config, deadline).await?;
         Ok(self.info(&topology))
     }
@@ -539,7 +539,7 @@ impl Realm {
                 "the realm has been shut down",
             )));
         }
-        let deadline = Instant::now() + config.yb_acquire_timeout;
+        let deadline = deadline_after(config.yb_acquire_timeout);
         let budget_error = || {
             Error::connect(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1130,6 +1130,18 @@ fn fresh_for(topology: &Topology, config: &Config) -> bool {
     config.yb_servers_refresh_interval != Duration::ZERO
         && topology.fetched_at.elapsed() <= config.yb_servers_refresh_interval
 }
+
+/// `now + budget`, or a far-future instant when that overflows (a budget of
+/// `Duration::MAX` set through the builder means "unbounded").
+fn deadline_after(budget: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(budget)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
+}
+
+/// About 30 years, as Tokio uses for an unbounded timer.
+const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
 fn invalid_topology(reason: &str) -> Error {
     Error::connect(io::Error::new(

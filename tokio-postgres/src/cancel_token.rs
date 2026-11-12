@@ -20,13 +20,20 @@ impl CancelToken {
     /// Attempts to cancel the in-progress query on the connection associated
     /// with this `CancelToken`.
     ///
-    /// The server provides no information about whether a cancellation attempt was successful or not. An error will
-    /// only be returned if the client was unable to connect to the database.
+    /// The server provides no information about whether a cancellation attempt was successful or not.
     ///
     /// Cancellation is inherently racy. There is no guarantee that the
     /// cancellation request will reach the server before the query terminates
     /// normally, or that the connection associated with this token is still
     /// active.
+    ///
+    /// Returns once the server has closed the cancel connection, which it
+    /// does after processing the request, so a successful return means the
+    /// request has already been acted on. A peer that keeps the connection
+    /// open, resets it or answers makes this fail (after 10 seconds for an
+    /// open connection), although the request was sent. The wait uses the
+    /// Tokio timer. The inherited OpenSSL and native-tls adapters may report
+    /// a server close without TLS `close_notify` as an error.
     ///
     /// Requires the `runtime` Cargo feature (enabled by default).
     #[cfg(feature = "runtime")]
@@ -45,7 +52,7 @@ impl CancelToken {
     }
 
     /// Like `cancel_query`, but uses a stream which is already connected to the server rather than opening a new
-    /// connection itself.
+    /// connection itself. Returns once the request is sent, without waiting for the server to close the stream.
     pub async fn cancel_query_raw<S, T>(&self, stream: S, tls: T) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -58,6 +65,7 @@ impl CancelToken {
             true,
             self.process_id,
             self.secret_key,
+            false,
         )
         .await
     }

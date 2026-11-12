@@ -817,6 +817,41 @@ async fn stalled_endpoints_are_bounded_by_attempt_and_acquisition_budgets() {
     assert!(started.elapsed() < Duration::from_millis(2600), "{:?}", started.elapsed());
 }
 
+/// ASTS-97: an unbounded budget set through the builder is honoured instead
+/// of overflowing the deadline, and connection strings are bounded.
+#[tokio::test]
+async fn unbounded_budgets_do_not_overflow_and_parsed_budgets_are_bounded() {
+    let cluster = Cluster::new("unbounded");
+    let n1 = Node::start(&cluster).await;
+    cluster.publish(&[(&n1, "primary", "z1")]);
+    let mut conf = config(&n1, "load_balance=only-primary");
+    conf.yb_acquire_timeout(Duration::MAX);
+    conf.yb_attempt_timeout(Duration::MAX);
+    let realm = Realm::new("unbounded");
+    let s = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&s).await, n1.ip);
+    // The idle-pool refresh shares the acquisition budget.
+    realm.refresh(NoTls, &conf).await.unwrap();
+    let mut direct = config(&n1, "load_balance=false");
+    direct.yb_acquire_timeout(Duration::MAX);
+    let (client, connection) = direct.connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    drop(client);
+
+    for key in ["yb_acquire_timeout", "yb_attempt_timeout", "yb_topology_max_staleness"] {
+        let base = "host=localhost user=test sslmode=disable";
+        format!("{} {}=86400", base, key).parse::<Config>().unwrap();
+        for bad in ["0", "86401", "18446744073709551615"] {
+            assert!(
+                format!("{} {}={}", base, key, bad).parse::<Config>().is_err(),
+                "{}={} must be rejected",
+                key,
+                bad
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn cancellation_at_every_stage_releases_state() {
     let cluster = Cluster::new("x");

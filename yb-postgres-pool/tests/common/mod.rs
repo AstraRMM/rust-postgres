@@ -221,6 +221,10 @@ pub struct Wire {
     /// stops answering, including cancel requests).
     pub freeze: AtomicBool,
     pub hold_replies: AtomicBool,
+    /// While set, cancel requests are counted but neither forwarded nor
+    /// answered: the cancel connection stays open (a server that never
+    /// confirms the cancel).
+    pub stall_cancels: AtomicBool,
     injectors: parking_lot::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
@@ -339,6 +343,10 @@ async fn relay(client: TcpStream, target: SocketAddr, wire: Arc<Wire>) -> std::i
     if code == 80877102 {
         wire.cancels.fetch_add(1, Ordering::SeqCst);
         if wire.freeze.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if wire.stall_cancels.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(30)).await;
             return Ok(());
         }
     } else {
