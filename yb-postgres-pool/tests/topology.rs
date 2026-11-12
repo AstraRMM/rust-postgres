@@ -886,3 +886,41 @@ async fn supersession_needs_no_free_pool_slot_and_shutdown_awaits_the_drain() {
     assert_eq!(new.state().physical, 0);
     assert!(counts(&realm).is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_generation_keys_cannot_undo_a_rotation() {
+    let cluster = Cluster::new("sk");
+    let a = Node::start(&cluster).await;
+    cluster.publish(&[(&a, "z1")]);
+    let realm = Realm::new("stale-keys");
+    let pg = driver_config(&a, &realm, "load_balance=true");
+    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
+        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(1, 2)))
+    };
+    let mut set_config = PoolSetConfig::default();
+    set_config.max_pools = 1;
+    set_config.drain_timeout = Duration::from_secs(30);
+    let set = PoolSet::new(set_config, resolver).unwrap();
+    let gen0 = PoolKey::for_realm(&realm, "test", "test");
+    let gen1 = gen0.clone().with_credential_generation(1);
+
+    let old = set.pool(&gen0).unwrap();
+    let in_flight = old.get().await.unwrap();
+    let new = set.pool(&gen1).unwrap();
+    let stale = set.pool(&gen0).unwrap_err();
+    assert_eq!(
+        stale.kind(),
+        yb_postgres_pool::ErrorKind::PoolClosed,
+        "{stale}"
+    );
+    assert!(set.pool(&gen1).is_ok());
+    assert!(!new.is_closed());
+    assert!(old.state().physical >= 1);
+    assert!(
+        set.retire(&gen0, Duration::from_millis(200)).await,
+        "the draining generation is reachable"
+    );
+    drop(in_flight);
+    assert!(eventually(Duration::from_secs(3), || old.state().physical == 0).await);
+    set.shutdown(Duration::from_secs(1)).await;
+}

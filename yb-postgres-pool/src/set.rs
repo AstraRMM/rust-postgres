@@ -57,7 +57,7 @@ struct SetInner<T: PoolTls> {
     resolver: Box<dyn PoolResolver<T>>,
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
     /// Superseded generations still draining, awaited by `shutdown`.
-    retiring: Mutex<Vec<Pool<T>>>,
+    retiring: Mutex<HashMap<PoolKey, Pool<T>>>,
     closed: AtomicBool,
 }
 
@@ -100,7 +100,7 @@ impl<T: PoolTls> PoolSet<T> {
             config,
             resolver: Box::new(resolver),
             pools: Mutex::new(HashMap::new()),
-            retiring: Mutex::new(Vec::new()),
+            retiring: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let weak: Weak<SetInner<T>> = Arc::downgrade(&inner);
@@ -155,6 +155,19 @@ impl<T: PoolTls> PoolSet<T> {
             }
             pools.remove(key);
         }
+        if pools.keys().any(|k| k.supersedes(key))
+            || self
+                .inner
+                .retiring
+                .lock()
+                .keys()
+                .any(|k| k.supersedes(key) || k == key)
+        {
+            return Err(PoolError::new(
+                ErrorKind::PoolClosed,
+                format!("{} was superseded by a newer generation", key),
+            ));
+        }
         let superseded_keys: Vec<PoolKey> = pools
             .keys()
             .filter(|k| key.supersedes(k))
@@ -199,9 +212,9 @@ impl<T: PoolTls> PoolSet<T> {
                 });
             }
         }
-        let superseded: Vec<Pool<T>> = superseded_keys
+        let superseded: Vec<(PoolKey, Pool<T>)> = superseded_keys
             .iter()
-            .filter_map(|k| pools.remove(k))
+            .filter_map(|k| pools.remove(k).map(|p| (k.clone(), p)))
             .collect();
         if !superseded.is_empty() {
             log::info!(
@@ -215,15 +228,30 @@ impl<T: PoolTls> PoolSet<T> {
                 .extend(superseded.iter().cloned());
             let warming = pool.clone();
             let drain = self.inner.config.drain_timeout;
+            let interval = warming
+                .config()
+                .maintenance_interval
+                .min(Duration::from_millis(100));
             let inner = Arc::downgrade(&self.inner);
             tokio::spawn(async move {
-                warming.top_up().await;
-                futures_util::future::join_all(superseded.iter().map(|p| p.shutdown(drain))).await;
+                let draining = futures_util::future::join_all(
+                    superseded.iter().map(|(_, p)| p.shutdown(drain)),
+                );
+                tokio::pin!(draining);
+                loop {
+                    warming.top_up().await;
+                    tokio::select! {
+                        _ = &mut draining => break,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
                 if let Some(inner) = inner.upgrade() {
-                    inner
-                        .retiring
-                        .lock()
-                        .retain(|p| !superseded.iter().any(|s| s.same_pool(p)));
+                    let mut retiring = inner.retiring.lock();
+                    for (key, old) in &superseded {
+                        if retiring.get(key).is_some_and(|p| p.same_pool(old)) {
+                            retiring.remove(key);
+                        }
+                    }
                 }
                 warming.top_up().await;
             });
@@ -278,6 +306,7 @@ impl<T: PoolTls> PoolSet<T> {
     /// superseded) and shuts it down within `drain`.
     pub async fn retire(&self, key: &PoolKey, drain: Duration) -> bool {
         let pool = self.inner.pools.lock().remove(key);
+        let pool = pool.or_else(|| self.inner.retiring.lock().get(key).cloned());
         match pool {
             Some(pool) => {
                 pool.shutdown(drain).await;
@@ -291,7 +320,7 @@ impl<T: PoolTls> PoolSet<T> {
     pub async fn shutdown(&self, drain: Duration) {
         self.inner.closed.store(true, Ordering::SeqCst);
         let mut pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
-        pools.extend(self.inner.retiring.lock().drain(..));
+        pools.extend(self.inner.retiring.lock().drain().map(|(_, p)| p));
         futures_util::future::join_all(pools.iter().map(|p| p.shutdown(drain))).await;
     }
 }

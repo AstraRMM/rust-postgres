@@ -551,6 +551,10 @@ impl<T: PoolTls> Shared<T> {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if credit {
+            if !sweeping() {
+                self.rebalance_pending.store(true, Ordering::SeqCst);
+                self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
+            }
             return Err(reason);
         }
         if !sweeping() {
@@ -1152,8 +1156,16 @@ impl<T: PoolTls> Pool<T> {
             Some(realm) => realm,
             None => return,
         };
-        let refresh = realm.refresh(shared.tls.clone(), &shared.pg);
-        match tokio::time::timeout(shared.config.connect_timeout, refresh).await {
+        let refresh = tokio::time::timeout(
+            shared.config.connect_timeout,
+            realm.refresh(shared.tls.clone(), &shared.pg),
+        );
+        let outcome = tokio::select! {
+            biased;
+            _ = shared.until_closed() => return,
+            outcome = refresh => outcome,
+        };
+        match outcome {
             Ok(Ok(_)) => bump(&shared.stats.topology_refreshes),
             Ok(Err(e)) => {
                 bump(&shared.stats.topology_refresh_failures);
@@ -1292,11 +1304,16 @@ impl<T: PoolTls> Pool<T> {
     }
 
     /// Checks out every idle connection without waiting. bb8 discards the
-    /// ones that fail the checkout checks on the way.
+    /// ones that fail the checkout checks on the way. bb8 has no idle-only
+    /// checkout, so a checkout racing this one can still make bb8 approve a
+    /// dial; it stays within `max_size` and the limiter.
     async fn take_idle(&self) -> Vec<bb8::PooledConnection<'_, Manager<T>>> {
         let idle = self.inner.pool.state().idle_connections;
         let mut held = Vec::new();
         for _ in 0..idle {
+            if self.inner.pool.state().idle_connections == 0 {
+                break;
+            }
             match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
                 Ok(Ok(conn)) => held.push(conn),
                 _ => break,
