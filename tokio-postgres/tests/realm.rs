@@ -49,6 +49,8 @@ enum Behaviour {
     AskPassword,
     /// Accepts the login but answers `yb_servers()` with 57P01.
     DiscoveryShutdown,
+    /// Accepts the login but answers `yb_servers()` with 28000.
+    DiscoveryDenied,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -419,6 +421,11 @@ async fn session(
                 let discovery = *cluster.discovery.lock().unwrap();
                 if mode == Behaviour::DiscoveryShutdown {
                     error(&mut socket, "57P01", "terminating connection due to administrator command").await?;
+                    discard_until_sync = true;
+                    continue;
+                }
+                if mode == Behaviour::DiscoveryDenied {
+                    error(&mut socket, "28000", "role is not permitted").await?;
                     discard_until_sync = true;
                     continue;
                 }
@@ -894,8 +901,9 @@ async fn failed_refreshes_coalesce_and_serve_the_stale_snapshot() {
     for attempt in attempts {
         attempt.await.unwrap().unwrap();
     }
-    // One refresh attempt (the seed, then the one known node), shared by all.
-    assert_eq!(cluster.discoveries.load(Ordering::SeqCst) - before, 2);
+    // One refresh attempt, shared by all: the seed is also the one known
+    // node, and is queried once (ASTS-86: the seed passes cover the seeds).
+    assert_eq!(cluster.discoveries.load(Ordering::SeqCst) - before, 1);
 }
 
 #[tokio::test]
@@ -1266,6 +1274,12 @@ async fn a_seed_tls_error_outranks_a_later_seeds_query_failure() {
     let e = connect_tls(&conf, Some(&Realm::new("query-rank"))).await.err().expect("discovery fails");
     assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
     assert_eq!(query.logins(), 1, "the later seed was reached");
+
+    // A credential failure of the later seed's query is not hidden by the
+    // earlier seed's TLS error.
+    query.set(Behaviour::DiscoveryDenied);
+    let e = connect_tls(&conf, Some(&Realm::new("query-denied"))).await.err().expect("discovery fails");
+    assert_eq!(e.code().map(|c| c.code()), Some("28000"), "{}", e);
 }
 
 /// ASTS-86: a configuration with a short reconnect delay does not clear a

@@ -1252,6 +1252,11 @@ impl Realm {
                 }
                 match self.query_topology(client, connection, config).await {
                     Ok(topology) => return Ok(Ok(topology)),
+                    // A credential failure ends discovery, whatever an
+                    // earlier seed reported.
+                    Err(e) if e.is_security_failure() && !is_node_scoped_failure(&e) => {
+                        return Err(e)
+                    }
                     Err(e) => {
                         if is_node_scoped_failure(&e) {
                             warn!(
