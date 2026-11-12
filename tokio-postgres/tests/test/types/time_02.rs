@@ -1,5 +1,11 @@
+use std::fmt;
+
+use postgres_types::FromSqlOwned;
 use time_02::{OffsetDateTime, PrimitiveDateTime};
-use yb_tokio_postgres::types::{Date, Timestamp};
+use yb_tokio_postgres::{
+    types::{Date, Timestamp},
+    Client,
+};
 
 use crate::types::test_type;
 
@@ -147,4 +153,34 @@ async fn test_time_params() {
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_special_params_without_wrapper() {
+    async fn assert_overflows<T>(client: &mut Client, val: &str, sql_type: &str)
+    where
+        T: FromSqlOwned + fmt::Debug,
+    {
+        let err = client
+            .query_one(&*format!("SELECT {}::{}", val, sql_type), &[])
+            .await
+            .unwrap()
+            .try_get::<_, T>(0)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "error deserializing column 0: value too large to decode"
+        );
+    }
+
+    let mut client = crate::connect("user=postgres").await;
+
+    assert_overflows::<OffsetDateTime>(&mut client, "'-infinity'", "timestamptz").await;
+    assert_overflows::<OffsetDateTime>(&mut client, "'infinity'", "timestamptz").await;
+
+    assert_overflows::<PrimitiveDateTime>(&mut client, "'-infinity'", "timestamp").await;
+    assert_overflows::<PrimitiveDateTime>(&mut client, "'infinity'", "timestamp").await;
+
+    assert_overflows::<time_02::Date>(&mut client, "'-infinity'", "date").await;
+    assert_overflows::<time_02::Date>(&mut client, "'infinity'", "date").await;
 }
