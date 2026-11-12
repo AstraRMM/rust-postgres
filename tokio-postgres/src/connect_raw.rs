@@ -1,4 +1,6 @@
-use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
+use crate::codec::{
+    BackendMessage, BackendMessages, FrontendMessage, PostgresCodec, STARTUP_MAX_MESSAGE_SIZE,
+};
 use crate::config::{self, AuthMethod, Config};
 use crate::connect_tls::connect_tls;
 use crate::maybe_tls_stream::MaybeTlsStream;
@@ -109,7 +111,7 @@ where
     let stream = connect_tls(stream, config.ssl_mode, tls, has_hostname).await?;
 
     let mut stream = StartupStream {
-        inner: Framed::new(stream, PostgresCodec),
+        inner: Framed::new(stream, PostgresCodec::new(STARTUP_MAX_MESSAGE_SIZE)),
         buf: BackendMessages::empty(),
         delayed: VecDeque::new(),
     };
@@ -122,6 +124,10 @@ where
     startup(&mut stream, config, &user).await?;
     authenticate(&mut stream, config, &user).await?;
     let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
+    stream
+        .inner
+        .codec_mut()
+        .set_max_message_size(config.max_message_size);
 
     let (sender, receiver) = mpsc::unbounded();
     let session = Arc::new(SessionShared::new());
@@ -374,6 +380,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    // Bounds on what the server may make the client retain before the
+    // session is established.
+    const MAX_PARAMETERS: usize = 256;
+    const MAX_NOTICES: usize = 64;
+
     let mut process_id = 0;
     let mut secret_key = 0;
     let mut parameters = HashMap::new();
@@ -385,12 +396,26 @@ where
                 secret_key = body.secret_key();
             }
             Some(Message::ParameterStatus(body)) => {
+                if parameters.len() >= MAX_PARAMETERS
+                    && !parameters.contains_key(body.name().map_err(Error::parse)?)
+                {
+                    return Err(Error::parse(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many parameter status messages during startup",
+                    )));
+                }
                 parameters.insert(
                     body.name().map_err(Error::parse)?.to_string(),
                     body.value().map_err(Error::parse)?.to_string(),
                 );
             }
             Some(msg @ Message::NoticeResponse(_)) => {
+                if stream.delayed.len() >= MAX_NOTICES {
+                    return Err(Error::parse(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many notices during startup",
+                    )));
+                }
                 stream.delayed.push_back(BackendMessage::Async(msg))
             }
             Some(Message::ReadyForQuery(_)) => return Ok((process_id, secret_key, parameters)),

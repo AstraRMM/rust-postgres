@@ -373,6 +373,7 @@ pub struct Config {
     pub(crate) yb_attempt_timeout: Duration,
     pub(crate) yb_max_attempts: usize,
     pub(crate) yb_topology_max_staleness: Duration,
+    pub(crate) max_message_size: usize,
     #[cfg(feature = "runtime")]
     pub(crate) realm: Option<Realm>,
 }
@@ -423,6 +424,7 @@ impl Config {
             yb_attempt_timeout: Duration::from_secs(10),
             yb_max_attempts: 3,
             yb_topology_max_staleness: Duration::from_secs(900),
+            max_message_size: crate::codec::DEFAULT_MAX_MESSAGE_SIZE,
             #[cfg(feature = "runtime")]
             realm: None,
         }
@@ -765,6 +767,25 @@ impl Config {
     /// Gets the authentication methods the server may request, if restricted.
     pub fn get_require_auth(&self) -> Option<&[AuthMethod]> {
         self.require_auth.as_deref()
+    }
+
+    /// Sets the largest backend message, in bytes of message body, that an
+    /// established session accepts. A larger message fails the connection
+    /// before it is buffered.
+    ///
+    /// Defaults to 1 GiB, the most a PostgreSQL server can send in one
+    /// message, so the default never rejects a legitimate row. Lower it to
+    /// bound how much memory one connection may be made to buffer. Messages
+    /// received during startup and authentication are always limited to
+    /// 128 KiB.
+    pub fn max_message_size(&mut self, max_message_size: usize) -> &mut Config {
+        self.max_message_size = max_message_size;
+        self
+    }
+
+    /// Gets the largest backend message size an established session accepts.
+    pub fn get_max_message_size(&self) -> usize {
+        self.max_message_size
     }
 
     /// Sets the host load balancing behavior.
