@@ -1599,8 +1599,21 @@ async fn warm_floor_recovery_and_generation_replacement() {
         };
         let replaced = Instant::now();
         let new = set.pool(&gen1).unwrap();
+        assert!(eventually(Duration::from_secs(10), || new.state().physical == 1).await);
+        new.get()
+            .await
+            .unwrap()
+            .simple_query("SELECT 1")
+            .await
+            .unwrap();
+        let retiring = {
+            let set = set.clone();
+            let gen0 = gen0.clone();
+            tokio::spawn(async move { set.retire(&gen0, Duration::from_secs(3)).await })
+        };
         let in_flight_result = in_flight.simple_query("SELECT pg_sleep(0.2)").await;
         drop(in_flight);
+        assert!(retiring.await.unwrap());
         let settled = eventually(Duration::from_secs(10), || {
             new.state().physical == 3 && old.is_closed() && old.state().physical == 0
         })
@@ -1613,8 +1626,9 @@ async fn warm_floor_recovery_and_generation_replacement() {
             eventually_backends(&admin, &app1, 3, Duration::from_secs(5)).await,
         );
         println!(
-            "EVIDENCE [{}] generation replacement: limit 4, floor 3; new generation warm and old \
-             drained in {:?}; backends old={} new={}; peak permits in use={}",
+            "EVIDENCE [{}] generation replacement: limit 4, floor 3; new generation warmed from the \
+             free permit and served, caller retired the old one with work in flight; new floor \
+             reached and old drained in {:?}; backends old={} new={}; peak permits in use={}",
             e.name,
             settled_in,
             b0,

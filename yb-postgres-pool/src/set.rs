@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use yb_tokio_postgres::Config;
 
 /// Everything needed to open a pool for one key.
@@ -56,14 +56,6 @@ struct SetInner<T: PoolTls> {
     limiter: ConnectionLimiter,
     resolver: Box<dyn PoolResolver<T>>,
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
-    /// Superseded generations still draining, awaited by `shutdown`.
-    retiring: Mutex<HashMap<PoolKey, Pool<T>>>,
-    /// The running generation hand-off per identity; a newer rotation
-    /// cancels it and takes over its pools.
-    handoffs: Mutex<HashMap<PoolKey, Arc<AtomicBool>>>,
-    /// The highest credential and configuration generation created per
-    /// identity; a key below either is refused.
-    newest: Mutex<HashMap<PoolKey, (u64, u64)>>,
     closed: AtomicBool,
 }
 
@@ -106,9 +98,6 @@ impl<T: PoolTls> PoolSet<T> {
             config,
             resolver: Box::new(resolver),
             pools: Mutex::new(HashMap::new()),
-            retiring: Mutex::new(HashMap::new()),
-            newest: Mutex::new(HashMap::new()),
-            handoffs: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let weak: Weak<SetInner<T>> = Arc::downgrade(&inner);
@@ -163,29 +152,9 @@ impl<T: PoolTls> PoolSet<T> {
             }
             pools.remove(key);
         }
-        if self
-            .inner
-            .newest
-            .lock()
-            .get(&key.identity())
-            .is_some_and(|&(credential, config)| {
-                key.credential_generation() < credential || key.config_generation() < config
-            })
-        {
-            return Err(PoolError::new(
-                ErrorKind::PoolClosed,
-                format!("{} was superseded by a newer generation", key),
-            ));
-        }
-        let superseded_keys: Vec<PoolKey> = pools
-            .keys()
-            .filter(|k| key.supersedes(k))
-            .cloned()
-            .collect();
-        let victim = if pools.len() - superseded_keys.len() >= self.inner.config.max_pools {
+        let victim = if pools.len() >= self.inner.config.max_pools {
             let victim = pools
                 .iter()
-                .filter(|(k, _)| !superseded_keys.contains(k))
                 .filter(|(_, p)| !p.busy())
                 .max_by_key(|(_, p)| p.idle_for())
                 .map(|(k, _)| k.clone());
@@ -219,53 +188,6 @@ impl<T: PoolTls> PoolSet<T> {
                 tokio::spawn(async move {
                     evicted.shutdown(drain).await;
                 });
-            }
-        }
-        let mut superseded: Vec<(PoolKey, Pool<T>)> = superseded_keys
-            .iter()
-            .filter_map(|k| pools.remove(k).map(|p| (k.clone(), p)))
-            .collect();
-        {
-            let retiring = self.inner.retiring.lock();
-            superseded.extend(
-                retiring
-                    .iter()
-                    .filter(|(k, _)| key.supersedes(k))
-                    .map(|(k, p)| (k.clone(), p.clone())),
-            );
-        }
-        if !superseded.is_empty() {
-            log::info!(
-                "pool set: {} supersedes {} older generation pool(s)",
-                key,
-                superseded.len()
-            );
-            self.inner
-                .retiring
-                .lock()
-                .extend(superseded.iter().cloned());
-            let cancel = Arc::new(AtomicBool::new(false));
-            if let Some(previous) = self
-                .inner
-                .handoffs
-                .lock()
-                .insert(key.identity(), cancel.clone())
-            {
-                previous.store(true, Ordering::SeqCst);
-            }
-            tokio::spawn(hand_off(
-                Arc::downgrade(&self.inner),
-                pool.clone(),
-                superseded,
-                cancel,
-            ));
-        }
-        {
-            let mut newest = self.inner.newest.lock();
-            if (key.credential_generation(), key.config_generation()) != (0, 0) {
-                let entry = newest.entry(key.identity()).or_insert((0, 0));
-                entry.0 = entry.0.max(key.credential_generation());
-                entry.1 = entry.1.max(key.config_generation());
             }
         }
         pools.insert(key.clone(), pool.clone());
@@ -318,7 +240,6 @@ impl<T: PoolTls> PoolSet<T> {
     /// superseded) and shuts it down within `drain`.
     pub async fn retire(&self, key: &PoolKey, drain: Duration) -> bool {
         let pool = self.inner.pools.lock().remove(key);
-        let pool = pool.or_else(|| self.inner.retiring.lock().get(key).cloned());
         match pool {
             Some(pool) => {
                 pool.shutdown(drain).await;
@@ -331,124 +252,7 @@ impl<T: PoolTls> PoolSet<T> {
     /// Shuts every pool down within `drain` and refuses new pools.
     pub async fn shutdown(&self, drain: Duration) {
         self.inner.closed.store(true, Ordering::SeqCst);
-        let mut pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
-        pools.extend(self.inner.retiring.lock().drain().map(|(_, p)| p));
+        let pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
         futures_util::future::join_all(pools.iter().map(|p| p.shutdown(drain))).await;
-    }
-}
-
-/// Moves warm capacity from superseded generations to `warming`. The old
-/// generations keep serving and keep their own floor; one old idle session
-/// is closed at a time only when the new generation is short of permits,
-/// and the old generations refill if a new connection then fails (retried
-/// with backoff for as long as the set lives). The old generations drain
-/// (within `drain_timeout`) only once the new generation has connected and
-/// either reached its floor or `drain_timeout` has passed; borrowed old
-/// sessions are never cut off for an unverified rotation.
-async fn hand_off<T: PoolTls>(
-    set: Weak<SetInner<T>>,
-    warming: Pool<T>,
-    old: Vec<(PoolKey, Pool<T>)>,
-    cancel: Arc<AtomicBool>,
-) {
-    let (drain, closed_set) = match set.upgrade() {
-        Some(inner) => (
-            inner.config.drain_timeout,
-            inner.closed.load(Ordering::SeqCst),
-        ),
-        None => return,
-    };
-    if closed_set {
-        return;
-    }
-    let interval = warming
-        .config()
-        .maintenance_interval
-        .min(Duration::from_millis(100));
-    let floor = warming.config().warm_floor;
-    let min_idle = warming.config().min_idle.unwrap_or(0);
-    let deadline = Instant::now() + drain;
-    let set_superseded = |value: bool| {
-        for (_, pool) in &old {
-            pool.set_superseded(value);
-        }
-    };
-    let stopped = || {
-        cancel.load(Ordering::SeqCst)
-            || warming.is_closed()
-            || set
-                .upgrade()
-                .is_none_or(|inner| inner.closed.load(Ordering::SeqCst))
-    };
-    set_superseded(false);
-    let connects = warming.state().stats.connects;
-    let mut awaiting: Option<(u32, u32)> = None;
-    let mut failing = interval;
-    loop {
-        if stopped() {
-            if !cancel.load(Ordering::SeqCst) {
-                set_superseded(false);
-            }
-            return;
-        }
-        if floor == 0 && min_idle == 0 {
-            break;
-        }
-        let failures = warming.state().stats.connect_failures;
-        warming.top_up().await;
-        let state = warming.state();
-        let validated = state.stats.connects > connects;
-        let ready = state.physical >= floor && state.idle >= min_idle;
-        if validated && (ready || Instant::now() >= deadline) {
-            break;
-        }
-        if state.stats.connect_failures > failures {
-            set_superseded(false);
-            awaiting = None;
-            tokio::time::sleep(failing).await;
-            failing = (failing * 2).min(Duration::from_secs(5));
-            continue;
-        }
-        failing = interval;
-        if let Some((before, waited)) = awaiting {
-            if state.physical <= before && waited < 20 {
-                awaiting = Some((before, waited + 1));
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-        }
-        set_superseded(true);
-        let mut closed = false;
-        for (_, pool) in &old {
-            if pool.close_one_idle().await {
-                closed = true;
-                break;
-            }
-        }
-        awaiting = closed.then_some((state.physical, 0));
-        tokio::time::sleep(interval).await;
-    }
-    set_superseded(true);
-    let draining = futures_util::future::join_all(old.iter().map(|(_, p)| p.shutdown(drain)));
-    tokio::pin!(draining);
-    loop {
-        if !cancel.load(Ordering::SeqCst) && !warming.is_closed() {
-            warming.top_up().await;
-        }
-        tokio::select! {
-            _ = &mut draining => break,
-            _ = tokio::time::sleep(interval) => {}
-        }
-    }
-    if let Some(inner) = set.upgrade() {
-        let mut retiring = inner.retiring.lock();
-        for (key, pool) in &old {
-            if retiring.get(key).is_some_and(|p| p.same_pool(pool)) {
-                retiring.remove(key);
-            }
-        }
-    }
-    if !cancel.load(Ordering::SeqCst) && !warming.is_closed() {
-        warming.top_up().await;
     }
 }

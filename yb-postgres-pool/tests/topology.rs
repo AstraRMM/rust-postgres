@@ -705,7 +705,6 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
     };
     let mut set_config = PoolSetConfig::default();
     set_config.max_connections = 6;
-    set_config.drain_timeout = Duration::from_secs(2);
     let set = PoolSet::new(set_config, resolver).unwrap();
     let limiter = set.limiter().clone();
     let gen0 = PoolKey::for_realm(&realm, "test", "test");
@@ -718,11 +717,18 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
 
     let replaced = Instant::now();
     let new = set.pool(&gen1).unwrap();
-    let combined = Sampler::start(&limiter, {
-        let (old, new) = (old.clone(), new.clone());
-        move || old.state().physical + new.state().physical
-    });
+    assert!(eventually(Duration::from_secs(5), || new.state().physical == 2).await);
     let during = (old.state().physical, new.state().physical);
+    assert_eq!(
+        node_of(&new).await.is_empty(),
+        false,
+        "the new generation serves"
+    );
+    let retiring = {
+        let set = set.clone();
+        let gen0 = gen0.clone();
+        tokio::spawn(async move { set.retire(&gen0, Duration::from_secs(2)).await })
+    };
     let rows = in_flight.simple_query("select node").await.unwrap();
     assert!(
         !rows.is_empty(),
@@ -730,31 +736,24 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(in_flight);
+    assert!(retiring.await.unwrap());
     let warmed = eventually(Duration::from_secs(5), || {
-        new.state().physical == 4 && old.is_closed() && old.state().physical == 0
+        new.state().physical == 4 && old.state().physical == 0
     })
     .await;
     let warmed_in = replaced.elapsed();
-    let (_, min_combined) = combined.finish().await;
     let (max_in_use, _) = sampler.finish().await;
     println!(
-        "EVIDENCE generations: limit 6, floor 4; old/new physical during={:?}; new floor reached \
-         and old drained in {:?}; max_permits_in_use={}; counts={:?}",
+        "EVIDENCE generations: limit 6, floor 4; the new generation warmed from free permits \
+         (old/new physical {:?}), served, the caller retired the old one with work in flight; \
+         new floor reached and old drained in {:?}; max_permits_in_use={}; counts={:?}",
         during,
         warmed_in,
         max_in_use,
         counts(&realm)
     );
-    println!(
-        "EVIDENCE generations: minimum combined physical during hand-off={}",
-        min_combined
-    );
     assert!(warmed);
-    assert!(
-        min_combined >= 4,
-        "warm capacity dipped to {} during hand-off",
-        min_combined
-    );
+    assert_eq!(during, (4, 2));
     assert!(set.state(&gen0).is_none());
     assert!(max_in_use <= 6);
     assert_eq!(counts(&realm).values().sum::<usize>(), 4);
@@ -848,114 +847,6 @@ async fn dropping_the_last_handle_stops_maintenance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn supersession_needs_no_free_pool_slot_and_shutdown_awaits_the_drain() {
-    let cluster = Cluster::new("sp");
-    let a = Node::start(&cluster).await;
-    cluster.publish(&[(&a, "z1")]);
-    let realm = Realm::new("slots");
-    let pg = driver_config(&a, &realm, "load_balance=true");
-    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
-        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(2, 3)))
-    };
-    let mut set_config = PoolSetConfig::default();
-    set_config.max_connections = 6;
-    set_config.max_pools = 1;
-    set_config.drain_timeout = Duration::from_secs(30);
-    let set = PoolSet::new(set_config, resolver).unwrap();
-    let gen0 = PoolKey::for_realm(&realm, "test", "test");
-    let gen1 = gen0.clone().with_config_generation(1);
-
-    let old = set.pool(&gen0).unwrap();
-    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
-    let in_flight = old.get().await.unwrap();
-    let new = set
-        .pool(&gen1)
-        .expect("a newer generation replaces its predecessor without a free pool slot");
-    assert!(eventually(Duration::from_secs(5), || new.state().physical == 2).await);
-    assert!(
-        old.state().physical >= 1,
-        "the borrowed session is still draining"
-    );
-
-    let started = Instant::now();
-    let shutdown = {
-        let set = set.clone();
-        tokio::spawn(async move { set.shutdown(Duration::from_millis(300)).await })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    drop(in_flight);
-    shutdown.await.unwrap();
-    println!(
-        "EVIDENCE supersession: max_pools 1; set shutdown returned in {:?}; old physical={} new physical={} counts={:?}",
-        started.elapsed(),
-        old.state().physical,
-        new.state().physical,
-        counts(&realm)
-    );
-    assert_eq!(
-        old.state().physical,
-        0,
-        "shutdown returned before the old generation drained"
-    );
-    assert_eq!(new.state().physical, 0);
-    assert!(counts(&realm).is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stale_generation_keys_cannot_undo_a_rotation() {
-    let cluster = Cluster::new("sk");
-    let a = Node::start(&cluster).await;
-    cluster.publish(&[(&a, "z1")]);
-    let realm = Realm::new("stale-keys");
-    let pg = driver_config(&a, &realm, "load_balance=true");
-    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
-        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(1, 2)))
-    };
-    let mut set_config = PoolSetConfig::default();
-    set_config.max_pools = 1;
-    set_config.drain_timeout = Duration::from_secs(30);
-    let set = PoolSet::new(set_config, resolver).unwrap();
-    let gen0 = PoolKey::for_realm(&realm, "test", "test");
-    let gen1 = gen0.clone().with_credential_generation(1);
-
-    let old = set.pool(&gen0).unwrap();
-    let in_flight = old.get().await.unwrap();
-    let new = set.pool(&gen1).unwrap();
-    let mixed = gen0.clone().with_config_generation(1);
-    let regressed = set.pool(&mixed).unwrap_err();
-    assert_eq!(
-        regressed.kind(),
-        yb_postgres_pool::ErrorKind::PoolClosed,
-        "a key below either newest generation is refused: {regressed}"
-    );
-    let stale = set.pool(&gen0).unwrap_err();
-    assert_eq!(
-        stale.kind(),
-        yb_postgres_pool::ErrorKind::PoolClosed,
-        "{stale}"
-    );
-    assert!(set.pool(&gen1).is_ok());
-    assert!(!new.is_closed());
-    assert!(old.state().physical >= 1);
-    assert!(
-        set.retire(&gen0, Duration::from_millis(200)).await,
-        "the draining generation is reachable"
-    );
-    drop(in_flight);
-    assert!(eventually(Duration::from_secs(3), || old.state().physical == 0).await);
-    drop(new);
-    set.retire(&gen1, Duration::ZERO).await;
-    assert_eq!(set.active_pools(), 0);
-    let after_eviction = set.pool(&gen0).unwrap_err();
-    assert_eq!(
-        after_eviction.kind(),
-        yb_postgres_pool::ErrorKind::PoolClosed,
-        "a superseded key is refused even with no newer pool alive"
-    );
-    set.shutdown(Duration::from_secs(1)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweeps_do_not_extend_idle_timeout() {
     let cluster = Cluster::new("it");
     let (a, b) = (Node::start(&cluster).await, Node::start(&cluster).await);
@@ -1036,104 +927,4 @@ async fn min_idle_is_kept_by_maintenance_and_sweeps_open_nothing() {
     );
     drop(held);
     pool.shutdown(Duration::from_secs(1)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failing_new_generation_never_drains_the_old_one() {
-    let cluster = Cluster::new("fg");
-    let (a, bad) = (Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&a, "z1")]);
-    bad.set(Behaviour::Refuse);
-    let realm = Realm::new("failing-generation");
-    let good = driver_config(&a, &realm, "load_balance=true");
-    let broken: Config = format!(
-        "host={} port={} user=test dbname=test sslmode=disable connect_timeout=1",
-        bad.ip, bad.port
-    )
-    .parse()
-    .unwrap();
-    let resolver = move |key: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
-        let pg = if key.credential_generation() == 0 {
-            good.clone()
-        } else {
-            broken.clone()
-        };
-        let mut config = pool_config(2, 3);
-        config.connect_timeout = Duration::from_millis(500);
-        Ok(PoolSpec::new(pg, NoTls, config))
-    };
-    let mut set_config = PoolSetConfig::default();
-    set_config.max_connections = 4;
-    let set = PoolSet::new(set_config, resolver).unwrap();
-    let gen0 = PoolKey::for_realm(&realm, "test", "test");
-    let old = set.pool(&gen0).unwrap();
-    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
-    let new = set
-        .pool(&gen0.clone().with_credential_generation(1))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let (old_state, new_state) = (old.state(), new.state());
-    println!(
-        "EVIDENCE failing generation: new pool connect failures={} physical={}; old physical={} closed={}",
-        new_state.stats.connect_failures,
-        new_state.physical,
-        old_state.physical,
-        old.is_closed()
-    );
-    assert!(new_state.stats.connect_failures > 0);
-    assert_eq!(new_state.physical, 0);
-    assert_eq!(
-        old_state.physical, 2,
-        "a failing rotation released working capacity"
-    );
-    assert!(!old.is_closed());
-    assert!(
-        old.get().await.is_ok(),
-        "the old generation still serves its holders"
-    );
-    set.shutdown(Duration::from_secs(1)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn borrowed_old_sessions_are_never_cut_off_for_an_unverified_rotation() {
-    let cluster = Cluster::new("hb");
-    let a = Node::start(&cluster).await;
-    cluster.publish(&[(&a, "z1")]);
-    let realm = Realm::new("borrowed-hand-off");
-    let pg = driver_config(&a, &realm, "load_balance=true");
-    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
-        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(2, 2)))
-    };
-    let mut set_config = PoolSetConfig::default();
-    set_config.max_connections = 2;
-    set_config.drain_timeout = Duration::from_millis(500);
-    let set = PoolSet::new(set_config, resolver).unwrap();
-    let gen0 = PoolKey::for_realm(&realm, "test", "test");
-    let old = set.pool(&gen0).unwrap();
-    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
-    let held = [old.get().await.unwrap(), old.get().await.unwrap()];
-    let new = set
-        .pool(&gen0.clone().with_credential_generation(1))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(
-        !old.is_closed(),
-        "the rotation was not verified, yet the old generation drained"
-    );
-    for client in &held {
-        assert!(client.simple_query("select node").await.is_ok());
-    }
-    let returned = Instant::now();
-    drop(held);
-    let warmed = eventually(Duration::from_secs(5), || {
-        new.state().physical == 2 && old.is_closed() && old.state().physical == 0
-    })
-    .await;
-    println!(
-        "EVIDENCE borrowed hand-off: every old session borrowed past the 500 ms deadline and still \
-         served; after they returned, new generation warm and old drained in {:?}",
-        returned.elapsed()
-    );
-    assert!(warmed);
-    set.shutdown(Duration::from_secs(1)).await;
 }
