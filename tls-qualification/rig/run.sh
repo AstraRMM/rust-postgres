@@ -45,7 +45,7 @@ tls() {
   chmod 755 "$fix"/*.sh
 
   step "containers"
-  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained yb-a yb-b >/dev/null 2>&1
+  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa yb-a yb-b yb-c >/dev/null 2>&1
   pg() { local name=$1; shift; docker run -d --name "$name" --network host -e POSTGRES_PASSWORD=qualification-only \
     -v "$fix:/fixtures:ro" --entrypoint /fixtures/pg-entry.sh "$pg_image" "$@" >/dev/null; }
   pg pg-valid 55432 server-valid scram
@@ -55,14 +55,38 @@ tls() {
   pg pg-tls12 55436 server-valid scram -c ssl_max_protocol_version=TLSv1.2
   pg pg-rotated 55437 server-rotated scram
   pg pg-chained 55438 server-chained scram
-  yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-entry.sh "$yb_image" "$2" "$3" "$4" >/dev/null; }
-  yb yb-a 127.0.0.2 yb-a 0
-  yb yb-b 127.0.0.3 yb-b 1
-  for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained; do
+  pg pg-rsa 55439 server-rsa scram
+  yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-entry.sh "$yb_image" "${@:2}" >/dev/null; }
+  # PostgreSQL listens on 554xx, inside the ephemeral port range: let every
+  # fixture bind before the YugabyteDB universes open outbound connections.
+  for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa; do
     wait_for "$name" 120 docker exec "$name" pg_isready -h 127.0.0.1 -p "$(docker inspect -f '{{index .Args 0}}' "$name")" || return 1
   done
+  yb yb-a 127.0.0.2 yb-a 0
+  yb yb-b 127.0.0.3 yb-b 1
+  yb yb-c 127.0.0.4 yb-c-rsa 2 ca-rsa
   wait_for yb-a 420 docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select 1' || return 1
   wait_for yb-b 420 docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select 1' || return 1
+  wait_for yb-c 420 docker exec -e PGSSLMODE=require yb-c /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select 1' || return 1
+  # SCRAM-only role on the ECDSA (yb-a) and RSA (yb-c) universes.
+  for node in yb-a:127.0.0.2 yb-c:127.0.0.4; do
+    docker exec -e PGSSLMODE=require "${node%%:*}" /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U yugabyte -v ON_ERROR_STOP=1 \
+      -c "set password_encryption = 'scram-sha-256'" -c "create role qual_scram login password 'qualification-only'" \
+      -c "select rolname, left(rolpassword, 14) as verifier from pg_authid where rolname = 'qual_scram'" || return 1
+    # Independent view from the server's own libpq client (ysqlsh).
+    docker exec -e PGSSLMODE=require -e PGCHANNELBINDING=require -e PGPASSWORD=qualification-only "${node%%:*}" \
+      /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U qual_scram -d yugabyte -c 'select current_user'
+    echo "PROBE ysqlsh-channel-binding-require ${node%%:*} rc=$?"
+  done
+  # Which SASL mechanisms each engine offers over TLS (no credential sent).
+  for target in 127.0.0.2:5433:qual_scram:yugabyte 127.0.0.4:5433:qual_scram:yugabyte \
+    127.0.0.1:55432:postgres:postgres 127.0.0.1:55439:postgres:postgres; do
+    IFS=: read -r host port user db <<<"$target"
+    python3 -I tls-qualification/rig/sasl-mechanisms.py "$host" "$port" "$user" "$db"
+    echo "PROBE sasl-mechanisms $host:$port rc=$?"
+  done
+  docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte \
+    -c "select name, setting from pg_settings where name in ('ssl', 'ssl_library', 'password_encryption', 'ssl_min_protocol_version') order by name"
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select version()'

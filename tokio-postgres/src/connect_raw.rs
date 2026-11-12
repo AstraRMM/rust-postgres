@@ -1,5 +1,5 @@
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
-use crate::config::{self, Config};
+use crate::config::{self, AuthMethod, Config};
 use crate::connect_tls::connect_tls;
 use crate::maybe_tls_stream::MaybeTlsStream;
 use crate::session_status::SessionShared;
@@ -178,10 +178,12 @@ where
 {
     match stream.try_next().await.map_err(Error::io)? {
         Some(Message::AuthenticationOk) => {
+            check_require_auth(config, AuthMethod::None)?;
             can_skip_channel_binding(config)?;
             return Ok(());
         }
         Some(Message::AuthenticationCleartextPassword) => {
+            check_require_auth(config, AuthMethod::Password)?;
             can_skip_channel_binding(config)?;
 
             let pass = config
@@ -192,6 +194,7 @@ where
             authenticate_password(stream, pass).await?;
         }
         Some(Message::AuthenticationMd5Password(body)) => {
+            check_require_auth(config, AuthMethod::Md5)?;
             can_skip_channel_binding(config)?;
 
             let pass = config
@@ -203,6 +206,7 @@ where
             authenticate_password(stream, output.as_bytes()).await?;
         }
         Some(Message::AuthenticationSasl(body)) => {
+            check_require_auth(config, AuthMethod::ScramSha256)?;
             authenticate_sasl(stream, body, config).await?;
         }
         Some(Message::AuthenticationKerberosV5)
@@ -223,6 +227,25 @@ where
         Some(Message::ErrorResponse(body)) => Err(Error::db(body)),
         Some(_) => Err(Error::unexpected_message()),
         None => Err(Error::closed()),
+    }
+}
+
+/// Refuses an authentication request that `require_auth` does not allow,
+/// before any credential is sent.
+fn check_require_auth(config: &Config, method: AuthMethod) -> Result<(), Error> {
+    match &config.require_auth {
+        Some(allowed) if !allowed.contains(&method) => {
+            let requested = match method {
+                AuthMethod::None => "server did not request authentication",
+                AuthMethod::Password => "server requested cleartext password authentication",
+                AuthMethod::Md5 => "server requested md5 password authentication",
+                _ => "server requested SASL authentication",
+            };
+            Err(Error::authentication(
+                format!("{}, which require_auth does not allow", requested).into(),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
