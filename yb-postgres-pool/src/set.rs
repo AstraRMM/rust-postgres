@@ -58,6 +58,8 @@ struct SetInner<T: PoolTls> {
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
     /// Superseded generations still draining, awaited by `shutdown`.
     retiring: Mutex<HashMap<PoolKey, Pool<T>>>,
+    /// The newest generation created per identity; older ones are refused.
+    newest: Mutex<HashMap<PoolKey, PoolKey>>,
     closed: AtomicBool,
 }
 
@@ -101,6 +103,7 @@ impl<T: PoolTls> PoolSet<T> {
             resolver: Box::new(resolver),
             pools: Mutex::new(HashMap::new()),
             retiring: Mutex::new(HashMap::new()),
+            newest: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let weak: Weak<SetInner<T>> = Arc::downgrade(&inner);
@@ -155,13 +158,12 @@ impl<T: PoolTls> PoolSet<T> {
             }
             pools.remove(key);
         }
-        if pools.keys().any(|k| k.supersedes(key))
-            || self
-                .inner
-                .retiring
-                .lock()
-                .keys()
-                .any(|k| k.supersedes(key) || k == key)
+        if self
+            .inner
+            .newest
+            .lock()
+            .get(&key.identity())
+            .is_some_and(|newest| newest.supersedes(key))
         {
             return Err(PoolError::new(
                 ErrorKind::PoolClosed,
@@ -238,8 +240,14 @@ impl<T: PoolTls> PoolSet<T> {
                     superseded.iter().map(|(_, p)| p.shutdown(drain)),
                 );
                 tokio::pin!(draining);
+                let mut warming = Some(warming);
                 loop {
-                    warming.top_up().await;
+                    if inner.strong_count() == 0 {
+                        warming = None;
+                    }
+                    if let Some(warming) = &warming {
+                        warming.top_up().await;
+                    }
                     tokio::select! {
                         _ = &mut draining => break,
                         _ = tokio::time::sleep(interval) => {}
@@ -253,8 +261,17 @@ impl<T: PoolTls> PoolSet<T> {
                         }
                     }
                 }
-                warming.top_up().await;
+                if let Some(warming) = warming {
+                    warming.top_up().await;
+                }
             });
+        }
+        {
+            let mut newest = self.inner.newest.lock();
+            let entry = newest.entry(key.identity()).or_insert_with(|| key.clone());
+            if key.supersedes(entry) {
+                *entry = key.clone();
+            }
         }
         pools.insert(key.clone(), pool.clone());
         Ok(pool)

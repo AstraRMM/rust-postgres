@@ -263,6 +263,9 @@ pub(crate) struct Shared<T: PoolTls> {
     retire_credits: AtomicU64,
     /// Serializes sweeps so concurrent passes cannot spend the same surplus.
     sweep_lock: tokio::sync::Mutex<()>,
+    /// When the oldest idle session a sweep returned reaches `idle_timeout`
+    /// (a sweep restarts bb8's own idle clock).
+    idle_deadline: Mutex<Option<Instant>>,
     /// Earliest next replacement retry and the current backoff.
     rebalance_retry: Mutex<(Instant, Duration)>,
 }
@@ -550,16 +553,12 @@ impl<T: PoolTls> Shared<T> {
             .retire_credits
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
-        if credit {
-            if !sweeping() {
-                self.rebalance_pending.store(true, Ordering::SeqCst);
-                self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
-            }
-            return Err(reason);
-        }
         if !sweeping() {
-            self.rebalance_pending.store(true, Ordering::SeqCst);
             self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
+            self.rebalance_pending.store(true, Ordering::SeqCst);
+        }
+        if credit {
+            return Err(reason);
         }
         Ok(!reusable(client))
     }
@@ -919,6 +918,7 @@ impl<T: PoolTls> Pool<T> {
             rebalance_requests: AtomicU64::new(0),
             retire_credits: AtomicU64::new(0),
             sweep_lock: tokio::sync::Mutex::new(()),
+            idle_deadline: Mutex::new(None),
             rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
         });
         let pool = bb8::Pool::builder()
@@ -1204,7 +1204,11 @@ impl<T: PoolTls> Pool<T> {
                 || (Instant::now() >= shared.rebalance_retry.lock().0
                     && shared.capacity.in_use() < shared.capacity.max()
                     && shared.limiter.in_use() < shared.limiter.max()));
-        if !dead && !changed && !retry {
+        let idle_due = shared
+            .idle_deadline
+            .lock()
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !dead && !changed && !retry && !idle_due {
             return;
         }
         bump(&shared.stats.idle_sweeps);
@@ -1227,6 +1231,11 @@ impl<T: PoolTls> Pool<T> {
                     .connections
                     .saturating_sub(shared.config.warm_floor);
                 let mut need = 0u64;
+                let idle_deadline = shared
+                    .config
+                    .idle_timeout
+                    .and_then(|timeout| held.iter().map(|conn| conn.idle_since + timeout).min());
+                *shared.idle_deadline.lock() = idle_deadline;
                 for mut conn in held {
                     let reason = match conn.client.node_standing() {
                         NodeStanding::Fallback => Retire::Rebalanced,

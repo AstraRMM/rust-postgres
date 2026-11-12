@@ -113,6 +113,15 @@ impl PoolKey {
         self.discriminator.as_deref()
     }
 
+    /// The key with both generations reset: what generations of one
+    /// identity share.
+    pub(crate) fn identity(&self) -> PoolKey {
+        let mut identity = self.clone();
+        identity.credential_generation = 0;
+        identity.config_generation = 0;
+        identity
+    }
+
     /// Whether `self` is a newer generation of the same realm, incarnation,
     /// database, role and discriminator as `older`: neither generation is
     /// lower and at least one is higher.
