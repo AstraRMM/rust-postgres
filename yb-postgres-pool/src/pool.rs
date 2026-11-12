@@ -263,6 +263,8 @@ pub(crate) struct Shared<T: PoolTls> {
     swept: Mutex<Option<(u64, Vec<String>)>>,
     /// Departed or fallback-tier connections await replacement.
     rebalance_pending: AtomicBool,
+    /// The request count when the previous sweep started.
+    requests_at_sweep: AtomicU64,
     /// Bumped by every return of a departed or fallback-tier session.
     rebalance_requests: AtomicU64,
     /// Serializes sweeps so concurrent passes cannot spend the same surplus.
@@ -384,14 +386,6 @@ impl<T: PoolTls> Shared<T> {
                 ErrorKind::Transport,
                 format!("connect did not complete within {:?}", budget),
             )),
-        }
-    }
-
-    /// Resolves once a checkout is waiting, so background discovery yields
-    /// the session or permit it holds.
-    async fn until_waiting(&self) {
-        while self.waiting.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -937,6 +931,7 @@ impl<T: PoolTls> Pool<T> {
             died: Arc::new(AtomicU64::new(0)),
             swept_died: AtomicU64::new(0),
             rebalance_pending: AtomicBool::new(false),
+            requests_at_sweep: AtomicU64::new(0),
             rebalance_requests: AtomicU64::new(0),
             sweep_lock: tokio::sync::Mutex::new(()),
             idle_deadline: Mutex::new(None),
@@ -1215,7 +1210,7 @@ impl<T: PoolTls> Pool<T> {
             let outcome = tokio::select! {
                 biased;
                 _ = shared.until_closed() => None,
-                _ = shared.until_waiting() => {
+                _ = self.until_starved() => {
                     // The query may still be in flight: close the session so
                     // the waiting caller can dial instead of waiting for it.
                     session.retire = Some(Retire::Explicit);
@@ -1253,7 +1248,7 @@ impl<T: PoolTls> Pool<T> {
         let outcome = tokio::select! {
             biased;
             _ = shared.until_closed() => return,
-            _ = shared.until_waiting() => {
+            _ = self.until_starved() => {
                 bump(&shared.stats.topology_refresh_failures);
                 return;
             }
@@ -1321,6 +1316,7 @@ impl<T: PoolTls> Pool<T> {
             *shared.rebalance_retry.lock() = (Instant::now(), REBALANCE_BACKOFF_MIN);
         }
         let requests = shared.rebalance_requests.load(Ordering::SeqCst);
+        let previous = shared.requests_at_sweep.swap(requests, Ordering::SeqCst);
         let need = SWEEPING
             .scope((), async {
                 let held = self.take_idle().await;
@@ -1413,7 +1409,9 @@ impl<T: PoolTls> Pool<T> {
                 }
             }
         }
-        shared.rebalance_pending.store(pending, Ordering::SeqCst);
+        shared
+            .rebalance_pending
+            .store(pending || requests != previous, Ordering::SeqCst);
         if shared.rebalance_requests.load(Ordering::SeqCst) != requests {
             shared.rebalance_pending.store(true, Ordering::SeqCst);
         }
@@ -1459,6 +1457,16 @@ impl<T: PoolTls> Pool<T> {
                 _process: process,
             }),
             _ => None,
+        }
+    }
+
+    /// Resolves once a checkout is waiting with no idle session left, so
+    /// background discovery yields the session or permit it holds.
+    async fn until_starved(&self) {
+        while self.inner.shared.waiting.load(Ordering::SeqCst) == 0
+            || self.inner.pool.state().idle_connections > 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
