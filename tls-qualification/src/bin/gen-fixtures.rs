@@ -124,7 +124,9 @@ fn main() {
 
     let (this_update, next_update) = (date_time_ymd(2025, 1, 1), date_time_ymd(2035, 1, 1));
     let crl_pem = |issuer: &Ca, number: u64, next_update: OffsetDateTime, revoked: &[u64]| {
-        crl(&issuer.cert, &issuer.key, number, this_update.min(next_update), next_update, revoked)
+        // thisUpdate must precede nextUpdate; the stale CRL is issued earlier.
+        let this_update = if next_update > this_update { this_update } else { date_time_ymd(2024, 1, 1) };
+        crl(&issuer.cert, &issuer.key, number, this_update, next_update, revoked)
             .pem()
             .unwrap()
     };

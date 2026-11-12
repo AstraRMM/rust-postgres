@@ -328,7 +328,7 @@ async fn enforced_crl_expiry_rejects_stale_material_and_keeps_the_current_genera
 async fn enforced_crl_expiry_applies_to_a_crl_that_expires_after_loading() {
     let (ca, key) = load_ca(CA_A_CN, std::str::from_utf8(&read("ca-a.key")).unwrap());
     let now = time::OffsetDateTime::now_utc();
-    let short = crl(&ca, &key, 10, now - time::Duration::minutes(1), now + time::Duration::seconds(3), &[])
+    let short = crl(&ca, &key, 10, now - time::Duration::minutes(1), now + time::Duration::seconds(20), &[])
         .pem()
         .unwrap();
     let material = roots("ca-a.crt").with_crl(short);
@@ -336,8 +336,11 @@ async fn enforced_crl_expiry_applies_to_a_crl_that_expires_after_loading() {
     let ignored = connector(&material);
     open(&pg(PG_VALID, "localhost"), &enforced).await.unwrap();
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(enforced.current().earliest_crl_next_update().unwrap() < SystemTime::now());
+    // Wait until the reported nextUpdate has passed (whole-second precision).
+    let next_update = enforced.current().earliest_crl_next_update().unwrap();
+    let wait = next_update.duration_since(SystemTime::now()).unwrap_or_default() + Duration::from_secs(2);
+    tokio::time::sleep(wait).await;
+    assert!(next_update < SystemTime::now());
     let e = expect_tls(open(&pg(PG_VALID, "localhost"), &enforced).await, TlsFailureKind::CrlExpired);
     let rendered = format!("{e} {e:?}");
     assert!(rendered.contains("nextUpdate"), "{rendered}");
