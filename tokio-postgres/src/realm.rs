@@ -656,23 +656,23 @@ impl Realm {
         match time::timeout(remaining, connect_with_tls_ref(tls, config, Some(attempt))).await {
             Ok(Ok((mut client, connection))) => {
                 let identity = self.seed_identity(&client, topology.as_deref());
-                if let Some(identity) = identity {
-                    client.set_lease(Box::new(self.reserve(&identity)));
-                    if let Some(socket) = client.get_socket_config() {
-                        let mut identities = vec![identity];
-                        identities.extend(socket.node.clone());
-                        if let crate::client::Addr::Tcp(ip) = &socket.addr {
-                            identities.push(ip.to_string());
-                        }
-                        identities.dedup();
-                        client.set_placement(Placement {
-                            realm: self.clone(),
-                            config: Arc::new(config.clone()),
-                            identities,
-                            port: socket.port,
-                            seed: true,
-                        });
+                if let Some(identity) = &identity {
+                    client.set_lease(Box::new(self.reserve(identity)));
+                }
+                if let Some(socket) = client.get_socket_config() {
+                    let mut identities: Vec<String> = identity.into_iter().collect();
+                    identities.extend(socket.node.clone());
+                    if let crate::client::Addr::Tcp(ip) = &socket.addr {
+                        identities.push(ip.to_string());
                     }
+                    identities.dedup();
+                    client.set_placement(Placement {
+                        realm: self.clone(),
+                        config: Arc::new(config.clone()),
+                        identities,
+                        port: socket.port,
+                        seed: true,
+                    });
                 }
                 Ok((client, connection))
             }

@@ -1184,13 +1184,11 @@ impl<T: PoolTls> Pool<T> {
         if !realm.refresh_due(&shared.pg) {
             return;
         }
-        let idle = self.inner.pool.state().idle_connections;
-        let saturated = shared.capacity.in_use() >= shared.capacity.max()
-            || shared.limiter.in_use() >= shared.limiter.max();
-        let last_idle = idle == 1 && saturated;
         let session = SWEEPING
             .scope((), async {
-                if shared.waiting.load(Ordering::SeqCst) > 0 || (idle < 2 && !last_idle) {
+                if shared.waiting.load(Ordering::SeqCst) > 0
+                    || self.inner.pool.state().idle_connections < 2
+                {
                     return None;
                 }
                 match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
@@ -1200,13 +1198,10 @@ impl<T: PoolTls> Pool<T> {
             })
             .await;
         if let Some(mut session) = session {
-            let budget = if last_idle {
-                shared.config.connect_timeout.min(Duration::from_secs(2))
-            } else {
-                shared.config.connect_timeout
-            };
-            let refresh =
-                tokio::time::timeout(budget, realm.refresh_with(&session.client, &shared.pg));
+            let refresh = tokio::time::timeout(
+                shared.config.connect_timeout,
+                realm.refresh_with(&session.client, &shared.pg),
+            );
             let outcome = tokio::select! {
                 biased;
                 _ = shared.until_closed() => None,
