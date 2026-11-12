@@ -12,6 +12,7 @@ use log::debug;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -58,6 +59,11 @@ ORDER BY attnum
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// The deepest chain of not-yet-known types (domain, array, range or
+/// composite member types, and the type lookup statements themselves) that
+/// one lookup resolves. Real catalogs nest far less than this.
+const MAX_TYPE_DEPTH: usize = 16;
+
 /// Preparation and the type lookups it needs are attributed to
 /// [`Class::Preparation`](crate::observe::Class::Preparation).
 const PREPARATION: Option<crate::observe::Class> = Some(crate::observe::Class::Preparation);
@@ -66,6 +72,17 @@ pub async fn prepare(
     client: &Arc<InnerClient>,
     query: &str,
     types: &[Type],
+) -> Result<Statement, Error> {
+    prepare_in(client, query, types, &[]).await
+}
+
+/// Prepares `query` while resolving the types in `lineage`, the chain of type
+/// lookups already in progress.
+async fn prepare_in(
+    client: &Arc<InnerClient>,
+    query: &str,
+    types: &[Type],
+    lineage: &[Oid],
 ) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let buf = encode(client, &name, query, types)?;
@@ -93,7 +110,7 @@ pub async fn prepare(
     let mut parameters = vec![];
     let mut it = parameter_description.parameters();
     while let Some(oid) = it.next().map_err(Error::parse)? {
-        let type_ = get_type(client, oid).await?;
+        let type_ = get_type(client, oid, lineage).await?;
         parameters.push(type_);
     }
 
@@ -101,7 +118,7 @@ pub async fn prepare(
     if let Some(row_description) = row_description {
         let mut it = row_description.fields();
         while let Some(field) = it.next().map_err(Error::parse)? {
-            let type_ = get_type(client, field.type_oid()).await?;
+            let type_ = get_type(client, field.type_oid(), lineage).await?;
             let column = Column::new(field.name().to_string(), type_);
             columns.push(column);
         }
@@ -114,8 +131,9 @@ fn prepare_rec<'a>(
     client: &'a Arc<InnerClient>,
     query: &'a str,
     types: &'a [Type],
+    lineage: &'a [Oid],
 ) -> Pin<Box<dyn Future<Output = Result<Statement, Error>> + 'a + Send>> {
-    Box::pin(prepare(client, query, types))
+    Box::pin(prepare_in(client, query, types, lineage))
 }
 
 fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Result<Bytes, Error> {
@@ -134,7 +152,7 @@ fn encode(client: &InnerClient, name: &str, query: &str, types: &[Type]) -> Resu
     })
 }
 
-async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
+async fn get_type(client: &Arc<InnerClient>, oid: Oid, lineage: &[Oid]) -> Result<Type, Error> {
     if let Some(type_) = Type::from_oid(oid) {
         return Ok(type_);
     }
@@ -143,7 +161,23 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
         return Ok(type_);
     }
 
-    let stmt = typeinfo_statement(client).await?;
+    // The server describes types in terms of other types; refuse a cycle or
+    // an unreasonably deep chain instead of recursing without bound.
+    if lineage.contains(&oid) {
+        return Err(type_lookup_error(
+            "type lookup found a cyclic type definition",
+        ));
+    }
+    if lineage.len() >= MAX_TYPE_DEPTH {
+        return Err(type_lookup_error(
+            "type lookup exceeded the maximum type nesting depth",
+        ));
+    }
+    let mut lineage = lineage.to_vec();
+    lineage.push(oid);
+    let lineage = &lineage[..];
+
+    let stmt = typeinfo_statement(client, lineage).await?;
 
     let rows = query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION).await?;
     pin_mut!(rows);
@@ -162,21 +196,21 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
     let relid: Oid = row.try_get(6)?;
 
     let kind = if type_ == b'e' as i8 {
-        let variants = get_enum_variants(client, oid).await?;
+        let variants = get_enum_variants(client, oid, lineage).await?;
         Kind::Enum(variants)
     } else if type_ == b'p' as i8 {
         Kind::Pseudo
     } else if basetype != 0 {
-        let type_ = get_type_rec(client, basetype).await?;
+        let type_ = get_type_rec(client, basetype, lineage).await?;
         Kind::Domain(type_)
     } else if elem_oid != 0 {
-        let type_ = get_type_rec(client, elem_oid).await?;
+        let type_ = get_type_rec(client, elem_oid, lineage).await?;
         Kind::Array(type_)
     } else if relid != 0 {
-        let fields = get_composite_fields(client, relid).await?;
+        let fields = get_composite_fields(client, relid, lineage).await?;
         Kind::Composite(fields)
     } else if let Some(rngsubtype) = rngsubtype {
-        let type_ = get_type_rec(client, rngsubtype).await?;
+        let type_ = get_type_rec(client, rngsubtype, lineage).await?;
         Kind::Range(type_)
     } else {
         Kind::Simple
@@ -191,19 +225,27 @@ async fn get_type(client: &Arc<InnerClient>, oid: Oid) -> Result<Type, Error> {
 fn get_type_rec<'a>(
     client: &'a Arc<InnerClient>,
     oid: Oid,
+    lineage: &'a [Oid],
 ) -> Pin<Box<dyn Future<Output = Result<Type, Error>> + Send + 'a>> {
-    Box::pin(get_type(client, oid))
+    Box::pin(get_type(client, oid, lineage))
 }
 
-async fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+fn type_lookup_error(reason: &str) -> Error {
+    Error::parse(io::Error::new(io::ErrorKind::InvalidData, reason))
+}
+
+async fn typeinfo_statement(
+    client: &Arc<InnerClient>,
+    lineage: &[Oid],
+) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo() {
         return Ok(stmt);
     }
 
-    let stmt = match prepare_rec(client, TYPEINFO_QUERY, &[]).await {
+    let stmt = match prepare_rec(client, TYPEINFO_QUERY, &[], lineage).await {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => {
-            prepare_rec(client, TYPEINFO_FALLBACK_QUERY, &[]).await?
+            prepare_rec(client, TYPEINFO_FALLBACK_QUERY, &[], lineage).await?
         }
         Err(e) => return Err(e),
     };
@@ -212,8 +254,12 @@ async fn typeinfo_statement(client: &Arc<InnerClient>) -> Result<Statement, Erro
     Ok(stmt)
 }
 
-async fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<String>, Error> {
-    let stmt = typeinfo_enum_statement(client).await?;
+async fn get_enum_variants(
+    client: &Arc<InnerClient>,
+    oid: Oid,
+    lineage: &[Oid],
+) -> Result<Vec<String>, Error> {
+    let stmt = typeinfo_enum_statement(client, lineage).await?;
 
     query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION)
         .await?
@@ -222,15 +268,18 @@ async fn get_enum_variants(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<St
         .await
 }
 
-async fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+async fn typeinfo_enum_statement(
+    client: &Arc<InnerClient>,
+    lineage: &[Oid],
+) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo_enum() {
         return Ok(stmt);
     }
 
-    let stmt = match prepare_rec(client, TYPEINFO_ENUM_QUERY, &[]).await {
+    let stmt = match prepare_rec(client, TYPEINFO_ENUM_QUERY, &[], lineage).await {
         Ok(stmt) => stmt,
         Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_COLUMN) => {
-            prepare_rec(client, TYPEINFO_ENUM_FALLBACK_QUERY, &[]).await?
+            prepare_rec(client, TYPEINFO_ENUM_FALLBACK_QUERY, &[], lineage).await?
         }
         Err(e) => return Err(e),
     };
@@ -239,8 +288,12 @@ async fn typeinfo_enum_statement(client: &Arc<InnerClient>) -> Result<Statement,
     Ok(stmt)
 }
 
-async fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec<Field>, Error> {
-    let stmt = typeinfo_composite_statement(client).await?;
+async fn get_composite_fields(
+    client: &Arc<InnerClient>,
+    oid: Oid,
+    lineage: &[Oid],
+) -> Result<Vec<Field>, Error> {
+    let stmt = typeinfo_composite_statement(client, lineage).await?;
 
     let rows = query::query_for(client, stmt, slice_iter(&[&oid]), PREPARATION)
         .await?
@@ -251,19 +304,22 @@ async fn get_composite_fields(client: &Arc<InnerClient>, oid: Oid) -> Result<Vec
     for row in rows {
         let name = row.try_get(0)?;
         let oid = row.try_get(1)?;
-        let type_ = get_type_rec(client, oid).await?;
+        let type_ = get_type_rec(client, oid, lineage).await?;
         fields.push(Field::new(name, type_));
     }
 
     Ok(fields)
 }
 
-async fn typeinfo_composite_statement(client: &Arc<InnerClient>) -> Result<Statement, Error> {
+async fn typeinfo_composite_statement(
+    client: &Arc<InnerClient>,
+    lineage: &[Oid],
+) -> Result<Statement, Error> {
     if let Some(stmt) = client.typeinfo_composite() {
         return Ok(stmt);
     }
 
-    let stmt = prepare_rec(client, TYPEINFO_COMPOSITE_QUERY, &[]).await?;
+    let stmt = prepare_rec(client, TYPEINFO_COMPOSITE_QUERY, &[], lineage).await?;
 
     client.set_typeinfo_composite(&stmt);
     Ok(stmt)

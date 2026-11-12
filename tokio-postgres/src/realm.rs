@@ -1019,7 +1019,7 @@ impl Realm {
             .unwrap_or_default();
         self.inner.discoveries.fetch_add(1, Ordering::SeqCst);
         let rows = {
-            let query = client.query("select * from yb_servers()", &[]);
+            let query = discovery_rows(&client);
             pin_mut!(query);
             time::timeout(
                 QUERY_TIMEOUT,
@@ -1118,6 +1118,33 @@ fn invalid_topology(reason: &str) -> Error {
         io::ErrorKind::InvalidData,
         format!("rejected yb_servers() snapshot: {}", reason),
     ))
+}
+
+/// Runs the discovery query, refusing an answer with more rows, or longer
+/// fields, than any real cluster reports, as it streams in.
+async fn discovery_rows(client: &Client) -> Result<Vec<crate::Row>, Error> {
+    use futures_util::TryStreamExt;
+
+    /// Far more nodes than a YugabyteDB universe runs.
+    const MAX_ROWS: usize = 4096;
+    /// Host names are at most 253 bytes; placement names and UUIDs are short.
+    const MAX_FIELD_LEN: usize = 1024;
+
+    let rows = client
+        .query_raw("select * from yb_servers()", crate::slice_iter(&[]))
+        .await?;
+    pin_mut!(rows);
+    let mut collected = Vec::new();
+    while let Some(row) = rows.try_next().await? {
+        if collected.len() >= MAX_ROWS {
+            return Err(invalid_topology("too many rows"));
+        }
+        if row.max_field_len() > MAX_FIELD_LEN {
+            return Err(invalid_topology("a field is too long"));
+        }
+        collected.push(row);
+    }
+    Ok(collected)
 }
 
 /// Accounts one connection (or in-flight attempt) against a node. Dropping

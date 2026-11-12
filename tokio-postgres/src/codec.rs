@@ -49,7 +49,34 @@ impl FallibleIterator for BackendMessages {
     }
 }
 
-pub struct PostgresCodec;
+/// The default limit on the body of one backend message once a session is
+/// established. PostgreSQL assembles every outgoing message in a buffer
+/// capped at `MaxAllocSize` (1 GiB - 1), so no server, YugabyteDB YSQL
+/// included, produces a larger message: this default never rejects a
+/// legitimate row, however large its fields.
+pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: usize = 1 << 30;
+
+/// The limit on the body of one backend message during startup and
+/// authentication, before the session is established. PostgreSQL limits
+/// authentication exchange tokens to 65535 bytes (`PG_MAX_AUTH_TOKEN_LENGTH`);
+/// parameter status, key data and error messages are far smaller.
+pub(crate) const STARTUP_MAX_MESSAGE_SIZE: usize = 128 * 1024;
+
+pub struct PostgresCodec {
+    max_message_size: usize,
+}
+
+impl PostgresCodec {
+    /// A codec that rejects backend messages whose body exceeds
+    /// `max_message_size` bytes.
+    pub fn new(max_message_size: usize) -> PostgresCodec {
+        PostgresCodec { max_message_size }
+    }
+
+    pub fn set_max_message_size(&mut self, max_message_size: usize) {
+        self.max_message_size = max_message_size;
+    }
+}
 
 impl Encoder<FrontendMessage> for PostgresCodec {
     type Error = io::Error;
@@ -74,6 +101,17 @@ impl Decoder for PostgresCodec {
 
         while let Some(header) = backend::Header::parse(&src[idx..])? {
             let len = header.len() as usize + 1;
+            // Refuse an oversized message from its header, before buffering it.
+            if header.len() as usize - 4 > self.max_message_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "backend message of {} bytes exceeds the {} byte limit",
+                        header.len() as usize - 4,
+                        self.max_message_size
+                    ),
+                ));
+            }
             if src[idx..].len() < len {
                 break;
             }

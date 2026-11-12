@@ -32,6 +32,11 @@ enum Behaviour {
     Stall,
     AuthFail,
     Busy,
+    /// Announces a startup message larger than any the driver accepts
+    /// before the session is established, then stalls.
+    HugeStartupMessage,
+    /// Floods the startup with distinct parameter status messages.
+    ParameterFlood,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -44,7 +49,24 @@ enum Discovery {
     SlowError(u64),
     /// Every DataRow carries fewer fields than its RowDescription announced.
     ShortRows,
+    /// The discovery query's `host` column has an unknown type whose lookup
+    /// names another unknown element type, without end.
+    TypeChain,
+    /// As `TypeChain`, but the element types refer back to each other.
+    TypeCycle,
+    /// The simple-query reply row carries a 2000-byte value.
+    LargeRow,
+    /// The simple-query reply announces a row beyond the default 1 GiB
+    /// message limit, then stalls.
+    HugeRow,
+    /// Discovery pads the published rows to this many rows.
+    ManyRows(usize),
+    /// Discovery reports every zone with this many bytes.
+    LongZone(usize),
 }
+
+/// The first unknown type OID the `TypeChain`/`TypeCycle` fixtures report.
+const UNKNOWN_TYPE: u32 = 100_000;
 
 #[derive(Clone, Debug)]
 struct NodeRow {
@@ -59,6 +81,7 @@ struct Cluster {
     rows: Arc<Mutex<Vec<NodeRow>>>,
     discovery: Arc<Mutex<Discovery>>,
     discoveries: Arc<AtomicUsize>,
+    type_lookups: Arc<AtomicUsize>,
     region: String,
 }
 
@@ -68,6 +91,7 @@ impl Cluster {
             rows: Arc::new(Mutex::new(Vec::new())),
             discovery: Arc::new(Mutex::new(Discovery::Rows)),
             discoveries: Arc::new(AtomicUsize::new(0)),
+            type_lookups: Arc::new(AtomicUsize::new(0)),
             region: region.to_string(),
         }
     }
@@ -164,9 +188,9 @@ async fn error(socket: &mut TcpStream, code: &str, text: &str) -> io::Result<()>
     message(socket, b'E', body.as_bytes()).await
 }
 
-fn metadata_description() -> Vec<u8> {
+fn metadata_description(host_type: u32) -> Vec<u8> {
     let columns = [
-        ("host", 25u32, -1i16),
+        ("host", host_type, -1i16),
         ("port", 20, 8),
         ("cloud", 25, -1),
         ("region", 25, -1),
@@ -187,6 +211,50 @@ fn metadata_description() -> Vec<u8> {
         payload.extend_from_slice(&0i16.to_be_bytes());
     }
     payload
+}
+
+/// The row description of the driver's `pg_type` lookup statement.
+fn typeinfo_description() -> Vec<u8> {
+    let columns = [
+        ("typname", 19u32),
+        ("typtype", 18),
+        ("typelem", 26),
+        ("rngsubtype", 26),
+        ("typbasetype", 26),
+        ("nspname", 19),
+        ("typrelid", 26),
+    ];
+    let mut payload = (columns.len() as u16).to_be_bytes().to_vec();
+    for (name, oid) in columns {
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
+        payload.extend_from_slice(&oid.to_be_bytes());
+        payload.extend_from_slice(&(-1i16).to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    payload
+}
+
+/// Splits a NUL-terminated string off the front of a frontend message body.
+fn cstr(body: &[u8]) -> (&[u8], &[u8]) {
+    let end = body.iter().position(|b| *b == 0).expect("NUL-terminated string");
+    (&body[..end], &body[end + 1..])
+}
+
+/// The value of the single binary parameter of a Bind message, if any.
+fn bind_parameter(body: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let (_portal, rest) = cstr(body);
+    let (statement, rest) = cstr(rest);
+    let formats = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    let rest = &rest[2 + 2 * formats..];
+    if u16::from_be_bytes([rest[0], rest[1]]) == 0 {
+        return (statement, None);
+    }
+    let len = i32::from_be_bytes([rest[2], rest[3], rest[4], rest[5]]) as usize;
+    (statement, Some(&rest[6..6 + len]))
 }
 
 fn data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
@@ -228,6 +296,20 @@ async fn session(
         _ => {}
     }
     message(&mut socket, b'R', &0u32.to_be_bytes()).await?;
+    match mode {
+        Behaviour::HugeStartupMessage => {
+            socket.write_u8(b'S').await?;
+            socket.write_u32(1024 * 1024).await?;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            return Ok(());
+        }
+        Behaviour::ParameterFlood => {
+            for i in 0..300 {
+                message(&mut socket, b'S', format!("p{}\0v\0", i).as_bytes()).await?;
+            }
+        }
+        _ => {}
+    }
     message(&mut socket, b'K', &[0, 0, 0, 1, 0, 0, 0, 1]).await?;
     message(&mut socket, b'S', b"client_encoding\0UTF8\0").await?;
     message(&mut socket, b'S', b"server_version\x0015.0\0").await?;
@@ -242,6 +324,9 @@ async fn session(
     let _close = Close(open.clone());
 
     let mut discard_until_sync = false;
+    // Statements naming `pg_type`, and the type OID bound to the open portal.
+    let mut typeinfo_statements = Vec::<Vec<u8>>::new();
+    let mut typeinfo_oid = None;
     loop {
         let tag = match socket.read_u8().await {
             Ok(tag) => tag,
@@ -262,8 +347,16 @@ async fn session(
                 row_description.extend_from_slice(b"node\0");
                 row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255, 0, 0]);
                 message(&mut socket, b'T', &row_description).await?;
-                if *cluster.discovery.lock().unwrap() == Discovery::ShortRows {
+                let discovery = *cluster.discovery.lock().unwrap();
+                if discovery == Discovery::ShortRows {
                     message(&mut socket, b'D', &data_row(&[])).await?;
+                } else if discovery == Discovery::LargeRow {
+                    message(&mut socket, b'D', &data_row(&[Some(&[b'x'; 2000])])).await?;
+                } else if discovery == Discovery::HugeRow {
+                    socket.write_u8(b'D').await?;
+                    socket.write_u32((1 << 30) + 4 + 1).await?;
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    return Ok(());
                 } else {
                     message(&mut socket, b'D', &data_row(&[Some(identity.as_bytes())])).await?;
                 }
@@ -271,6 +364,12 @@ async fn session(
                 message(&mut socket, b'Z', b"I").await?;
             }
             b'P' => {
+                let (name, rest) = cstr(&body);
+                if cstr(rest).0.windows(7).any(|w| w == b"pg_type") {
+                    typeinfo_statements.push(name.to_vec());
+                    message(&mut socket, b'1', &[]).await?;
+                    continue;
+                }
                 cluster.discoveries.fetch_add(1, Ordering::SeqCst);
                 let discovery = *cluster.discovery.lock().unwrap();
                 match discovery {
@@ -291,16 +390,76 @@ async fn session(
                     _ => message(&mut socket, b'1', &[]).await?,
                 }
             }
-            b'D' => {
-                message(&mut socket, b't', &0u16.to_be_bytes()).await?;
-                message(&mut socket, b'T', &metadata_description()).await?;
+            b'D' if typeinfo_statements.iter().any(|name| name[..] == body[1..body.len() - 1]) => {
+                let mut parameters = 1u16.to_be_bytes().to_vec();
+                parameters.extend_from_slice(&26u32.to_be_bytes());
+                message(&mut socket, b't', &parameters).await?;
+                message(&mut socket, b'T', &typeinfo_description()).await?;
             }
-            b'B' => message(&mut socket, b'2', &[]).await?,
+            b'D' => {
+                let host_type = match *cluster.discovery.lock().unwrap() {
+                    Discovery::TypeChain | Discovery::TypeCycle => UNKNOWN_TYPE,
+                    _ => 25,
+                };
+                message(&mut socket, b't', &0u16.to_be_bytes()).await?;
+                message(&mut socket, b'T', &metadata_description(host_type)).await?;
+            }
+            b'B' => {
+                let (statement, parameter) = bind_parameter(&body);
+                typeinfo_oid = match parameter {
+                    Some(oid) if typeinfo_statements.iter().any(|name| name[..] == *statement) => {
+                        Some(u32::from_be_bytes([oid[0], oid[1], oid[2], oid[3]]))
+                    }
+                    _ => None,
+                };
+                message(&mut socket, b'2', &[]).await?
+            }
+            b'E' if typeinfo_oid.is_some() => {
+                let oid = typeinfo_oid.take().unwrap();
+                cluster.type_lookups.fetch_add(1, Ordering::SeqCst);
+                let element = match *cluster.discovery.lock().unwrap() {
+                    Discovery::TypeCycle if oid != UNKNOWN_TYPE => UNKNOWN_TYPE,
+                    _ => oid + 1,
+                };
+                let name = format!("t{}", oid);
+                message(
+                    &mut socket,
+                    b'D',
+                    &data_row(&[
+                        Some(name.as_bytes()),
+                        Some(b"b"),
+                        Some(&element.to_be_bytes()),
+                        None,
+                        Some(&0u32.to_be_bytes()),
+                        Some(b"public"),
+                        Some(&0u32.to_be_bytes()),
+                    ]),
+                )
+                .await?;
+                message(&mut socket, b'C', b"SELECT 1\0").await?;
+            }
             b'E' => {
                 let rows = if *cluster.discovery.lock().unwrap() == Discovery::Empty {
                     Vec::new()
                 } else {
                     cluster.rows.lock().unwrap().clone()
+                };
+                let rows: Vec<NodeRow> = match *cluster.discovery.lock().unwrap() {
+                    // Pad with rows of a node type discovery skips, so only
+                    // the row count differs from a good answer.
+                    Discovery::ManyRows(n) => {
+                        let pad = NodeRow {
+                            node_type: "unsupported",
+                            ..rows[0].clone()
+                        };
+                        let padding = n - rows.len();
+                        rows.into_iter().chain(std::iter::repeat(pad).take(padding)).collect()
+                    }
+                    Discovery::LongZone(n) => rows
+                        .into_iter()
+                        .map(|row| NodeRow { zone: "z".repeat(n), ..row })
+                        .collect(),
+                    _ => rows,
                 };
                 let short = *cluster.discovery.lock().unwrap() == Discovery::ShortRows;
                 for row in &rows {
@@ -914,4 +1073,104 @@ async fn short_data_rows_are_errors_not_panics() {
         .await
         .err()
         .expect("a short simple-query row must be rejected");
+}
+
+/// ASTS-90: the type lookups a statement description triggers are bounded in
+/// depth and refuse cycles, on the driver's own discovery query.
+#[tokio::test]
+async fn unknown_type_chains_and_cycles_are_bounded() {
+    for (mode, most) in [(Discovery::TypeChain, 16), (Discovery::TypeCycle, 2)] {
+        let cluster = Cluster::new("types");
+        let n1 = Node::start(&cluster).await;
+        cluster.publish(&[(&n1, "primary", "z1")]);
+        cluster.set_discovery(mode);
+        let realm = Realm::new("types");
+        let started = Instant::now();
+        connect(&config(&n1, "load_balance=only-primary"), &realm)
+            .await
+            .err()
+            .expect("an unresolvable discovery column type must fail restricted routing closed");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}: {:?}", mode, started.elapsed());
+        let lookups = cluster.type_lookups.load(Ordering::SeqCst);
+        assert!(lookups > 0 && lookups <= most, "{:?}: {} type lookups", mode, lookups);
+        assert!(realm.topology().is_none());
+    }
+}
+
+/// ASTS-90: a backend message larger than the configured limit fails the
+/// connection from its header, without waiting to buffer it; the default
+/// limit admits large legitimate rows.
+#[tokio::test]
+async fn oversized_backend_messages_are_rejected_from_their_header() {
+    let cluster = Cluster::new("frames");
+    let n1 = Node::start(&cluster).await;
+    let direct = config(&n1, "load_balance=false");
+
+    // The default limit (1 GiB, PostgreSQL's own) admits a large row...
+    cluster.set_discovery(Discovery::LargeRow);
+    let (client, connection) = direct.connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client.simple_query("node").await.unwrap();
+
+    // ...while a configured lower limit rejects it.
+    let mut limited = direct.clone();
+    limited.max_message_size(1024);
+    assert_eq!(limited.get_max_message_size(), 1024);
+    let (client, connection) = limited.connect(NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    client.simple_query("node").await.err().expect("a row beyond the configured limit");
+    let e = timeout(Duration::from_secs(1), connection).await.unwrap().unwrap().err().unwrap();
+    assert!(e.to_string().contains("byte limit"), "{}", e);
+
+    // A frame beyond the default limit fails as soon as its header arrives.
+    cluster.set_discovery(Discovery::HugeRow);
+    let (client, connection) = direct.connect(NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    timeout(Duration::from_secs(1), client.simple_query("node"))
+        .await
+        .expect("the oversized frame must be refused from its header")
+        .err()
+        .expect("a frame beyond the default limit");
+    let e = timeout(Duration::from_secs(1), connection).await.unwrap().unwrap().err().unwrap();
+    assert!(e.to_string().contains("byte limit"), "{}", e);
+}
+
+/// ASTS-90: before the session is established, messages are limited to
+/// 128 KiB and the parameter status messages retained are bounded.
+#[tokio::test]
+async fn startup_messages_are_bounded() {
+    let cluster = Cluster::new("startup");
+    let n1 = Node::start(&cluster).await;
+    let direct = config(&n1, "load_balance=false");
+
+    n1.set(Behaviour::HugeStartupMessage);
+    let started = Instant::now();
+    let e = direct.connect(NoTls).await.err().expect("an oversized startup message");
+    assert!(e.to_string().contains("byte limit"), "{}", e);
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+    n1.set(Behaviour::ParameterFlood);
+    let e = direct.connect(NoTls).await.err().expect("a parameter status flood");
+    assert!(e.to_string().contains("too many parameter status"), "{}", e);
+}
+
+/// ASTS-90: a discovery answer with more rows, or longer fields, than any
+/// real cluster reports is an invalid snapshot, not a topology.
+#[tokio::test]
+async fn oversized_discovery_answers_are_rejected() {
+    for (mode, accepted) in [
+        (Discovery::ManyRows(4096), true),
+        (Discovery::ManyRows(4097), false),
+        (Discovery::LongZone(1024), true),
+        (Discovery::LongZone(1025), false),
+    ] {
+        let cluster = Cluster::new("oversized");
+        let n1 = Node::start(&cluster).await;
+        cluster.publish(&[(&n1, "primary", "z1")]);
+        cluster.set_discovery(mode);
+        let realm = Realm::new("oversized");
+        let result = connect(&config(&n1, "load_balance=only-primary"), &realm).await;
+        assert_eq!(result.is_ok(), accepted, "{:?}", mode);
+        assert_eq!(realm.topology().is_some(), accepted, "{:?}", mode);
+    }
 }
