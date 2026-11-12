@@ -198,6 +198,16 @@ impl Row {
         let range = self.ranges[idx].to_owned()?;
         Some(&self.body.buffer()[range])
     }
+
+    /// The length in bytes of the longest non-NULL field in this row.
+    pub(crate) fn max_field_len(&self) -> usize {
+        self.ranges
+            .iter()
+            .flatten()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl AsName for SimpleColumn {

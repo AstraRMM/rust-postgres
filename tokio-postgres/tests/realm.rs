@@ -59,6 +59,10 @@ enum Discovery {
     /// The simple-query reply announces a row beyond the default 1 GiB
     /// message limit, then stalls.
     HugeRow,
+    /// Discovery pads the published rows to this many rows.
+    ManyRows(usize),
+    /// Discovery reports every zone with this many bytes.
+    LongZone(usize),
 }
 
 /// The first unknown type OID the `TypeChain`/`TypeCycle` fixtures report.
@@ -439,6 +443,23 @@ async fn session(
                     Vec::new()
                 } else {
                     cluster.rows.lock().unwrap().clone()
+                };
+                let rows: Vec<NodeRow> = match *cluster.discovery.lock().unwrap() {
+                    // Pad with rows of a node type discovery skips, so only
+                    // the row count differs from a good answer.
+                    Discovery::ManyRows(n) => {
+                        let pad = NodeRow {
+                            node_type: "unsupported",
+                            ..rows[0].clone()
+                        };
+                        let padding = n - rows.len();
+                        rows.into_iter().chain(std::iter::repeat(pad).take(padding)).collect()
+                    }
+                    Discovery::LongZone(n) => rows
+                        .into_iter()
+                        .map(|row| NodeRow { zone: "z".repeat(n), ..row })
+                        .collect(),
+                    _ => rows,
                 };
                 let short = *cluster.discovery.lock().unwrap() == Discovery::ShortRows;
                 for row in &rows {
@@ -1131,4 +1152,25 @@ async fn startup_messages_are_bounded() {
     n1.set(Behaviour::ParameterFlood);
     let e = direct.connect(NoTls).await.err().expect("a parameter status flood");
     assert!(e.to_string().contains("too many parameter status"), "{}", e);
+}
+
+/// ASTS-90: a discovery answer with more rows, or longer fields, than any
+/// real cluster reports is an invalid snapshot, not a topology.
+#[tokio::test]
+async fn oversized_discovery_answers_are_rejected() {
+    for (mode, accepted) in [
+        (Discovery::ManyRows(4096), true),
+        (Discovery::ManyRows(4097), false),
+        (Discovery::LongZone(1024), true),
+        (Discovery::LongZone(1025), false),
+    ] {
+        let cluster = Cluster::new("oversized");
+        let n1 = Node::start(&cluster).await;
+        cluster.publish(&[(&n1, "primary", "z1")]);
+        cluster.set_discovery(mode);
+        let realm = Realm::new("oversized");
+        let result = connect(&config(&n1, "load_balance=only-primary"), &realm).await;
+        assert_eq!(result.is_ok(), accepted, "{:?}", mode);
+        assert_eq!(realm.topology().is_some(), accepted, "{:?}", mode);
+    }
 }
