@@ -4,9 +4,10 @@
 mod common;
 
 use common::*;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use yb_postgres_pool::yb_tokio_postgres::NoTls;
-use yb_postgres_pool::{ErrorKind, Pool, PoolConfig};
+use yb_postgres_pool::yb_tokio_postgres::{NoTls, TransactionStatus};
+use yb_postgres_pool::{ErrorKind, Pool, PoolConfig, TransactionOptions};
 
 /// An unbounded drain does not overflow the deadline: shutdown waits for
 /// the borrowed client and returns once it comes back.
@@ -82,5 +83,69 @@ async fn version_mismatch_text_outside_its_sqlstates_is_not_stale() {
         assert_eq!(stats.statement_invalidations, 0, "{stats:?}");
         drop(client);
         pool.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+/// A `transaction()` / `build_transaction()` future dropped after `BEGIN`
+/// was sent queues a `ROLLBACK`, so the borrower's later statements run in
+/// autocommit instead of inside an orphaned transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_begin_rolls_back() {
+    for e in engines() {
+        let app = format!("pt_avail_begin_{}", e.name);
+        let admin = e.admin().await;
+        let table = format!("pool_avail_begin_{}", e.name);
+        admin
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id int PRIMARY KEY)"
+            ))
+            .await
+            .unwrap();
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+        let mut client = pool.get().await.unwrap();
+        for (id, options) in [
+            (1, None),
+            (2, Some(TransactionOptions::default().read_only(false))),
+        ] {
+            wire.hold_replies.store(true, Ordering::SeqCst);
+            let abandoned = match options {
+                None => tokio::time::timeout(Duration::from_millis(200), client.transaction())
+                    .await
+                    .map(|_| ()),
+                Some(options) => tokio::time::timeout(
+                    Duration::from_millis(200),
+                    client.build_transaction(options),
+                )
+                .await
+                .map(|_| ()),
+            };
+            assert!(abandoned.is_err(), "BEGIN was sent and its reply held");
+            wire.hold_replies.store(false, Ordering::SeqCst);
+            client.client().wait_until_settled().await;
+            assert_eq!(
+                client.transaction_status(),
+                TransactionStatus::Idle,
+                "the abandoned BEGIN was rolled back"
+            );
+            client
+                .execute(&format!("INSERT INTO {table} VALUES ($1)"), &[&id])
+                .await
+                .unwrap();
+        }
+        drop(client);
+        let n: i64 = admin
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2, "both inserts committed in autocommit");
+        pool.shutdown(Duration::from_secs(1)).await;
+        admin
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await
+            .unwrap();
     }
 }
