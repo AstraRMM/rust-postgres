@@ -258,9 +258,6 @@ pub(crate) struct Shared<T: PoolTls> {
     rebalance_pending: AtomicBool,
     /// Bumped by every return of a departed or fallback-tier session.
     rebalance_requests: AtomicU64,
-    /// Replacements opened by a sweep and not yet matched by the retirement
-    /// of a departed or fallback-tier session.
-    retire_credits: AtomicU64,
     /// Serializes sweeps so concurrent passes cannot spend the same surplus.
     sweep_lock: tokio::sync::Mutex<()>,
     /// When the oldest idle session a sweep returned reaches `idle_timeout`
@@ -548,22 +545,13 @@ impl<T: PoolTls> Shared<T> {
         if conn.generation.is_some_and(|g| !self.tls.is_current(g)) {
             return Err(Retire::SupersededTls);
         }
-        let reason = match client.node_standing() {
+        match client.node_standing() {
             NodeStanding::Ineligible => return Err(Retire::Topology),
-            NodeStanding::Departed => Retire::Topology,
-            NodeStanding::Fallback => Retire::Rebalanced,
-            _ => return Ok(!reusable(client)),
-        };
-        let credit = self
-            .retire_credits
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        if !sweeping() {
-            self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
-            self.rebalance_pending.store(true, Ordering::SeqCst);
-        }
-        if credit {
-            return Err(reason);
+            NodeStanding::Departed | NodeStanding::Fallback if !sweeping() => {
+                self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
+                self.rebalance_pending.store(true, Ordering::SeqCst);
+            }
+            _ => {}
         }
         Ok(!reusable(client))
     }
@@ -921,7 +909,6 @@ impl<T: PoolTls> Pool<T> {
             swept: Mutex::new(None),
             rebalance_pending: AtomicBool::new(false),
             rebalance_requests: AtomicU64::new(0),
-            retire_credits: AtomicU64::new(0),
             sweep_lock: tokio::sync::Mutex::new(()),
             idle_deadline: Mutex::new(None),
             rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
@@ -1199,12 +1186,15 @@ impl<T: PoolTls> Pool<T> {
             .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
         let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
         let changed = digest.is_some() && *shared.swept.lock() != digest;
-        let surplus = self
-            .inner
-            .pool
-            .state()
+        let state = self.inner.pool.state();
+        let surplus = state
             .connections
-            .saturating_sub(shared.config.warm_floor);
+            .saturating_sub(shared.config.warm_floor)
+            .min(
+                state
+                    .idle_connections
+                    .saturating_sub(shared.config.min_idle.unwrap_or(0)),
+            );
         let retry = shared.rebalance_pending.load(Ordering::SeqCst)
             && (surplus > 0
                 || (Instant::now() >= shared.rebalance_retry.lock().0
@@ -1226,21 +1216,10 @@ impl<T: PoolTls> Pool<T> {
             *shared.rebalance_retry.lock() = (Instant::now(), REBALANCE_BACKOFF_MIN);
         }
         let requests = shared.rebalance_requests.load(Ordering::SeqCst);
-        shared.retire_credits.store(0, Ordering::SeqCst);
         let need = SWEEPING
             .scope((), async {
                 let held = self.take_idle().await;
-                let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
-                let idle_spare = (held.len() as u32 - retiring)
-                    .saturating_sub(shared.config.min_idle.unwrap_or(0));
-                let mut surplus = self
-                    .inner
-                    .pool
-                    .state()
-                    .connections
-                    .saturating_sub(retiring)
-                    .saturating_sub(shared.config.warm_floor)
-                    .min(idle_spare);
+                let mut surplus = self.retireable(&held);
                 let mut need = 0u64;
                 let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
                     held.iter()
@@ -1297,14 +1276,24 @@ impl<T: PoolTls> Pool<T> {
                 }
             }
             if opened > 0 {
-                shared.retire_credits.store(opened, Ordering::SeqCst);
                 SWEEPING
                     .scope((), async {
-                        for conn in self.take_idle().await {
-                            if shared.retire_credits.load(Ordering::SeqCst) == 0 {
+                        let held = self.take_idle().await;
+                        let mut budget = opened.min(self.retireable(&held) as u64);
+                        for mut conn in held {
+                            if budget == 0 {
                                 break;
                             }
-                            drop(conn);
+                            if conn.retire.is_some() {
+                                continue;
+                            }
+                            let reason = match conn.client.node_standing() {
+                                NodeStanding::Fallback => Retire::Rebalanced,
+                                NodeStanding::Departed => Retire::Topology,
+                                _ => continue,
+                            };
+                            conn.retire = Some(reason);
+                            budget -= 1;
                         }
                     })
                     .await;
@@ -1326,6 +1315,19 @@ impl<T: PoolTls> Pool<T> {
         if digest.is_some() {
             *shared.swept.lock() = digest;
         }
+    }
+
+    /// How many of the held idle sessions can be closed without a
+    /// replacement: what exceeds both the warm floor (all connections) and
+    /// the `min_idle` reserve (idle connections).
+    fn retireable(&self, held: &[bb8::PooledConnection<'_, Manager<T>>]) -> u32 {
+        let config = &self.inner.shared.config;
+        let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
+        let idle = held.len() as u32 - retiring;
+        let total = self.inner.pool.state().connections.saturating_sub(retiring);
+        total
+            .saturating_sub(config.warm_floor)
+            .min(idle.saturating_sub(config.min_idle.unwrap_or(0)))
     }
 
     /// Checks out every idle connection without waiting. bb8 discards the
@@ -1375,7 +1377,7 @@ impl<T: PoolTls> Pool<T> {
             let state = self.inner.pool.state();
             let opening = shared.opening.load(Ordering::SeqCst) as u32;
             let have = state.connections + opening;
-            let idle = state.idle_connections + opening;
+            let idle = state.idle_connections;
             let short_of_idle = idle < min_idle && have < shared.config.max_size;
             if have >= floor && !short_of_idle {
                 shared.stats.warm_deficit.store(0, Ordering::Relaxed);
