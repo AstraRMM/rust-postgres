@@ -1,15 +1,16 @@
 #!/bin/bash
 # Single-node YugabyteDB universe bound to one loopback address, with
-# client-to-server TLS from the fixture PKI.
-# usage: yb-entry.sh <bind-ip> <node-cert-name> <port-offset>
+# client-to-server TLS from the fixture PKI. The role qual_scram must
+# authenticate with SCRAM-SHA-256; every other role is trusted over TLS.
+# usage: yb-entry.sh <bind-ip> <node-cert-name> <port-offset> [ca-cert-name]
 set -euo pipefail
-ip=$1 node=$2 off=$3
+ip=$1 node=$2 off=$3 ca=${4:-ca-a}
 mkdir -p /certs
 for name in yb "$ip"; do
   cp "/fixtures/$node.crt" "/certs/node.$name.crt"
   cp "/fixtures/$node.key" "/certs/node.$name.key"
 done
-cp /fixtures/ca-a.crt /certs/ca.crt
+cp "/fixtures/$ca.crt" /certs/ca.crt
 chmod 600 /certs/*.key
 bin=/home/yugabyte/bin
 placement=(--placement_cloud=qual --placement_region="realm$off" --placement_zone=z1)
@@ -22,7 +23,7 @@ placement=(--placement_cloud=qual --placement_region="realm$off" --placement_zon
   --cql_proxy_bind_address="$ip:9042" --cql_proxy_webserver_port=$((12000 + off)) \
   --redis_proxy_webserver_port=$((11000 + off)) --start_redis_proxy=false \
   --use_client_to_server_encryption=true --certs_for_client_dir=/certs \
-  --ysql_hba_conf_csv='hostssl all all all trust,host all all all reject' \
+  --ysql_hba_conf_csv='hostssl all qual_scram all scram-sha-256,hostssl all all all trust,host all all all reject' \
   "${placement[@]}" &
 wait -n
 exit 1

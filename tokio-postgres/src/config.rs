@@ -88,6 +88,90 @@ pub enum ChannelBinding {
     Require,
 }
 
+/// An authentication method the server may ask the client to use, as named by
+/// the `require_auth` connection option.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AuthMethod {
+    /// The server accepts the session without asking for a credential
+    /// (a bare `AuthenticationOk`, for example `trust` authentication).
+    None,
+    /// The server asks for the password in cleartext.
+    Password,
+    /// The server asks for an MD5 hash of the password.
+    Md5,
+    /// The server runs a SCRAM-SHA-256 exchange, with or without channel
+    /// binding (`SCRAM-SHA-256-PLUS`).
+    ScramSha256,
+}
+
+impl AuthMethod {
+    const ALL: [AuthMethod; 4] = [
+        AuthMethod::None,
+        AuthMethod::Password,
+        AuthMethod::Md5,
+        AuthMethod::ScramSha256,
+    ];
+
+    /// The `require_auth` name of the method.
+    pub fn name(self) -> &'static str {
+        match self {
+            AuthMethod::None => "none",
+            AuthMethod::Password => "password",
+            AuthMethod::Md5 => "md5",
+            AuthMethod::ScramSha256 => "scram-sha-256",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<AuthMethod> {
+        AuthMethod::ALL.iter().copied().find(|m| m.name() == name)
+    }
+}
+
+impl fmt::Display for AuthMethod {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.write_str(self.name())
+    }
+}
+
+/// Parses a libpq-style `require_auth` value: a comma-separated list of
+/// methods the server may use, or a list of methods it may not use when every
+/// entry is prefixed with `!`. An empty value means no restriction.
+fn parse_require_auth(value: &str) -> Result<Option<Vec<AuthMethod>>, Error> {
+    let invalid = || Error::config_parse(Box::new(InvalidValue("require_auth")));
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let negated = value.starts_with('!');
+    let mut listed = Vec::new();
+    for entry in value.split(',') {
+        let name = match (negated, entry.strip_prefix('!')) {
+            (true, Some(name)) => name,
+            (false, None) => entry,
+            // libpq refuses to mix allowed and forbidden methods.
+            _ => return Err(invalid()),
+        };
+        let method = AuthMethod::from_name(name).ok_or_else(invalid)?;
+        if listed.contains(&method) {
+            return Err(invalid());
+        }
+        listed.push(method);
+    }
+    let allowed: Vec<AuthMethod> = if negated {
+        AuthMethod::ALL
+            .iter()
+            .copied()
+            .filter(|m| !listed.contains(m))
+            .collect()
+    } else {
+        listed
+    };
+    if allowed.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(allowed))
+}
+
 /// Load balancing configuration.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -175,6 +259,11 @@ pub enum Host {
 /// * `channel_binding` - Controls usage of channel binding in the authentication process. If set to `disable`, channel
 ///     binding will not be used. If set to `prefer`, channel binding will be used if available, but not used otherwise.
 ///     If set to `require`, the authentication process will fail if channel binding is not used. Defaults to `prefer`.
+/// * `require_auth` - A comma-separated list of the authentication methods the server may request: `scram-sha-256`
+///     (with or without channel binding), `md5`, `password` (cleartext) and `none` (the server skips authentication).
+///     If every entry is prefixed with `!` the list instead names the methods the server may not request. Any other
+///     request fails the connection before a credential is sent. Defaults to no restriction; services that
+///     authenticate with SCRAM should set `require_auth=scram-sha-256`.
 /// * `load_balance_hosts` - Controls the order in which the client tries to connect to the available hosts and
 ///     addresses. Once a connection attempt is successful no other hosts and addresses will be tried. This parameter
 ///     is typically used in combination with multiple host names or a DNS record that returns multiple IPs. If set to
@@ -272,6 +361,7 @@ pub struct Config {
     pub(crate) keepalive_config: KeepaliveConfig,
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
+    pub(crate) require_auth: Option<Vec<AuthMethod>>,
     pub(crate) load_balance_hosts: LoadBalanceHosts,
     /// YugabyteDB Specific
     pub(crate) load_balance: String,
@@ -322,6 +412,7 @@ impl Config {
             },
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
+            require_auth: None,
             load_balance_hosts: LoadBalanceHosts::Disable,
             load_balance: String::from("false"),
             topology_keys: HashMap::new(),
@@ -659,6 +750,21 @@ impl Config {
     /// Gets the channel binding behavior.
     pub fn get_channel_binding(&self) -> ChannelBinding {
         self.channel_binding
+    }
+
+    /// Sets the authentication methods the server may request.
+    ///
+    /// Any other request fails the connection before a credential is sent.
+    /// `None` (the default) places no restriction; an empty list allows no
+    /// method at all.
+    pub fn require_auth(&mut self, methods: Option<&[AuthMethod]>) -> &mut Config {
+        self.require_auth = methods.map(<[AuthMethod]>::to_vec);
+        self
+    }
+
+    /// Gets the authentication methods the server may request, if restricted.
+    pub fn get_require_auth(&self) -> Option<&[AuthMethod]> {
+        self.require_auth.as_deref()
     }
 
     /// Sets the host load balancing behavior.
@@ -1025,6 +1131,9 @@ impl Config {
                 };
                 self.channel_binding(channel_binding);
             }
+            "require_auth" => {
+                self.require_auth = parse_require_auth(value)?;
+            }
             "load_balance_hosts" => {
                 let load_balance_hosts = match value {
                     "disable" => LoadBalanceHosts::Disable,
@@ -1228,6 +1337,7 @@ impl fmt::Debug for Config {
         config_dbg
             .field("target_session_attrs", &self.target_session_attrs)
             .field("channel_binding", &self.channel_binding)
+            .field("require_auth", &self.require_auth)
             .finish()
     }
 }

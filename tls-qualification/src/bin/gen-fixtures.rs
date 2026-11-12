@@ -5,7 +5,7 @@
 
 use rcgen::{
     date_time_ymd, Certificate, CertificateParams, ExtendedKeyUsagePurpose, KeyPair,
-    KeyUsagePurpose, SanType, SerialNumber,
+    KeyUsagePurpose, SanType, SerialNumber, PKCS_RSA_SHA256,
 };
 use std::fs;
 use std::net::IpAddr;
@@ -19,7 +19,16 @@ struct Ca {
 }
 
 fn ca(cn: &str) -> Ca {
-    let key = KeyPair::generate().unwrap();
+    ca_with_key(cn, KeyPair::generate().unwrap())
+}
+
+/// An RSA-2048 key: certificates it signs carry `sha256WithRSAEncryption`,
+/// whose `tls-server-end-point` channel binding hashes with SHA-256.
+fn rsa_key() -> KeyPair {
+    KeyPair::generate_for(&PKCS_RSA_SHA256).unwrap()
+}
+
+fn ca_with_key(cn: &str, key: KeyPair) -> Ca {
     let cert = ca_params(cn, None).self_signed(&key).unwrap();
     Ca { cert, key }
 }
@@ -45,6 +54,18 @@ fn leaf(
     client: bool,
     validity: (OffsetDateTime, OffsetDateTime),
 ) -> (Certificate, KeyPair) {
+    leaf_with_key(issuer, cn, sans, serial, client, validity, KeyPair::generate().unwrap())
+}
+
+fn leaf_with_key(
+    issuer: &Ca,
+    cn: &str,
+    sans: &[San<'_>],
+    serial: u64,
+    client: bool,
+    validity: (OffsetDateTime, OffsetDateTime),
+    key: KeyPair,
+) -> (Certificate, KeyPair) {
     let mut params = CertificateParams::default();
     params.distinguished_name = name(cn);
     params.subject_alt_names = sans
@@ -63,7 +84,6 @@ fn leaf(
     }];
     params.not_before = validity.0;
     params.not_after = validity.1;
-    let key = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key, &issuer.cert, &issuer.key).unwrap();
     (cert, key)
 }
@@ -114,6 +134,29 @@ fn main() {
         &dir,
         "yb-b",
         &leaf(&ca_a, "yb-b.test", &[San::Dns("yb-b.test")], 3002, false, current),
+    );
+
+    // An all-RSA chain: RSA CA, RSA leaves signed with sha256WithRSAEncryption.
+    let ca_rsa = ca_with_key("qualification CA RSA", rsa_key());
+    write(&dir, "ca-rsa.crt", &ca_rsa.cert.pem());
+    write_pair(
+        &dir,
+        "server-rsa",
+        &leaf_with_key(&ca_rsa, "pg.test", &pg_sans, 5001, false, current, rsa_key()),
+    );
+    // YugabyteDB universe C advertises 127.0.0.4 and serves an RSA certificate.
+    write_pair(
+        &dir,
+        "yb-c-rsa",
+        &leaf_with_key(
+            &ca_rsa,
+            "yb-c.test",
+            &[San::Dns("yb-c.test"), San::Ip("127.0.0.4")],
+            5002,
+            false,
+            current,
+            rsa_key(),
+        ),
     );
 
     write_pair(&dir, "client-postgres", &leaf(&ca_a, "postgres", &[], 4001, true, current));

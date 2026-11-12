@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::runtime;
 #[doc(inline)]
 pub use yb_tokio_postgres::config::{
-    ChannelBinding, Host, LoadBalanceHosts, SslMode, TargetSessionAttrs,
+    AuthMethod, ChannelBinding, Host, LoadBalanceHosts, SslMode, TargetSessionAttrs,
 };
 use yb_tokio_postgres::error::DbError;
 use yb_tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
@@ -76,6 +76,10 @@ use yb_tokio_postgres::{Error, Socket};
 /// * `channel_binding` - Controls usage of channel binding in the authentication process. If set to `disable`, channel
 ///     binding will not be used. If set to `prefer`, channel binding will be used if available, but not used otherwise.
 ///     If set to `require`, the authentication process will fail if channel binding is not used. Defaults to `prefer`.
+/// * `require_auth` - A comma-separated list of the authentication methods the server may request: `scram-sha-256`
+///     (with or without channel binding), `md5`, `password` (cleartext) and `none` (the server skips authentication).
+///     If every entry is prefixed with `!` the list instead names the methods the server may not request. Any other
+///     request fails the connection before a credential is sent. Defaults to no restriction.
 /// * `load_balance_hosts` - Controls the order in which the client tries to connect to the available hosts and
 ///     addresses. Once a connection attempt is successful no other hosts and addresses will be tried. This parameter
 ///     is typically used in combination with multiple host names or a DNS record that returns multiple IPs. If set to
@@ -417,6 +421,20 @@ impl Config {
     /// Gets the channel binding behavior.
     pub fn get_channel_binding(&self) -> ChannelBinding {
         self.config.get_channel_binding()
+    }
+
+    /// Sets the authentication methods the server may request.
+    ///
+    /// Any other request fails the connection before a credential is sent.
+    /// `None` (the default) places no restriction.
+    pub fn require_auth(&mut self, methods: Option<&[AuthMethod]>) -> &mut Config {
+        self.config.require_auth(methods);
+        self
+    }
+
+    /// Gets the authentication methods the server may request, if restricted.
+    pub fn get_require_auth(&self) -> Option<&[AuthMethod]> {
+        self.config.get_require_auth()
     }
 
     /// Sets the host load balancing behavior.
