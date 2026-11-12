@@ -223,9 +223,7 @@ pub struct Client {
     #[cfg(feature = "runtime")]
     lease: Option<Box<dyn std::any::Any + Send + Sync>>,
     #[cfg(feature = "runtime")]
-    placement: Option<(crate::realm::Realm, Arc<crate::Config>, String)>,
-    #[cfg(feature = "runtime")]
-    unlisted_seed: bool,
+    placement: Option<crate::realm::Placement>,
     ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
@@ -252,8 +250,6 @@ impl Client {
             lease: None,
             #[cfg(feature = "runtime")]
             placement: None,
-            #[cfg(feature = "runtime")]
-            unlisted_seed: false,
             ssl_mode,
             process_id,
             secret_key,
@@ -279,18 +275,8 @@ impl Client {
     }
 
     #[cfg(feature = "runtime")]
-    pub(crate) fn set_placement(
-        &mut self,
-        realm: crate::realm::Realm,
-        config: &crate::Config,
-        identity: String,
-    ) {
-        self.placement = Some((realm, Arc::new(config.clone()), identity));
-    }
-
-    #[cfg(feature = "runtime")]
-    pub(crate) fn mark_unlisted_seed(&mut self) {
-        self.unlisted_seed = true;
+    pub(crate) fn set_placement(&mut self, placement: crate::realm::Placement) {
+        self.placement = Some(placement);
     }
 
     /// Where this client's node stands in its realm's current topology
@@ -299,12 +285,7 @@ impl Client {
     #[cfg(feature = "runtime")]
     pub fn node_standing(&self) -> crate::realm::NodeStanding {
         match &self.placement {
-            Some((realm, config, identity)) => match realm.standing(config, identity) {
-                crate::realm::NodeStanding::Departed if self.unlisted_seed => {
-                    crate::realm::NodeStanding::Unknown
-                }
-                standing => standing,
-            },
+            Some(placement) => placement.standing(),
             None => crate::realm::NodeStanding::Unknown,
         }
     }

@@ -1177,6 +1177,38 @@ impl<T: PoolTls> Pool<T> {
             Some(realm) => realm,
             None => return,
         };
+        if !realm.refresh_due(&shared.pg) {
+            return;
+        }
+        let session = SWEEPING
+            .scope((), async {
+                if self.inner.pool.state().idle_connections == 0 {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
+                    Ok(Ok(conn)) if conn.retire.is_none() => Some(conn),
+                    _ => None,
+                }
+            })
+            .await;
+        if let Some(session) = session {
+            let refresh = tokio::time::timeout(
+                shared.config.connect_timeout,
+                realm.refresh_with(&session.client, &shared.pg),
+            );
+            let outcome = tokio::select! {
+                biased;
+                _ = shared.until_closed() => None,
+                outcome = refresh => Some(outcome),
+            };
+            SWEEPING.sync_scope((), || drop(session));
+            match outcome {
+                Some(Ok(Ok(_))) => bump(&shared.stats.topology_refreshes),
+                Some(_) => bump(&shared.stats.topology_refresh_failures),
+                None => {}
+            }
+            return;
+        }
         let permits = match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
             (Ok(pool), Ok(process)) => Permits {
                 _pool: pool,

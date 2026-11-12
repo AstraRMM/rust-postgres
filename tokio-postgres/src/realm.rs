@@ -162,6 +162,27 @@ impl TopologyInfo {
     }
 }
 
+/// The endpoint a connection reached and the selection policy it was made
+/// under, classified against each new snapshot.
+#[derive(Clone)]
+pub(crate) struct Placement {
+    pub(crate) realm: Realm,
+    pub(crate) config: Arc<Config>,
+    /// Candidate identities: the canonical node, and for a seed fallback
+    /// also the configured seed name and dialed address.
+    pub(crate) identities: Vec<String>,
+    pub(crate) port: u16,
+    /// A seed fallback that matches no listed endpoint is unclassified,
+    /// not departed.
+    pub(crate) seed: bool,
+}
+
+impl Placement {
+    pub(crate) fn standing(&self) -> NodeStanding {
+        self.realm.standing_of(self)
+    }
+}
+
 /// Where a connected node stands under a configuration's role and placement
 /// policy in its realm's current snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +364,33 @@ impl Realm {
     /// when it was installed ([`TopologyInfo::epoch`]).
     pub fn topology_epoch(&self) -> u64 {
         self.inner.change_epoch.load(Ordering::SeqCst)
+    }
+
+    fn standing_of(&self, placement: &Placement) -> NodeStanding {
+        let config = &placement.config;
+        if config.load_balance == "false" {
+            return NodeStanding::Unknown;
+        }
+        let topology = match self.inner.snapshot.read().clone() {
+            Some(topology) => topology,
+            None => return NodeStanding::Unknown,
+        };
+        let listed = placement.identities.iter().find(|identity| {
+            topology
+                .nodes
+                .get(identity.as_str())
+                .is_some_and(|node| node.port == placement.port)
+        });
+        match listed {
+            Some(identity) => {
+                let failures = self.failures_within(config.failed_host_reconnect_delay_secs);
+                let public_only =
+                    public_ip_mode_allowed(config) && self.inner.public_mode.load(Ordering::SeqCst);
+                standing_in(config, &topology, &failures, identity, public_only)
+            }
+            None if placement.seed => NodeStanding::Unknown,
+            None => NodeStanding::Departed,
+        }
     }
 
     /// Where `identity` stands under `config`'s selection policy in the
@@ -548,7 +596,13 @@ impl Realm {
                         match outcome {
                             Ok((mut client, connection)) => {
                                 client.set_lease(Box::new(lease));
-                                client.set_placement(self.clone(), config, identity.clone());
+                                client.set_placement(Placement {
+                                    realm: self.clone(),
+                                    config: Arc::new(config.clone()),
+                                    identities: vec![identity.clone()],
+                                    port: node.port,
+                                    seed: false,
+                                });
                                 return Ok((client, connection));
                             }
                             Err(e) => {
@@ -604,15 +658,20 @@ impl Realm {
                 let identity = self.seed_identity(&client, topology.as_deref());
                 if let Some(identity) = identity {
                     client.set_lease(Box::new(self.reserve(&identity)));
-                    let port = client.get_socket_config().map(|socket| socket.port);
-                    let listed = topology.as_deref().is_some_and(|t| {
-                        t.nodes
-                            .get(&identity)
-                            .is_some_and(|node| Some(node.port) == port)
-                    });
-                    client.set_placement(self.clone(), config, identity);
-                    if !listed {
-                        client.mark_unlisted_seed();
+                    if let Some(socket) = client.get_socket_config() {
+                        let mut identities = vec![identity];
+                        identities.extend(socket.node.clone());
+                        if let crate::client::Addr::Tcp(ip) = &socket.addr {
+                            identities.push(ip.to_string());
+                        }
+                        identities.dedup();
+                        client.set_placement(Placement {
+                            realm: self.clone(),
+                            config: Arc::new(config.clone()),
+                            identities,
+                            port: socket.port,
+                            seed: true,
+                        });
                     }
                 }
                 Ok((client, connection))
@@ -718,24 +777,7 @@ impl Realm {
         }
         self.inner.attempt_epoch.fetch_add(1, Ordering::SeqCst);
         match discovered {
-            Ok(Ok(mut topology)) => {
-                {
-                    let mut failures = self.inner.failures.lock();
-                    failures.retain(|identity, _| topology.nodes.contains_key(identity));
-                }
-                let topology = {
-                    let mut current = self.inner.snapshot.write();
-                    topology.epoch = match current.as_ref() {
-                        Some(previous) if previous.nodes == topology.nodes => previous.epoch,
-                        _ => self.inner.change_epoch.fetch_add(1, Ordering::SeqCst) + 1,
-                    };
-                    let topology = Arc::new(topology);
-                    *current = Some(topology.clone());
-                    topology
-                };
-                self.inner.refresh_epoch.fetch_add(1, Ordering::SeqCst);
-                Ok(topology)
-            }
+            Ok(Ok(topology)) => Ok(self.install(topology)),
             Ok(Err(e)) if e.is_security_failure() => Err(e),
             Ok(Err(e)) => self.stale_or(snapshot, config, e),
             Err(_) => self.stale_or(
@@ -746,6 +788,94 @@ impl Realm {
                     "topology discovery exceeded the acquisition budget",
                 )),
             ),
+        }
+    }
+
+    fn install(&self, mut topology: Topology) -> Arc<Topology> {
+        {
+            let mut failures = self.inner.failures.lock();
+            failures.retain(|identity, _| topology.nodes.contains_key(identity));
+        }
+        let topology = {
+            let mut current = self.inner.snapshot.write();
+            topology.epoch = match current.as_ref() {
+                Some(previous) if previous.nodes == topology.nodes => previous.epoch,
+                _ => self.inner.change_epoch.fetch_add(1, Ordering::SeqCst) + 1,
+            };
+            let topology = Arc::new(topology);
+            *current = Some(topology.clone());
+            topology
+        };
+        self.inner.refresh_epoch.fetch_add(1, Ordering::SeqCst);
+        topology
+    }
+
+    /// Whether the snapshot is missing or older than
+    /// [`Config::yb_servers_refresh_interval`].
+    pub fn refresh_due(&self, config: &Config) -> bool {
+        match self.inner.snapshot.read().as_ref() {
+            Some(topology) => {
+                config.yb_servers_refresh_interval == Duration::ZERO
+                    || topology.fetched_at.elapsed() > config.yb_servers_refresh_interval
+            }
+            None => true,
+        }
+    }
+
+    /// Refreshes the snapshot by running `yb_servers()` on `client`, an
+    /// established session of this realm, instead of opening a control
+    /// connection. Coalesces with other refreshes and applies the same
+    /// staleness rules; returns the current snapshot when it is not due.
+    pub async fn refresh_with(&self, client: &Client, config: &Config) -> Result<TopologyInfo, Error> {
+        let snapshot = self.inner.snapshot.read().clone();
+        if !self.refresh_due(config) {
+            if let Some(topology) = &snapshot {
+                return Ok(self.info(topology));
+            }
+        }
+        let _gate = match self.inner.refresh_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return match snapshot {
+                    Some(topology) => Ok(self.info(&topology)),
+                    None => Err(Error::connect(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a topology refresh is already in progress",
+                    ))),
+                }
+            }
+        };
+        let control_host = client
+            .get_socket_config()
+            .and_then(|c| c.hostname)
+            .unwrap_or_default();
+        self.inner.discoveries.fetch_add(1, Ordering::SeqCst);
+        let query = crate::observe::with_class(
+            crate::observe::Class::Discovery,
+            client.query("select * from yb_servers()", &[]),
+        );
+        let outcome = match time::timeout(QUERY_TIMEOUT, query).await {
+            Ok(Ok(rows)) => self.parse_topology(rows, &control_host, config),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "`select * from yb_servers()` did not complete within {:?}",
+                    QUERY_TIMEOUT
+                ),
+            ))),
+        };
+        self.inner.attempt_epoch.fetch_add(1, Ordering::SeqCst);
+        match outcome {
+            Ok(topology) => {
+                *self.inner.last_failure.lock() = None;
+                Ok(self.info(&self.install(topology)))
+            }
+            Err(e) => {
+                *self.inner.last_failure.lock() = Some(error_chain(&e));
+                self.stale_or(snapshot, config, e)
+                    .map(|topology| self.info(&topology))
+            }
         }
     }
 
@@ -903,7 +1033,15 @@ impl Realm {
         };
         drop(client);
         let _ = time::timeout(CONTROL_CONN_CLOSE_TIMEOUT, connection).await;
+        self.parse_topology(rows, &control_host, config)
+    }
 
+    fn parse_topology(
+        &self,
+        rows: Vec<crate::Row>,
+        control_host: &str,
+        config: &Config,
+    ) -> Result<Topology, Error> {
         let mut nodes = BTreeMap::new();
         for row in rows {
             let host: String = row.try_get("host")?;
