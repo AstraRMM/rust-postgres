@@ -243,18 +243,28 @@ impl<T: PoolTls> PoolSet<T> {
             }
             tokio::spawn(async move {
                 let floor = warming.config().warm_floor;
+                let min_idle = warming.config().min_idle.unwrap_or(0);
                 let mut waited = 0u32;
                 let mut before = warming.state().physical;
                 loop {
                     if inner.strong_count() == 0 {
-                        break;
+                        return;
                     }
+                    let failures = warming.state().stats.connect_failures;
                     warming.top_up().await;
-                    let ready = warming.state().physical;
-                    if ready >= floor {
+                    let state = warming.state();
+                    if state.physical >= floor && state.idle >= min_idle {
                         break;
                     }
-                    if ready <= before && waited > 0 && waited < 20 {
+                    if state.stats.connect_failures > failures {
+                        // The new generation cannot connect yet: keep the
+                        // old one serving and retry.
+                        waited = 0;
+                        before = state.physical;
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    if state.physical <= before && waited > 0 && waited < 20 {
                         waited += 1;
                         tokio::time::sleep(interval).await;
                         continue;
@@ -266,10 +276,15 @@ impl<T: PoolTls> PoolSet<T> {
                             break;
                         }
                     }
+                    if !closed && state.physical < floor {
+                        tokio::time::sleep(interval).await;
+                        waited = 0;
+                        continue;
+                    }
                     if !closed {
                         break;
                     }
-                    before = ready;
+                    before = state.physical;
                     waited = 1;
                     tokio::time::sleep(interval).await;
                 }

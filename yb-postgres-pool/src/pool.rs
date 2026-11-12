@@ -497,6 +497,11 @@ impl<T: PoolTls> Shared<T> {
         };
         if let Some(reason) = reason {
             conn.retire = Some(reason);
+            if sweeping() {
+                // Handed to the sweep, which drops it: failing the check
+                // would make bb8 look for (and approve a dial for) another.
+                return Ok(());
+            }
             return Err(PoolError::new(
                 ErrorKind::Transport,
                 format!("connection {} retired at checkout: {:?}", conn.id, reason),
@@ -1228,19 +1233,26 @@ impl<T: PoolTls> Pool<T> {
         let need = SWEEPING
             .scope((), async {
                 let held = self.take_idle().await;
+                let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
                 let mut surplus = self
                     .inner
                     .pool
                     .state()
                     .connections
+                    .saturating_sub(retiring)
                     .saturating_sub(shared.config.warm_floor);
                 let mut need = 0u64;
-                let idle_deadline = shared
-                    .config
-                    .idle_timeout
-                    .and_then(|timeout| held.iter().map(|conn| conn.idle_since + timeout).min());
+                let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
+                    held.iter()
+                        .filter(|conn| conn.retire.is_none())
+                        .map(|conn| conn.idle_since + timeout)
+                        .min()
+                });
                 *shared.idle_deadline.lock() = idle_deadline;
                 for mut conn in held {
+                    if conn.retire.is_some() {
+                        continue;
+                    }
                     let reason = match conn.client.node_standing() {
                         NodeStanding::Fallback => Retire::Rebalanced,
                         NodeStanding::Departed => Retire::Topology,
@@ -1257,14 +1269,18 @@ impl<T: PoolTls> Pool<T> {
             })
             .await;
         let may_replace = Instant::now() >= shared.rebalance_retry.lock().0;
+        let superseded = shared.superseded.load(Ordering::SeqCst);
         let (mut attempted, mut pending) = (false, false);
-        if need > 0 && !may_replace {
+        if need > 0 && !may_replace && !superseded {
             pending = true;
         }
-        if need > 0 && may_replace {
+        if need > 0 && superseded {
+            pending = true;
+        }
+        if need > 0 && may_replace && !superseded {
             attempted = true;
             let mut opened = 0;
-            while opened < need {
+            while opened < need && !shared.superseded.load(Ordering::SeqCst) {
                 let replacement = match self.replacement().await {
                     Some(replacement) => replacement,
                     None => {

@@ -1037,3 +1037,59 @@ async fn min_idle_is_kept_by_maintenance_and_sweeps_open_nothing() {
     drop(held);
     pool.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_new_generation_never_drains_the_old_one() {
+    let cluster = Cluster::new("fg");
+    let (a, bad) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&a, "z1")]);
+    bad.set(Behaviour::Refuse);
+    let realm = Realm::new("failing-generation");
+    let good = driver_config(&a, &realm, "load_balance=true");
+    let broken: Config = format!(
+        "host={} port={} user=test dbname=test sslmode=disable connect_timeout=1",
+        bad.ip, bad.port
+    )
+    .parse()
+    .unwrap();
+    let resolver = move |key: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
+        let pg = if key.credential_generation() == 0 {
+            good.clone()
+        } else {
+            broken.clone()
+        };
+        let mut config = pool_config(2, 3);
+        config.connect_timeout = Duration::from_millis(500);
+        Ok(PoolSpec::new(pg, NoTls, config))
+    };
+    let mut set_config = PoolSetConfig::default();
+    set_config.max_connections = 4;
+    let set = PoolSet::new(set_config, resolver).unwrap();
+    let gen0 = PoolKey::for_realm(&realm, "test", "test");
+    let old = set.pool(&gen0).unwrap();
+    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
+    let new = set
+        .pool(&gen0.clone().with_credential_generation(1))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (old_state, new_state) = (old.state(), new.state());
+    println!(
+        "EVIDENCE failing generation: new pool connect failures={} physical={}; old physical={} closed={}",
+        new_state.stats.connect_failures,
+        new_state.physical,
+        old_state.physical,
+        old.is_closed()
+    );
+    assert!(new_state.stats.connect_failures > 0);
+    assert_eq!(new_state.physical, 0);
+    assert_eq!(
+        old_state.physical, 2,
+        "a failing rotation released working capacity"
+    );
+    assert!(!old.is_closed());
+    assert!(
+        old.get().await.is_ok(),
+        "the old generation still serves its holders"
+    );
+    set.shutdown(Duration::from_secs(1)).await;
+}
