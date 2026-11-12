@@ -178,9 +178,19 @@ impl<'a> PoolTransaction<'a> {
     pub async fn commit(mut self) -> Result<(), PoolError> {
         let tx = self.tx.take().expect("transaction present");
         tx.client().wait_until_settled().await;
-        if tx.client().transaction_status() == TransactionStatus::Failed {
-            let _ = tx.rollback().await;
-            return Err(PoolError::kind_only(ErrorKind::TransactionAborted));
+        match tx.client().transaction_status() {
+            TransactionStatus::Failed => {
+                let _ = tx.rollback().await;
+                return Err(PoolError::kind_only(ErrorKind::TransactionAborted));
+            }
+            TransactionStatus::Unknown => {
+                let _ = tx.rollback().await;
+                return Err(PoolError::new(
+                    ErrorKind::TransactionAborted,
+                    "the server's transaction status is unknown; not committing",
+                ));
+            }
+            _ => {}
         }
         match tx.commit().await {
             Ok(()) => Ok(()),
