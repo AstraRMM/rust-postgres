@@ -42,6 +42,8 @@ enum Discovery {
     Stall,
     Slow(u64),
     SlowError(u64),
+    /// Every DataRow carries fewer fields than its RowDescription announced.
+    ShortRows,
 }
 
 #[derive(Clone, Debug)]
@@ -260,7 +262,11 @@ async fn session(
                 row_description.extend_from_slice(b"node\0");
                 row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255, 0, 0]);
                 message(&mut socket, b'T', &row_description).await?;
-                message(&mut socket, b'D', &data_row(&[Some(identity.as_bytes())])).await?;
+                if *cluster.discovery.lock().unwrap() == Discovery::ShortRows {
+                    message(&mut socket, b'D', &data_row(&[])).await?;
+                } else {
+                    message(&mut socket, b'D', &data_row(&[Some(identity.as_bytes())])).await?;
+                }
                 message(&mut socket, b'C', b"SELECT 1\0").await?;
                 message(&mut socket, b'Z', b"I").await?;
             }
@@ -296,7 +302,12 @@ async fn session(
                 } else {
                     cluster.rows.lock().unwrap().clone()
                 };
+                let short = *cluster.discovery.lock().unwrap() == Discovery::ShortRows;
                 for row in &rows {
+                    if short {
+                        message(&mut socket, b'D', &data_row(&[Some(row.host.as_bytes())])).await?;
+                        continue;
+                    }
                     let port = (row.port as i64).to_be_bytes();
                     message(
                         &mut socket,
@@ -807,4 +818,31 @@ async fn disabled_load_balancing_does_not_attempt_discovery() {
     tokio::spawn(connection);
     assert_eq!(cluster.discoveries.load(Ordering::SeqCst), 0);
     drop(client);
+}
+
+/// ASTS-83 (RUSTSEC-2026-0178): a DataRow with fewer fields than the row
+/// description is a protocol error, not an out-of-bounds panic, on both the
+/// extended path (the discovery query) and the simple-query path.
+#[tokio::test]
+async fn short_data_rows_are_errors_not_panics() {
+    let cluster = Cluster::new("short");
+    let n1 = Node::start(&cluster).await;
+    cluster.publish(&[(&n1, "primary", "z1")]);
+    cluster.set_discovery(Discovery::ShortRows);
+
+    let realm = Realm::new("short-discovery");
+    connect(&config(&n1, "load_balance=only-primary"), &realm)
+        .await
+        .err()
+        .expect("a short discovery row must fail restricted routing closed");
+    assert!(realm.topology().is_none());
+
+    let realm = Realm::new("short-simple");
+    let session = connect(&config(&n1, "load_balance=false"), &realm).await.unwrap();
+    session
+        .client
+        .simple_query("select 1")
+        .await
+        .err()
+        .expect("a short simple-query row must be rejected");
 }
