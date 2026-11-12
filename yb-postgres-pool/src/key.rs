@@ -9,7 +9,8 @@ use yb_tokio_postgres::realm::Realm;
 /// A pool is keyed by the realm and the database, role, credential and
 /// configuration identities that determine what its sessions are allowed to
 /// do. A new credential or configuration generation is a new key (and a new
-/// pool); the superseded pool drains and is evicted once idle. Resource
+/// pool); when the set creates it, pools of older generations of the same
+/// identity are retired once the new one has warmed. Resource
 /// routing changes inside a realm are *not* part of the key: the driver
 /// selects nodes, the pool only owns client lifecycle.
 ///
@@ -110,6 +111,21 @@ impl PoolKey {
     /// The discriminator, if any.
     pub fn discriminator(&self) -> Option<&str> {
         self.discriminator.as_deref()
+    }
+
+    /// Whether `self` is a newer generation of the same realm, incarnation,
+    /// database, role and discriminator as `older`: neither generation is
+    /// lower and at least one is higher.
+    pub fn supersedes(&self, older: &PoolKey) -> bool {
+        self.realm == older.realm
+            && self.incarnation == older.incarnation
+            && self.database == older.database
+            && self.role == older.role
+            && self.discriminator == older.discriminator
+            && self.credential_generation >= older.credential_generation
+            && self.config_generation >= older.config_generation
+            && (self.credential_generation, self.config_generation)
+                != (older.credential_generation, older.config_generation)
     }
 }
 

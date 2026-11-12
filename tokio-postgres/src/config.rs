@@ -1135,6 +1135,20 @@ impl Config {
         crate::observe::with_class(crate::observe::Class::SessionSetup, setup).await
     }
 
+    /// The realm this configuration's load-balanced connections use: the
+    /// explicit [`realm`](Self::realm) or the implicit one for its trusted
+    /// endpoints. `None` when load balancing is off.
+    #[cfg(feature = "runtime")]
+    pub fn resolved_realm(&self) -> Option<Realm> {
+        if self.load_balance == "false" {
+            return None;
+        }
+        Some(match &self.realm {
+            Some(realm) => realm.clone(),
+            None => Realm::for_config(self),
+        })
+    }
+
     /// Connects to a PostgreSQL database over an arbitrary stream.
     ///
     /// All of the settings other than `user`, `password`, `dbname`, `options`, and `application_name` name are ignored.

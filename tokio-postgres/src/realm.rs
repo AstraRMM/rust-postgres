@@ -140,6 +140,7 @@ pub(crate) struct Topology {
 pub struct TopologyInfo {
     nodes: Vec<NodeInfo>,
     age: Duration,
+    epoch: u64,
 }
 
 impl TopologyInfo {
@@ -152,6 +153,29 @@ impl TopologyInfo {
     pub fn age(&self) -> Duration {
         self.age
     }
+
+    /// The realm's [`topology_epoch`](Realm::topology_epoch) when this
+    /// snapshot was read.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Where a connected node stands under a configuration's role and placement
+/// policy in its realm's current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NodeStanding {
+    /// In the best preference tier that has an available node.
+    Preferred,
+    /// Eligible, but a better preference tier has an available node again.
+    Fallback,
+    /// Gone from the topology, or excluded by admission, role or strict
+    /// placement.
+    Ineligible,
+    /// Load balancing is off, the realm has no snapshot, or the connection
+    /// has no node identity.
+    Unknown,
 }
 
 struct RealmInner {
@@ -159,6 +183,7 @@ struct RealmInner {
     snapshot: RwLock<Option<Arc<Topology>>>,
     refresh_gate: tokio::sync::Mutex<()>,
     refresh_epoch: AtomicU64,
+    change_epoch: AtomicU64,
     attempt_epoch: AtomicU64,
     last_failure: Mutex<Option<String>>,
     discoveries: AtomicU64,
@@ -225,6 +250,7 @@ impl Realm {
                 snapshot: RwLock::new(None),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 refresh_epoch: AtomicU64::new(0),
+                change_epoch: AtomicU64::new(0),
                 attempt_epoch: AtomicU64::new(0),
                 last_failure: Mutex::new(None),
                 discoveries: AtomicU64::new(0),
@@ -296,10 +322,56 @@ impl Realm {
 
     /// The current topology snapshot, if any.
     pub fn topology(&self) -> Option<TopologyInfo> {
-        self.inner.snapshot.read().as_ref().map(|t| TopologyInfo {
-            nodes: t.nodes.values().cloned().collect(),
-            age: t.fetched_at.elapsed(),
-        })
+        self.inner.snapshot.read().as_ref().map(|t| self.info(t))
+    }
+
+    fn info(&self, topology: &Topology) -> TopologyInfo {
+        TopologyInfo {
+            nodes: topology.nodes.values().cloned().collect(),
+            age: topology.fetched_at.elapsed(),
+            epoch: self.topology_epoch(),
+        }
+    }
+
+    /// Number of refreshes whose snapshot differed in nodes or metadata
+    /// from the one it replaced (including the first snapshot, and a
+    /// snapshot after one was discarded).
+    pub fn topology_epoch(&self) -> u64 {
+        self.inner.change_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Where `identity` stands under `config`'s selection policy in the
+    /// current snapshot. Reads local state only.
+    pub fn standing(&self, config: &Config, identity: &str) -> NodeStanding {
+        if config.load_balance == "false" {
+            return NodeStanding::Unknown;
+        }
+        let topology = match self.inner.snapshot.read().clone() {
+            Some(topology) => topology,
+            None => return NodeStanding::Unknown,
+        };
+        let failures = self.failures(config.failed_host_reconnect_delay_secs);
+        standing_in(config, &topology, &failures, identity)
+    }
+
+    /// Refreshes the snapshot if it is older than
+    /// [`Config::yb_servers_refresh_interval`], within
+    /// [`Config::yb_acquire_timeout`], with the same coalescing and staleness
+    /// rules as an acquisition. Lets an idle pool notice topology changes
+    /// without opening a connection.
+    pub async fn refresh<T>(&self, mut tls: T, config: &Config) -> Result<TopologyInfo, Error>
+    where
+        T: MakeTlsConnect<Socket>,
+    {
+        if self.is_shut_down() {
+            return Err(Error::connect(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the realm has been shut down",
+            )));
+        }
+        let deadline = Instant::now() + config.yb_acquire_timeout;
+        let topology = self.current_topology(&mut tls, config, deadline).await?;
+        Ok(self.info(&topology))
     }
 
     /// Forces the next acquisition to refresh the topology.
@@ -316,6 +388,16 @@ impl Realm {
             .filter(|(_, n)| **n > 0)
             .map(|(k, v)| (k.clone(), *v))
             .collect()
+    }
+
+    /// Nodes quarantined under `config`'s reconnect delay, sorted.
+    pub fn quarantined(&self, config: &Config) -> Vec<String> {
+        let mut nodes: Vec<String> = self
+            .failures(config.failed_host_reconnect_delay_secs)
+            .into_keys()
+            .collect();
+        nodes.sort();
+        nodes
     }
 
     /// Nodes currently quarantined after transport failures.
@@ -447,6 +529,7 @@ impl Realm {
                         match outcome {
                             Ok((mut client, connection)) => {
                                 client.set_lease(Box::new(lease));
+                                client.set_placement(self.clone(), config);
                                 return Ok((client, connection));
                             }
                             Err(e) => {
@@ -502,6 +585,7 @@ impl Realm {
                 let identity = self.seed_identity(&client, topology.as_deref());
                 if let Some(identity) = identity {
                     client.set_lease(Box::new(self.reserve(&identity)));
+                    client.set_placement(self.clone(), config);
                 }
                 Ok((client, connection))
             }
@@ -612,7 +696,13 @@ impl Realm {
                     let mut failures = self.inner.failures.lock();
                     failures.retain(|identity, _| topology.nodes.contains_key(identity));
                 }
-                *self.inner.snapshot.write() = Some(topology.clone());
+                {
+                    let mut current = self.inner.snapshot.write();
+                    if current.as_ref().map(|t| &t.nodes) != Some(&topology.nodes) {
+                        self.inner.change_epoch.fetch_add(1, Ordering::SeqCst);
+                    }
+                    *current = Some(topology.clone());
+                }
                 self.inner.refresh_epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(topology)
             }
@@ -890,6 +980,102 @@ fn classify(e: &Error) -> AttemptFailure {
     }
 }
 
+struct Policy<'a> {
+    role_tiers: Vec<&'static [NodeRole]>,
+    placement_tiers: Vec<Option<&'a Vec<String>>>,
+    strict_placement: bool,
+}
+
+impl<'a> Policy<'a> {
+    fn new(config: &'a Config) -> Policy<'a> {
+        use NodeRole::{Primary, ReadReplica};
+        const PRIMARY: &[NodeRole] = &[Primary];
+        const REPLICA: &[NodeRole] = &[ReadReplica];
+        const ANY: &[NodeRole] = &[Primary, ReadReplica];
+        let role_tiers: Vec<&'static [NodeRole]> = match config.load_balance.as_str() {
+            "only-primary" => vec![PRIMARY],
+            "only-rr" => vec![REPLICA],
+            "prefer-primary" => vec![PRIMARY, REPLICA],
+            "prefer-rr" => vec![REPLICA, PRIMARY],
+            _ => vec![ANY],
+        };
+        let mut priorities: Vec<&i64> = config.topology_keys.keys().collect();
+        priorities.sort();
+        let mut placement_tiers: Vec<Option<&Vec<String>>> =
+            priorities.into_iter().map(|p| config.topology_keys.get(p)).collect();
+        let strict_placement = !placement_tiers.is_empty() && config.fallback_to_topology_keys_only;
+        if !strict_placement {
+            placement_tiers.push(None);
+        }
+        Policy {
+            role_tiers,
+            placement_tiers,
+            strict_placement,
+        }
+    }
+
+    /// Admission and hard role/placement eligibility.
+    fn eligible(&self, config: &Config, node: &NodeInfo) -> bool {
+        resolve_node(config, &node.identity, node.port).is_some()
+            && self.role_tiers.iter().any(|roles| roles.contains(&node.role))
+            && (!self.strict_placement
+                || self
+                    .placement_tiers
+                    .iter()
+                    .flatten()
+                    .any(|patterns| patterns.iter().any(|p| node.matches(p))))
+    }
+
+    /// The first preference tier (role-major, then placement) containing
+    /// `node`.
+    fn tier(&self, node: &NodeInfo) -> Option<usize> {
+        let width = self.placement_tiers.len();
+        for (r, roles) in self.role_tiers.iter().enumerate() {
+            if !roles.contains(&node.role) {
+                continue;
+            }
+            for (p, placement) in self.placement_tiers.iter().enumerate() {
+                let matches = match placement {
+                    Some(patterns) => patterns.iter().any(|pattern| node.matches(pattern)),
+                    None => true,
+                };
+                if matches {
+                    return Some(r * width + p);
+                }
+            }
+        }
+        None
+    }
+}
+
+pub(crate) fn standing_in(
+    config: &Config,
+    topology: &Topology,
+    failures: &HashMap<String, Instant>,
+    identity: &str,
+) -> NodeStanding {
+    let policy = Policy::new(config);
+    let node = match topology.nodes.get(identity) {
+        Some(node) if policy.eligible(config, node) => node,
+        _ => return NodeStanding::Ineligible,
+    };
+    let own = match policy.tier(node) {
+        Some(tier) => tier,
+        None => return NodeStanding::Ineligible,
+    };
+    let best = topology
+        .nodes
+        .values()
+        .filter(|n| n.identity != identity && !failures.contains_key(&n.identity))
+        .filter(|n| policy.eligible(config, n))
+        .filter_map(|n| policy.tier(n))
+        .min();
+    match best {
+        Some(best) if best < own => NodeStanding::Fallback,
+        _ => NodeStanding::Preferred,
+    }
+}
+
 /// Orders the eligible candidates of a snapshot.
 pub(crate) fn plan(
     config: &Config,
@@ -897,39 +1083,13 @@ pub(crate) fn plan(
     failures: &HashMap<String, Instant>,
     counts: &HashMap<String, usize>,
 ) -> Result<Vec<String>, Error> {
-    use NodeRole::{Primary, ReadReplica};
-    const PRIMARY: &[NodeRole] = &[Primary];
-    const REPLICA: &[NodeRole] = &[ReadReplica];
-    const ANY: &[NodeRole] = &[Primary, ReadReplica];
-    let role_tiers: Vec<&[NodeRole]> = match config.load_balance.as_str() {
-        "only-primary" => vec![PRIMARY],
-        "only-rr" => vec![REPLICA],
-        "prefer-primary" => vec![PRIMARY, REPLICA],
-        "prefer-rr" => vec![REPLICA, PRIMARY],
-        _ => vec![ANY],
-    };
-    let mut priorities: Vec<&i64> = config.topology_keys.keys().collect();
-    priorities.sort();
-    let mut placement_tiers: Vec<Option<&Vec<String>>> =
-        priorities.into_iter().map(|p| config.topology_keys.get(p)).collect();
-    let strict_placement = !placement_tiers.is_empty() && config.fallback_to_topology_keys_only;
-    if !strict_placement {
-        placement_tiers.push(None);
-    }
+    let policy = Policy::new(config);
 
     // 1. Admission and 2. hard eligibility.
     let eligible: Vec<&NodeInfo> = topology
         .nodes
         .values()
-        .filter(|node| resolve_node(config, &node.identity, node.port).is_some())
-        .filter(|node| role_tiers.iter().any(|roles| roles.contains(&node.role)))
-        .filter(|node| {
-            !strict_placement
-                || placement_tiers
-                    .iter()
-                    .flatten()
-                    .any(|patterns| patterns.iter().any(|p| node.matches(p)))
-        })
+        .filter(|node| policy.eligible(config, node))
         .collect();
     let available: Vec<&NodeInfo> = eligible
         .iter()
@@ -938,24 +1098,18 @@ pub(crate) fn plan(
         .collect();
 
     // 3. Preference tiers and 4. load within each tier.
+    let mut tiers: BTreeMap<usize, Vec<&NodeInfo>> = BTreeMap::new();
+    for node in available {
+        if let Some(tier) = policy.tier(node) {
+            tiers.entry(tier).or_default().push(node);
+        }
+    }
     let mut ordered: Vec<String> = Vec::new();
     let mut rng = rand::thread_rng();
-    for roles in &role_tiers {
-        for placement in &placement_tiers {
-            let mut tier: Vec<&NodeInfo> = available
-                .iter()
-                .copied()
-                .filter(|node| roles.contains(&node.role))
-                .filter(|node| match placement {
-                    Some(patterns) => patterns.iter().any(|p| node.matches(p)),
-                    None => true,
-                })
-                .filter(|node| !ordered.contains(&node.identity))
-                .collect();
-            tier.shuffle(&mut rng);
-            tier.sort_by_key(|node| counts.get(&node.identity).copied().unwrap_or(0));
-            ordered.extend(tier.into_iter().map(|node| node.identity.clone()));
-        }
+    for (_, mut tier) in tiers {
+        tier.shuffle(&mut rng);
+        tier.sort_by_key(|node| counts.get(&node.identity).copied().unwrap_or(0));
+        ordered.extend(tier.into_iter().map(|node| node.identity.clone()));
     }
     if ordered.is_empty() {
         let reason = if eligible.is_empty() {

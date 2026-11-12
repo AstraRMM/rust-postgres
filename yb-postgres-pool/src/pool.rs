@@ -17,8 +17,17 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::AbortHandle;
+use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::types::{ToSql, Type};
 use yb_tokio_postgres::{Client, Config, Row, Statement, TransactionStatus};
+
+tokio::task_local! {
+    static SWEEPING: ();
+}
+
+fn sweeping() -> bool {
+    SWEEPING.try_with(|_| ()).is_ok()
+}
 
 /// One physical connection as bb8 stores it.
 pub struct NativeConnection {
@@ -241,6 +250,12 @@ pub(crate) struct Shared<T: PoolTls> {
     last_activity: Mutex<Instant>,
     /// Serializes warm-floor top-ups so concurrent passes cannot overshoot.
     warm_lock: tokio::sync::Mutex<()>,
+    /// The realm of load-balanced connections, if load balancing is on.
+    realm: Option<Realm>,
+    /// Topology epoch and quarantine set at the last idle sweep.
+    swept: Mutex<Option<(u64, Vec<String>)>>,
+    /// A sweep left fallback-tier connections for lack of free permits.
+    rebalance_pending: AtomicBool,
 }
 
 impl<T: PoolTls> Shared<T> {
@@ -436,6 +451,8 @@ impl<T: PoolTls> Shared<T> {
             .is_some_and(|it| now.duration_since(conn.idle_since) >= it)
         {
             Some(Retire::Idle)
+        } else if conn.client.node_standing() == NodeStanding::Ineligible {
+            Some(Retire::Topology)
         } else if !reusable(&conn.client)
             // A ParameterStatus that arrived while the connection was idle
             // (for example a server-side setting change) means the session
@@ -454,7 +471,7 @@ impl<T: PoolTls> Shared<T> {
             ));
         }
         if let HealthCheck::AfterIdle(after) = self.config.health_check {
-            if now.duration_since(conn.idle_since) >= after {
+            if !sweeping() && now.duration_since(conn.idle_since) >= after {
                 bump(&self.stats.probes);
                 let started = Instant::now();
                 let probe =
@@ -496,12 +513,17 @@ impl<T: PoolTls> Shared<T> {
         if conn.generation.is_some_and(|g| !self.tls.is_current(g)) {
             return Err(Retire::SupersededTls);
         }
+        if client.node_standing() == NodeStanding::Ineligible {
+            return Err(Retire::Topology);
+        }
         Ok(!reusable(client))
     }
 
     /// bb8's return hook (`has_broken`): the final, synchronous gate.
     fn on_return(&self, conn: &mut NativeConnection) -> bool {
-        conn.idle_since = Instant::now();
+        if !sweeping() {
+            conn.idle_since = Instant::now();
+        }
         match self.assess(conn) {
             Ok(false) => false,
             Ok(true) => {
@@ -818,6 +840,7 @@ impl<T: PoolTls> Pool<T> {
         if pg.get_yb_attempt_timeout() > config.connect_timeout {
             pg.yb_attempt_timeout(config.connect_timeout);
         }
+        let realm = pg.resolved_realm();
         let shared = Arc::new(Shared {
             pg,
             tls,
@@ -845,6 +868,9 @@ impl<T: PoolTls> Pool<T> {
             released: Notify::new(),
             last_activity: Mutex::new(Instant::now()),
             warm_lock: tokio::sync::Mutex::new(()),
+            realm,
+            swept: Mutex::new(None),
+            rebalance_pending: AtomicBool::new(false),
         });
         let pool = bb8::Pool::builder()
             .max_size(config.max_size)
@@ -867,7 +893,7 @@ impl<T: PoolTls> Pool<T> {
                 shared: shared.clone(),
             });
         let inner = Arc::new(Inner { pool, shared });
-        if config.warm_floor > 0 {
+        if config.warm_floor > 0 || inner.shared.realm.is_some() {
             let weak = Arc::downgrade(&inner);
             let interval = config.maintenance_interval;
             tokio::spawn(async move {
@@ -882,7 +908,7 @@ impl<T: PoolTls> Pool<T> {
                     if inner.shared.is_closed() {
                         break;
                     }
-                    Pool { inner }.top_up().await;
+                    Pool { inner }.maintain().await;
                 }
             });
         }
@@ -1062,6 +1088,96 @@ impl<T: PoolTls> Pool<T> {
                 ErrorKind::Transport,
                 format!("probe did not complete within {:?}", budget),
             )),
+        }
+    }
+
+    /// One maintenance pass: refresh the realm's topology if it is due,
+    /// sweep idle connections if the topology or quarantine set changed,
+    /// then top up to `warm_floor`. Maintenance calls this every
+    /// `maintenance_interval`.
+    pub async fn maintain(&self) {
+        self.refresh_topology().await;
+        self.sweep().await;
+        self.top_up().await;
+    }
+
+    async fn refresh_topology(&self) {
+        let shared = &self.inner.shared;
+        let realm = match &shared.realm {
+            Some(realm) => realm,
+            None => return,
+        };
+        let refresh = realm.refresh(shared.tls.clone(), &shared.pg);
+        match tokio::time::timeout(shared.config.connect_timeout, refresh).await {
+            Ok(Ok(_)) => bump(&shared.stats.topology_refreshes),
+            Ok(Err(e)) => {
+                bump(&shared.stats.topology_refresh_failures);
+                log::debug!("pool {}: topology refresh failed: {}", shared.label, e);
+            }
+            Err(_) => bump(&shared.stats.topology_refresh_failures),
+        }
+    }
+
+    /// Checks every idle connection: closes those whose transport ended
+    /// or whose node is no longer eligible, and replaces fallback-tier ones
+    /// with preferred-tier connections opened from free permits before
+    /// closing them. Runs only when a pooled connection's task has ended, or
+    /// the topology epoch or quarantine set changed since the last complete
+    /// sweep. Sends no traffic on the swept connections and leaves their
+    /// idle timers untouched.
+    async fn sweep(&self) {
+        let shared = &self.inner.shared;
+        let digest = shared
+            .realm
+            .as_ref()
+            .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
+        let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
+        let changed = digest.is_some() && *shared.swept.lock() != digest;
+        let retry = shared.rebalance_pending.load(Ordering::SeqCst)
+            && shared.capacity.in_use() < shared.capacity.max()
+            && shared.limiter.in_use() < shared.limiter.max();
+        if !dead && !changed && !retry {
+            return;
+        }
+        bump(&shared.stats.idle_sweeps);
+        let complete = SWEEPING
+            .scope((), async {
+                let idle = self.inner.pool.state().idle_connections;
+                let mut held = Vec::new();
+                for _ in 0..idle {
+                    let next = tokio::time::timeout(Duration::ZERO, self.inner.pool.get());
+                    match next.await {
+                        Ok(Ok(conn)) => held.push(conn),
+                        _ => break,
+                    }
+                }
+                let mut complete = true;
+                for mut conn in held {
+                    if conn.client.node_standing() != NodeStanding::Fallback {
+                        continue;
+                    }
+                    match shared.open(false).await {
+                        Ok(replacement) => match self.inner.pool.add(replacement) {
+                            Ok(()) => conn.retire = Some(Retire::Rebalanced),
+                            Err(bb8::AddError::Broken(mut replacement))
+                            | Err(bb8::AddError::NoCapacity(mut replacement)) => {
+                                replacement.retire = Some(Retire::Explicit);
+                                bump(&shared.stats.rebalance_deferrals);
+                                complete = false;
+                            }
+                        },
+                        Err(_) => {
+                            bump(&shared.stats.rebalance_deferrals);
+                            complete = false;
+                        }
+                    }
+                }
+                complete
+            })
+            .await;
+        shared.rebalance_pending.store(!complete, Ordering::SeqCst);
+        if digest.is_some() {
+            *shared.swept.lock() = digest;
         }
     }
 

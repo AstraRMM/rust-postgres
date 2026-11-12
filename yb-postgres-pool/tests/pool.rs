@@ -1501,3 +1501,131 @@ async fn verify_full_generation_retirement() {
     assert_eq!(pool.state().stats.connect_failures, 1);
     pool.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_floor_recovery_and_generation_replacement() {
+    for e in engines() {
+        let admin = e.admin().await;
+        let app = format!("pt_recover_{}", e.name);
+        let mut config = short(&app);
+        config.max_size = 5;
+        config.warm_floor = 3;
+        config.maintenance_interval = Duration::from_millis(100);
+        let pool = Pool::new(e.config(), NoTls, config).unwrap();
+        assert!(eventually(Duration::from_secs(10), || pool.state().physical == 3).await);
+        assert_eq!(
+            eventually_backends(&admin, &app, 3, Duration::from_secs(5)).await,
+            3
+        );
+        let pids: Vec<i32> = admin
+            .query(
+                "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+                &[&app],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let killed = Instant::now();
+        for pid in &pids {
+            terminate(&admin, *pid).await;
+        }
+        let mut recovered = None;
+        while killed.elapsed() < Duration::from_secs(10) {
+            let fresh: i64 = admin
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 \
+                     AND NOT (pid = ANY($2))",
+                    &[&app, &pids],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if fresh == 3 && pool.state().physical == 3 {
+                recovered = Some(killed.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stats = pool.state().stats;
+        println!(
+            "EVIDENCE [{}] backend termination: 3 idle backends killed; floor 3 restored with new \
+             backends in {:?}; retired_closed={} idle_sweeps={} warm_connects={}",
+            e.name, recovered, stats.retired_closed, stats.idle_sweeps, stats.warm_connects
+        );
+        let recovered = recovered.expect("warm floor not restored after termination");
+        assert!(recovered < Duration::from_secs(2), "{:?}", recovered);
+        assert_eq!(stats.retired_closed, 3);
+        pool.shutdown(Duration::from_secs(1)).await;
+
+        let engine = e.clone();
+        let resolver = move |key: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
+            let mut config = pool_config(&format!(
+                "pt_gen_{}_{}",
+                engine.name,
+                key.credential_generation()
+            ));
+            config.max_size = 4;
+            config.warm_floor = 3;
+            config.maintenance_interval = Duration::from_millis(100);
+            Ok(PoolSpec::new(engine.config(), NoTls, config))
+        };
+        let mut set_config = PoolSetConfig::default();
+        set_config.max_connections = 4;
+        set_config.drain_timeout = Duration::from_secs(3);
+        let set = PoolSet::new(set_config, resolver).unwrap();
+        let limiter = set.limiter().clone();
+        let gen0 = PoolKey::new("test", e.dbname, e.user);
+        let gen1 = gen0.clone().with_credential_generation(1);
+        let (app0, app1) = (
+            format!("pt_gen_{}_0", e.name),
+            format!("pt_gen_{}_1", e.name),
+        );
+        let old = set.pool(&gen0).unwrap();
+        assert!(eventually(Duration::from_secs(10), || old.state().physical == 3).await);
+        let in_flight = old.get().await.unwrap();
+
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let (peak, stop, limiter) = (peak.clone(), stop.clone(), limiter.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    peak.fetch_max(limiter.in_use(), Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+        };
+        let replaced = Instant::now();
+        let new = set.pool(&gen1).unwrap();
+        let in_flight_result = in_flight.simple_query("SELECT pg_sleep(0.2)").await;
+        drop(in_flight);
+        let settled = eventually(Duration::from_secs(10), || {
+            new.state().physical == 3 && old.is_closed() && old.state().physical == 0
+        })
+        .await;
+        let settled_in = replaced.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        sampler.await.unwrap();
+        let (b0, b1) = (
+            eventually_backends(&admin, &app0, 0, Duration::from_secs(5)).await,
+            eventually_backends(&admin, &app1, 3, Duration::from_secs(5)).await,
+        );
+        println!(
+            "EVIDENCE [{}] generation replacement: limit 4, floor 3; new generation warm and old \
+             drained in {:?}; backends old={} new={}; peak permits in use={}",
+            e.name,
+            settled_in,
+            b0,
+            b1,
+            peak.load(Ordering::SeqCst)
+        );
+        assert!(in_flight_result.is_ok(), "in-flight work was cut off");
+        assert!(settled);
+        assert_eq!((b0, b1), (0, 3));
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        assert!(set.state(&gen0).is_none());
+        set.shutdown(Duration::from_secs(1)).await;
+    }
+}

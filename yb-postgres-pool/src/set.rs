@@ -190,6 +190,28 @@ impl<T: PoolTls> PoolSet<T> {
                 });
             }
         }
+        let superseded: Vec<Pool<T>> = {
+            let older: Vec<PoolKey> = pools
+                .keys()
+                .filter(|k| key.supersedes(k))
+                .cloned()
+                .collect();
+            older.iter().filter_map(|k| pools.remove(k)).collect()
+        };
+        if !superseded.is_empty() {
+            log::info!(
+                "pool set: {} supersedes {} older generation pool(s)",
+                key,
+                superseded.len()
+            );
+            let warming = pool.clone();
+            let drain = self.inner.config.drain_timeout;
+            tokio::spawn(async move {
+                warming.top_up().await;
+                futures_util::future::join_all(superseded.iter().map(|p| p.shutdown(drain))).await;
+                warming.top_up().await;
+            });
+        }
         pools.insert(key.clone(), pool.clone());
         Ok(pool)
     }
