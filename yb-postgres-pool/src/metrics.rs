@@ -105,6 +105,10 @@ fn families(state: &PoolState) -> Vec<Family> {
                 ("aged", Value::Count(s.retired_aged)),
                 ("idle", Value::Count(s.retired_idle)),
                 ("dirty_session", Value::Count(s.retired_dirty_session)),
+                (
+                    "session_fingerprint",
+                    Value::Count(s.retired_session_fingerprint),
+                ),
                 ("cleanup_failed", Value::Count(s.retired_cleanup_failed)),
                 ("probe_failed", Value::Count(s.retired_probe_failed)),
                 ("explicit", Value::Count(s.retired_explicit)),
@@ -113,6 +117,10 @@ fn families(state: &PoolState) -> Vec<Family> {
                 ("rebalanced", Value::Count(s.retired_rebalanced)),
                 ("reaped", Value::Count(s.reaped)),
             ],
+        ),
+        counter(
+            "session_fingerprint_checks_total",
+            s.session_fingerprint_checks,
         ),
         counter("cleanups_total", s.cleanups),
         counter("cleanup_cancels_total", s.cleanup_cancels),

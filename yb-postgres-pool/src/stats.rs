@@ -16,6 +16,8 @@ pub(crate) enum Retire {
     Idle,
     /// Session state changed (`ParameterStatus`) or was marked dirty.
     DirtySession,
+    /// The return-time session fingerprint differed from the connect-time one.
+    SessionFingerprint,
     /// Return cleanup (cancel/rollback) failed or ran out of budget.
     CleanupFailed,
     /// A checkout or readiness probe failed.
@@ -51,6 +53,8 @@ pub(crate) struct Stats {
     pub retired_aged: AtomicU64,
     pub retired_idle: AtomicU64,
     pub retired_dirty_session: AtomicU64,
+    pub retired_session_fingerprint: AtomicU64,
+    pub session_fingerprint_checks: AtomicU64,
     pub retired_cleanup_failed: AtomicU64,
     pub retired_probe_failed: AtomicU64,
     pub retired_explicit: AtomicU64,
@@ -91,6 +95,7 @@ impl Stats {
             Some(Retire::Aged) => &self.retired_aged,
             Some(Retire::Idle) => &self.retired_idle,
             Some(Retire::DirtySession) => &self.retired_dirty_session,
+            Some(Retire::SessionFingerprint) => &self.retired_session_fingerprint,
             Some(Retire::CleanupFailed) => &self.retired_cleanup_failed,
             Some(Retire::ProbeFailed) => &self.retired_probe_failed,
             Some(Retire::Explicit) => &self.retired_explicit,
@@ -123,6 +128,8 @@ impl Stats {
             retired_aged: l(&self.retired_aged),
             retired_idle: l(&self.retired_idle),
             retired_dirty_session: l(&self.retired_dirty_session),
+            retired_session_fingerprint: l(&self.retired_session_fingerprint),
+            session_fingerprint_checks: l(&self.session_fingerprint_checks),
             retired_cleanup_failed: l(&self.retired_cleanup_failed),
             retired_probe_failed: l(&self.retired_probe_failed),
             retired_explicit: l(&self.retired_explicit),
@@ -160,8 +167,11 @@ impl Stats {
 /// counted in `connects`),
 /// `cleanup_cancels` (one cancel request on a separate connection each),
 /// `cleanup_rollbacks` (one `ROLLBACK` each) and `statement_prepares` (one
-/// Parse/Describe/Sync exchange each, plus `Close` for evictions). A clean
-/// checkout and return costs nothing.
+/// Parse/Describe/Sync exchange each, plus `Close` for evictions) and
+/// `session_fingerprint_checks` (one simple query per connect and per
+/// return, only with
+/// [`PoolConfig::session_fingerprint`](crate::PoolConfig::session_fingerprint)).
+/// Otherwise a clean checkout and return costs nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PoolStats {
@@ -202,6 +212,10 @@ pub struct PoolStats {
     pub retired_idle: u64,
     /// Retired because session state changed or was marked dirty.
     pub retired_dirty_session: u64,
+    /// Retired on return because the session fingerprint changed.
+    pub retired_session_fingerprint: u64,
+    /// Session fingerprint queries sent (connect baselines and return checks).
+    pub session_fingerprint_checks: u64,
     /// Retired because return cleanup failed.
     pub retired_cleanup_failed: u64,
     /// Retired because a checkout or readiness probe failed.

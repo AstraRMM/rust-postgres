@@ -43,6 +43,10 @@
 //! its request's protocol does not allow ([`Client::is_poisoned`]) are
 //! closed rather than reset: `DISCARD ALL` would also drop the statement cache and cannot undo
 //! every session change, while a reconnect is paid only on that rare path.
+//! Unreported session changes (`SET ROLE`, `search_path`, session-level
+//! `set_config`) are detected only with the opt-in
+//! [`PoolConfig::session_fingerprint`], which costs one round trip per
+//! return.
 //! Tenant state belongs in transaction-local settings
 //! ([`PoolTransaction::set_local`]).
 //!
@@ -88,7 +92,8 @@ mod transaction;
 
 pub use crate::config::{
     DateOrder, DateOutput, DateStyle, HealthCheck, PlanCacheMode, PoolConfig, PoolSetConfig,
-    QueueStrategy, SessionConfig, SessionInit, SessionParameters, MAX_STATEMENT_CACHE_CAPACITY,
+    QueueStrategy, SessionConfig, SessionFingerprint, SessionInit, SessionParameters,
+    MAX_FINGERPRINT_SETTINGS, MAX_STATEMENT_CACHE_CAPACITY,
 };
 pub use crate::error::{classify, is_stale_statement, ErrorKind, PoolError};
 pub use crate::key::PoolKey;
