@@ -261,11 +261,22 @@ async fn wrong_dns_san_is_identity_mismatch_and_redacted() {
     assert!(rendered.contains("endpoint ep-"), "{rendered}");
 }
 
+/// ASTS-86: a seed whose certificate does not verify is skipped for the next
+/// seed under the same verification; its TLS error is what the caller sees
+/// when no seed succeeds, never replaced by a later transport error.
 #[tokio::test]
-async fn security_failure_on_one_seed_is_not_hidden_by_another() {
+async fn tls_failure_on_one_seed_moves_to_the_next_seed_and_is_not_hidden() {
     let tls = connector(&roots("ca-a.crt"));
     let conninfo = format!(
         "host=wrong.test,localhost hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
+    );
+    open(&conninfo, &tls).await.expect("the verified second seed serves");
+    let conninfo = format!(
+        "host=wrong.test,localhost hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID},1 user=postgres password={PASSWORD} dbname=postgres"
+    );
+    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::IdentityMismatch);
+    let conninfo = format!(
+        "host=wrong.test,other.test hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
     );
     expect_tls(open(&conninfo, &tls).await, TlsFailureKind::IdentityMismatch);
 }

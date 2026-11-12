@@ -26,8 +26,9 @@
 use crate::client::Client;
 use crate::config::{Config, Host};
 use crate::connect::{
-    allows_unbalanced_fallback, connect_host, connect_with_tls_ref, control_connection_config,
-    error_chain, public_ip_mode_allowed, resolve_node, seeds_label,
+    all_seed_aliases, allows_unbalanced_fallback, connect_host, connect_with_tls_ref,
+    control_connection_config, error_chain, public_ip_mode_allowed, record_failure, resolve_node,
+    seed_aliases, seed_port, seeds_label, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
 };
 use crate::endpoint;
 use crate::tls::MakeTlsConnect;
@@ -38,7 +39,7 @@ use log::{debug, info, warn};
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use std::cmp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -231,6 +232,10 @@ struct RealmInner {
     last_failure: Mutex<Option<String>>,
     discoveries: AtomicU64,
     failures: Mutex<HashMap<String, Instant>>,
+    /// Lower-case identity -> (when, penalty event); the identities of one
+    /// endpoint share the event number.
+    penalties: Mutex<HashMap<String, (Instant, u64)>>,
+    penalty_events: AtomicU64,
     counts: Mutex<HashMap<String, usize>>,
     public_mode: AtomicBool,
     shutdown: AtomicBool,
@@ -298,6 +303,8 @@ impl Realm {
                 last_failure: Mutex::new(None),
                 discoveries: AtomicU64::new(0),
                 failures: Mutex::new(HashMap::new()),
+                penalties: Mutex::new(HashMap::new()),
+                penalty_events: AtomicU64::new(0),
                 counts: Mutex::new(HashMap::new()),
                 public_mode: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
@@ -485,6 +492,74 @@ impl Realm {
         self.inner.discoveries.load(Ordering::SeqCst)
     }
 
+    /// Identities (in lower case) penalised after a node-scoped TLS or
+    /// server failure, with the most recent penalty of each.
+    ///
+    /// A penalised node is not quarantined: it stays eligible, but is tried
+    /// only after every other candidate until the penalty expires under the
+    /// `failed_host_reconnect_delay_secs` of the configuration connecting.
+    pub fn penalized_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self.inner.penalties.lock().keys().cloned().collect();
+        nodes.sort();
+        nodes
+    }
+
+    /// Number of node-scoped failures that penalised a node in this realm.
+    pub fn penalty_count(&self) -> u64 {
+        self.inner.penalty_events.load(Ordering::SeqCst)
+    }
+
+    fn penalize(&self, identity: &str) {
+        self.penalize_aliases(&[identity.to_string()]);
+    }
+
+    /// Penalises one failed endpoint under every identity it may be listed
+    /// under, counting one event. Identities are kept in lower case, as
+    /// host names match case-insensitively (`resolve_node`).
+    fn penalize_aliases(&self, aliases: &[String]) {
+        if aliases.is_empty() {
+            return;
+        }
+        let event = self.inner.penalty_events.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = Instant::now();
+        let mut penalties = self.inner.penalties.lock();
+        for alias in aliases {
+            penalties.insert(alias.to_ascii_lowercase(), (now, event));
+        }
+    }
+
+    /// Lower-case identities penalised within `delay` together with one of
+    /// `config`'s seeds, such as the address a seed name resolved to.
+    fn seed_endpoints(&self, config: &Config, delay: Duration) -> HashSet<String> {
+        let penalties = self.inner.penalties.lock();
+        let events: HashSet<u64> = all_seed_aliases(config)
+            .iter()
+            .flatten()
+            .filter_map(|alias| penalties.get(&alias.to_ascii_lowercase()))
+            .filter(|(at, _)| at.elapsed() <= delay)
+            .map(|(_, event)| *event)
+            .collect();
+        penalties
+            .iter()
+            .filter(|(_, (at, event))| at.elapsed() <= delay && events.contains(event))
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    /// Penalties within `delay`, keyed by lower-case identity
+    /// ([`is_penalized`]). The shared map is not pruned by one caller's
+    /// delay (other configurations of the realm may use a longer one); a
+    /// penalty older than every delay is replaced on the next failure.
+    fn penalties(&self, delay: Duration) -> HashMap<String, Instant> {
+        self.inner
+            .penalties
+            .lock()
+            .iter()
+            .filter(|(_, (at, _))| at.elapsed() <= delay)
+            .map(|(k, (at, _))| (k.clone(), *at))
+            .collect()
+    }
+
     fn reserve(&self, identity: &str) -> NodeLease {
         *self
             .inner
@@ -566,15 +641,21 @@ impl Realm {
         };
 
         let mut last_error = None;
+        // The first node-scoped security failure is what the caller sees if
+        // no candidate succeeds; it is never replaced by a later error.
+        let mut security_error = None;
         if let Some(topology) = &topology {
             let failures = self.failures(config.failed_host_reconnect_delay_secs);
             let counts = self.inner.counts.lock().clone();
             match plan(config, topology, &failures, &counts) {
-                Ok(candidates) => {
+                Ok(mut candidates) => {
+                    // Penalised nodes stay eligible but go last (stable sort).
+                    let penalties = self.penalties(config.failed_host_reconnect_delay_secs);
+                    candidates.sort_by_key(|identity| is_penalized(&penalties, identity));
                     for identity in candidates.into_iter().take(config.yb_max_attempts) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
-                            return Err(last_error.unwrap_or_else(budget_error));
+                            return Err(security_error.or(last_error).unwrap_or_else(budget_error));
                         }
                         let node = &topology.nodes[&identity];
                         let mut target = match resolve_node(config, &identity, node.port) {
@@ -595,22 +676,19 @@ impl Realm {
                         let label = endpoint::label(&identity);
                         info!("Creating connection to {}", label);
                         let lease = self.reserve(&identity);
-                        let attempt = connect_host(
+                        let limit = cmp::min(config.yb_attempt_timeout, remaining);
+                        // Bounded by `limit` itself, so a TLS error of an
+                        // earlier resolved address is not lost to a timeout.
+                        let outcome = connect_host(
                             Host::Tcp(target.dial.clone()),
                             Some(target.tls_name.clone()),
                             target.port,
                             tls,
                             config,
                             Some(identity.clone()),
-                        );
-                        let limit = cmp::min(config.yb_attempt_timeout, remaining);
-                        let outcome = match time::timeout(limit, attempt).await {
-                            Ok(outcome) => outcome,
-                            Err(_) => Err(Error::connect(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!("connection attempt to {} exceeded {:?}", label, limit),
-                            ))),
-                        };
+                            &mut HostAttempt::bounded(Some(limit)),
+                        )
+                        .await;
                         match outcome {
                             Ok((mut client, connection)) => {
                                 client.set_lease(Box::new(lease));
@@ -634,6 +712,19 @@ impl Realm {
                                         );
                                         return Err(e);
                                     }
+                                    AttemptFailure::Penalized => {
+                                        warn!(
+                                            "Connection to {} failed: {}; penalising the node and trying \
+                                             another admitted node under the same verification",
+                                            label,
+                                            error_chain(&e)
+                                        );
+                                        self.penalize(&identity);
+                                        if e.is_security_failure() {
+                                            security_error.get_or_insert(e);
+                                            continue;
+                                        }
+                                    }
                                     AttemptFailure::Busy => {
                                         info!("{} is busy: {}, trying another node", label, error_chain(&e));
                                     }
@@ -655,6 +746,10 @@ impl Realm {
             }
         }
 
+        // A security failure is never followed by a fallback that could hide it.
+        if let Some(e) = security_error {
+            return Err(e);
+        }
         if !allows_unbalanced_fallback(config) {
             return Err(last_error.unwrap_or_else(budget_error));
         }
@@ -671,7 +766,17 @@ impl Realm {
             );
         }
         let attempt = cmp::min(config.yb_attempt_timeout, remaining);
-        match time::timeout(remaining, connect_with_tls_ref(tls, config, Some(attempt))).await {
+        let penalties = self.penalties(config.failed_host_reconnect_delay_secs);
+        let mut pass = SeedPass::new(Some(attempt))
+            .deadline(deadline)
+            .deferring(penalties.into_keys().collect());
+        let outcome = time::timeout(
+            remaining.saturating_add(BACKSTOP_GRACE),
+            connect_with_tls_ref(tls, config, &mut pass),
+        )
+        .await;
+        self.penalize_seeds(&pass);
+        match outcome {
             Ok(Ok((mut client, connection))) => {
                 let identity = self.seed_identity(&client, topology.as_deref());
                 if let Some(identity) = &identity {
@@ -695,7 +800,20 @@ impl Realm {
                 Ok((client, connection))
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(budget_error()),
+            Err(_) => Err(pass.take_reportable().unwrap_or_else(budget_error)),
+        }
+    }
+
+    /// Penalises the seeds whose own endpoint failed in `pass`.
+    fn penalize_seeds(&self, pass: &SeedPass) {
+        for aliases in &pass.node_failures {
+            if let Some(seed) = aliases.first() {
+                warn!(
+                    "Penalising configured host {} after a node-scoped failure",
+                    endpoint::label(seed)
+                );
+            }
+            self.penalize_aliases(aliases);
         }
     }
 
@@ -784,7 +902,10 @@ impl Realm {
             crate::observe::Class::Discovery,
             self.discover(tls, config, snapshot.as_deref(), deadline),
         );
-        let discovered = time::timeout(remaining, discovery).await;
+        // Discovery bounds its own connection attempts by `deadline` and then
+        // returns the error it recorded (for example a seed's TLS failure);
+        // this timeout is only the backstop, so it fires a little later.
+        let discovered = time::timeout(remaining.saturating_add(BACKSTOP_GRACE), discovery).await;
         match &discovered {
             Ok(Ok(_)) => *self.inner.last_failure.lock() = None,
             Ok(Err(e)) => *self.inner.last_failure.lock() = Some(error_chain(e)),
@@ -940,29 +1061,79 @@ impl Realm {
     {
         let control = control_connection_config(config);
         let attempt_bound = cmp::min(LOGIN_TIMEOUT, config.yb_attempt_timeout);
-        let attempt = cmp::min(attempt_bound, deadline.saturating_duration_since(Instant::now()));
-        let mut last = match connect_with_tls_ref(tls, &control, Some(attempt)).await {
-            Ok((client, connection)) => {
-                info!("Control connection created to one of the configured host(s) {}", seeds_label(config));
-                match self.query_topology(client, connection, config).await {
-                    Ok(topology) => return Ok(topology),
-                    Err(e) => e,
-                }
-            }
-            Err(e) => e,
+        let delay = config.failed_host_reconnect_delay_secs;
+        // Order: seeds that are not penalised, then the other known nodes
+        // (penalised ones last), then the penalised seeds. Without a previous
+        // snapshot there are no known nodes: one pass over the seeds,
+        // penalised ones last.
+        let deferred: Vec<String> = self.penalties(delay).into_keys().collect();
+        let seeds = all_seed_aliases(config);
+        let penalised_seed = |aliases: &Vec<String>| {
+            aliases
+                .iter()
+                .any(|alias| deferred.contains(&alias.to_ascii_lowercase()))
         };
-        if last.is_security_failure() {
-            return Err(last);
+        let (first, last_pass) = match previous {
+            Some(_) => (
+                seeds
+                    .iter()
+                    .any(|aliases| !penalised_seed(aliases))
+                    .then(|| Seeds::Undeferred),
+                seeds.iter().any(penalised_seed).then(|| Seeds::Deferred),
+            ),
+            None => (Some(Seeds::All), None),
+        };
+        let mut last = None;
+        // Configured hosts a seed pass tries in this refresh.
+        let mut seed_tried = Vec::new();
+        if let Some(select) = first {
+            let seeded = self
+                .discover_through_seeds(
+                    tls,
+                    &control,
+                    config,
+                    attempt_bound,
+                    deadline,
+                    &deferred,
+                    select,
+                    &mut seed_tried,
+                )
+                .await?;
+            match seeded {
+                Ok(topology) => return Ok(topology),
+                Err(e) => record_failure(&mut last, e),
+            }
         }
-        info!(
-            "Discovery through the configured host(s) {} failed: {}; trying known nodes",
-            seeds_label(config),
-            error_chain(&last)
-        );
-        let failures = self.failures(config.failed_host_reconnect_delay_secs);
+        let failures = self.failures(delay);
         if let Some(previous) = previous {
-            for node in previous.nodes.values() {
+            // Including any penalty the seed pass just recorded.
+            let penalties = self.penalties(delay);
+            let seed_endpoints = self.seed_endpoints(config, delay);
+            if last_pass.is_some() {
+                let pending =
+                    (0..cmp::max(config.host.len(), config.hostaddr.len())).filter(|&i| {
+                        seed_aliases(config, i)
+                            .iter()
+                            .any(|alias| deferred.contains(&alias.to_ascii_lowercase()))
+                    });
+                seed_tried.extend(pending);
+            }
+            // Penalised nodes failed recently: try every other known node
+            // first (stable sort).
+            let mut known: Vec<&NodeInfo> = previous.nodes.values().collect();
+            known.sort_by_key(|node| is_penalized(&penalties, &node.identity));
+            for node in known {
                 if failures.contains_key(&node.identity) {
+                    continue;
+                }
+                // The seed passes cover the seeds, under any identity.
+                if covered_by_seeds(
+                    config,
+                    &node.identity,
+                    node.port,
+                    &seed_endpoints,
+                    &seed_tried,
+                ) {
                     continue;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -983,43 +1154,157 @@ impl Realm {
                     }
                 }
                 let label = endpoint::label(&node.identity);
-                let attempt = time::timeout(
-                    cmp::min(attempt_bound, remaining),
-                    connect_host(
-                        Host::Tcp(target.dial.clone()),
-                        Some(target.tls_name.clone()),
-                        target.port,
-                        tls,
-                        &control,
-                        Some(node.identity.clone()),
-                    ),
+                let attempt = connect_host(
+                    Host::Tcp(target.dial.clone()),
+                    Some(target.tls_name.clone()),
+                    target.port,
+                    tls,
+                    &control,
+                    Some(node.identity.clone()),
+                    &mut HostAttempt::bounded(Some(cmp::min(attempt_bound, remaining))),
                 )
                 .await;
                 match attempt {
-                    Ok(Ok((client, connection))) => {
+                    Ok((client, connection)) => {
                         info!("Control connection created to {}", label);
                         match self.query_topology(client, connection, config).await {
                             Ok(topology) => return Ok(topology),
+                            Err(e) if is_node_scoped_failure(&e) => {
+                                warn!(
+                                    "Topology query on {} failed: {}; penalising the node",
+                                    label,
+                                    error_chain(&e)
+                                );
+                                self.penalize(&node.identity);
+                                record_failure(&mut last, e);
+                            }
                             Err(e) if e.is_security_failure() => return Err(e),
-                            Err(e) => last = e,
+                            Err(e) => record_failure(&mut last, e),
                         }
                     }
-                    Ok(Err(e)) if e.is_security_failure() => return Err(e),
-                    Ok(Err(e)) => {
-                        self.mark_failed(&node.identity);
-                        last = e;
+                    Err(e) if is_node_scoped_failure(&e) => {
+                        warn!(
+                            "Control connection to {} failed: {}; penalising the node",
+                            label,
+                            error_chain(&e)
+                        );
+                        self.penalize(&node.identity);
+                        record_failure(&mut last, e);
                     }
-                    Err(_) => {
+                    Err(e) if e.is_security_failure() => return Err(e),
+                    Err(e) => {
                         self.mark_failed(&node.identity);
-                        last = Error::connect(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("control connection to {} timed out", label),
-                        ));
+                        record_failure(&mut last, e);
                     }
                 }
             }
         }
-        Err(last)
+        if let (Some(select), false) = (
+            last_pass,
+            deadline.saturating_duration_since(Instant::now()).is_zero(),
+        ) {
+            let seeded = self
+                .discover_through_seeds(
+                    tls,
+                    &control,
+                    config,
+                    attempt_bound,
+                    deadline,
+                    &deferred,
+                    select,
+                    &mut Vec::new(),
+                )
+                .await?;
+            match seeded {
+                Ok(topology) => return Ok(topology),
+                Err(e) => record_failure(&mut last, e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "topology discovery exceeded the acquisition budget",
+            ))
+        }))
+    }
+
+    /// Discovery through a control connection to one of the `select`ed
+    /// configured seeds, `deferred` (penalised) ones last. The outer `Err`
+    /// ends discovery (a failure that is not node-scoped); the inner one lets
+    /// the caller try the known nodes. A seed whose own endpoint failed is
+    /// penalised.
+    #[allow(clippy::too_many_arguments)]
+    async fn discover_through_seeds<T>(
+        &self,
+        tls: &mut T,
+        control: &Config,
+        config: &Config,
+        attempt_bound: Duration,
+        deadline: Instant,
+        deferred: &[String],
+        select: Seeds,
+        tried: &mut Vec<usize>,
+    ) -> Result<Result<Topology, Error>, Error>
+    where
+        T: MakeTlsConnect<Socket>,
+    {
+        let mut pass = SeedPass::new(Some(attempt_bound))
+            .deadline(deadline)
+            .deferring(deferred.to_vec())
+            .select(select);
+        let outcome = connect_with_tls_ref(tls, control, &mut pass).await;
+        self.penalize_seeds(&pass);
+        tried.extend(pass.tried.iter().copied());
+        let e = match outcome {
+            Ok((client, connection)) => {
+                info!(
+                    "Control connection created to one of the configured host(s) {}",
+                    seeds_label(config)
+                );
+                // The identities the seed that served may be listed under.
+                let mut aliases = Vec::new();
+                if let Some(socket) = client.get_socket_config() {
+                    aliases.extend(socket.node.clone());
+                    if let crate::client::Addr::Tcp(ip) = &socket.addr {
+                        aliases.push(ip.to_string());
+                    }
+                }
+                match self.query_topology(client, connection, config).await {
+                    Ok(topology) => return Ok(Ok(topology)),
+                    // A credential failure ends discovery, whatever an
+                    // earlier seed reported.
+                    Err(e) if e.is_security_failure() && !is_node_scoped_failure(&e) => {
+                        return Err(e)
+                    }
+                    Err(e) => {
+                        if is_node_scoped_failure(&e) {
+                            warn!(
+                                "Topology query on one of the configured host(s) {} failed: {}; \
+                                 penalising it",
+                                seeds_label(config),
+                                error_chain(&e)
+                            );
+                            self.penalize_aliases(&aliases);
+                        }
+                        // An earlier seed's TLS error still takes precedence.
+                        record_failure(&mut pass.failure, e);
+                        pass.take_failure()
+                    }
+                }
+            }
+            Err(e) => e,
+        };
+        // A node-scoped TLS failure of the seed(s) still lets the previously
+        // known admitted nodes serve discovery; its error wins if none does.
+        if e.is_security_failure() && !is_node_scoped_failure(&e) {
+            return Err(e);
+        }
+        info!(
+            "Discovery through the configured host(s) {} failed: {}",
+            seeds_label(config),
+            error_chain(&e)
+        );
+        Ok(Err(e))
     }
 
     async fn query_topology<S>(
@@ -1135,6 +1420,11 @@ impl Realm {
     }
 }
 
+/// Whether `identity` is penalised; `penalties` is keyed by lower case.
+fn is_penalized(penalties: &HashMap<String, Instant>, identity: &str) -> bool {
+    penalties.contains_key(&identity.to_ascii_lowercase())
+}
+
 fn fresh_for(topology: &Topology, config: &Config) -> bool {
     config.yb_servers_refresh_interval != Duration::ZERO
         && topology.fetched_at.elapsed() <= config.yb_servers_refresh_interval
@@ -1142,7 +1432,7 @@ fn fresh_for(topology: &Topology, config: &Config) -> bool {
 
 /// `now + budget`, or a far-future instant when that overflows (a budget of
 /// `Duration::MAX` set through the builder means "unbounded").
-fn deadline_after(budget: Duration) -> Instant {
+pub(crate) fn deadline_after(budget: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(budget)
         .or_else(|| now.checked_add(FAR_FUTURE))
@@ -1151,6 +1441,27 @@ fn deadline_after(budget: Duration) -> Instant {
 
 /// About 30 years, as Tokio uses for an unbounded timer.
 const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
+
+/// Whether a seed pass of this refresh dials `identity` on `port`: one of
+/// the configured hosts in `seeds` (tried, or left for the last pass) with
+/// that name or `hostaddr` on that port, or an address a seed resolved to
+/// (`seed_endpoints`, lower case) on one of their ports.
+fn covered_by_seeds(
+    config: &Config,
+    identity: &str,
+    port: u16,
+    seed_endpoints: &HashSet<String>,
+    seeds: &[usize],
+) -> bool {
+    let resolved = seed_endpoints.contains(&identity.to_ascii_lowercase());
+    seeds.iter().any(|&i| {
+        seed_port(config, i) == port
+            && (resolved
+                || seed_aliases(config, i)
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(identity)))
+    })
+}
 
 fn invalid_topology(reason: &str) -> Error {
     Error::connect(io::Error::new(
@@ -1206,8 +1517,11 @@ impl Drop for NodeLease {
 }
 
 enum AttemptFailure {
-    /// Security, authorization or configuration: never retried elsewhere.
+    /// Credential, authorization or configuration: never retried elsewhere.
     Terminal,
+    /// A failure attributable to the dialled node ([`is_node_scoped_failure`]):
+    /// penalise the node and try another admitted node.
+    Penalized,
     /// The node refused new sessions for now; another node may be tried
     /// without quarantining this one.
     Busy,
@@ -1216,6 +1530,9 @@ enum AttemptFailure {
 }
 
 fn classify(e: &Error) -> AttemptFailure {
+    if is_node_scoped_failure(e) {
+        return AttemptFailure::Penalized;
+    }
     if e.is_security_failure() {
         return AttemptFailure::Terminal;
     }
@@ -1325,6 +1642,43 @@ pub(crate) fn standing_in(
         Some(best) if best < own => NodeStanding::Fallback,
         _ => NodeStanding::Preferred,
     }
+}
+
+/// Whether a failure is attributable to the node that was dialled, so the
+/// identical attempt against another admitted node of the same realm may
+/// succeed.
+///
+/// TLS failures of the server's side of the handshake qualify: they happen
+/// before any credential is sent, and every other node is verified exactly
+/// the same way. So do server errors that report the node itself as
+/// unhealthy. Failures that would repeat on every node stay terminal:
+/// credentials and authorization (SQLSTATE class 28 and client-side
+/// authentication rejections), a rejected or missing client certificate, the
+/// client's own TLS configuration, a generic handshake failure that is local
+/// or reported by a server alert (it may be rejecting the client
+/// certificate), and every other SQLSTATE.
+/// Continuing after those would present one bad credential to every node.
+pub(crate) fn is_node_scoped_failure(e: &Error) -> bool {
+    use crate::tls::TlsFailureKind as K;
+    if let Some(code) = e.code() {
+        // admin_shutdown, crash_shutdown, system_error, io_error, disk_full,
+        // out_of_memory, internal_error.
+        return matches!(
+            code.code(),
+            "57P01" | "57P02" | "58000" | "58030" | "53100" | "53200" | "XX000"
+        );
+    }
+    matches!(
+        e.tls_failure(),
+        Some(K::ServerRefusedTls)
+            | Some(K::UnknownIssuer)
+            | Some(K::IdentityMismatch)
+            | Some(K::Expired)
+            | Some(K::NotYetValid)
+            | Some(K::Revoked)
+            | Some(K::InvalidCertificate)
+            | Some(K::ProtocolVersion)
+    ) || (e.tls_failure() == Some(K::HandshakeFailure) && e.tls_peer_fault())
 }
 
 /// Orders the eligible candidates of a snapshot.

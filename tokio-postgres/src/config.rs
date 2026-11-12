@@ -291,13 +291,15 @@ pub enum Host {
 ///     connect to it. Later, whenever it refreshes the server list via yb_servers(), if it sees the failed server in the response,
 ///     it marks the server as UP only if failed-host-reconnect-delay-secs time has elapsed. (The yb_servers() function does not remove
 ///     a failed server immediately from its result and retains it for a while.) Only transport failures quarantine a
-///     node; TLS, authentication and other terminal failures never do.
+///     node; TLS, authentication and other terminal failures never do. A node-scoped TLS or server failure (for
+///     example an expired server certificate on one node) instead penalises the node for the same delay: it is
+///     tried only after every other candidate, and the next admitted node is tried under the same verification.
 /// * `yb_acquire_timeout` - (default 30 seconds) Overall budget for one connection acquisition, covering topology
 ///     discovery, DNS, TCP, TLS, authentication and every retry. Also bounds direct (`load_balance=false`) connects.
 ///     This and the other `yb_*` durations accept 1 to 86400 seconds.
 /// * `yb_attempt_timeout` - (default 10 seconds) Bound on one node attempt (DNS, TCP, TLS and authentication).
 /// * `yb_max_attempts` - (default 3, 1-32) How many eligible discovered nodes one acquisition may try after
-///     transport failures.
+///     transport, busy or node-scoped failures. Credential failures (SQLSTATE class 28) end the acquisition.
 /// * `yb_topology_max_staleness` - (default 900 seconds) How old a topology snapshot may be and still be used while
 ///     refreshes fail. Older snapshots are discarded.
 ///
