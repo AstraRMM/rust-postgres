@@ -133,3 +133,77 @@ async fn cancel_query() {
         t => panic!("unexpected return: {:?}", t),
     }
 }
+
+/// How the fake cancel endpoint answers a cancel request.
+#[derive(Clone, Copy)]
+enum CancelReply {
+    /// Closes the connection after a delay, as the server does.
+    CloseAfter(Duration),
+    /// Writes a byte instead of closing.
+    Data,
+}
+
+/// A proxy to the test server that answers cancel requests itself.
+async fn cancel_proxy(reply: CancelReply) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = [0u8; 8];
+                socket.read_exact(&mut head).await.unwrap();
+                if head[4..8] == [4, 210, 22, 46] {
+                    let mut rest = [0u8; 8];
+                    socket.read_exact(&mut rest).await.unwrap();
+                    match reply {
+                        CancelReply::CloseAfter(delay) => time::sleep(delay).await,
+                        CancelReply::Data => {
+                            socket.write_all(b"N").await.unwrap();
+                            time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                    return;
+                }
+                let mut server = tokio::net::TcpStream::connect("127.0.0.1:5433")
+                    .await
+                    .unwrap();
+                server.write_all(&head).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut socket, &mut server).await;
+            });
+        }
+    });
+    port
+}
+
+/// ASTS-97: `cancel_query` returns only once the server has closed the
+/// cancel connection, and treats a reply instead of a close as a failure.
+#[tokio::test]
+async fn cancel_query_waits_for_the_server_to_close() {
+    let port = cancel_proxy(CancelReply::CloseAfter(Duration::from_millis(300))).await;
+    let client = connect(&format!(
+        "host=127.0.0.1 port={} user=postgres sslmode=disable",
+        port
+    ))
+    .await;
+    let started = std::time::Instant::now();
+    client.cancel_token().cancel_query(NoTls).await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "returned before the server closed: {:?}",
+        started.elapsed()
+    );
+
+    let port = cancel_proxy(CancelReply::Data).await;
+    let client = connect(&format!(
+        "host=127.0.0.1 port={} user=postgres sslmode=disable",
+        port
+    ))
+    .await;
+    client
+        .cancel_token()
+        .cancel_query(NoTls)
+        .await
+        .err()
+        .expect("a reply is not a confirmation");
+}

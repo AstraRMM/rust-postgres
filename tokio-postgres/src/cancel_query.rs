@@ -39,6 +39,14 @@ where
     .await?;
     socket.set_observed_role(crate::observe::SocketRole::Cancel);
 
-    cancel_query_raw::cancel_query_raw(socket, ssl_mode, tls, has_hostname, process_id, secret_key)
-        .await
+    cancel_query_raw::cancel_query_raw(
+        socket,
+        ssl_mode,
+        tls,
+        has_hostname,
+        process_id,
+        secret_key,
+        true,
+    )
+    .await
 }

@@ -16,6 +16,7 @@ pub async fn cancel_query_raw<S, T>(
     has_hostname: bool,
     process_id: i32,
     secret_key: i32,
+    confirm: bool,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -32,12 +33,13 @@ where
     crate::observe::note(crate::observe::Q::cancel_requests, None);
 
     // The server closes the connection once it has processed the request
-    // (signalled the backend). Waiting for that, as libpq does, keeps a
-    // cancel from arriving after the caller has moved on to its next query.
-    // Without the `runtime` feature there is no timer to bound that wait,
-    // so the request is only sent.
-    #[cfg(feature = "runtime")]
-    confirm(&mut stream).await?;
+    // (signalled the backend). `CancelToken::cancel_query` waits for that,
+    // as libpq does, so a cancel cannot arrive after the caller has moved on
+    // to its next query. The raw-stream API keeps returning once the request
+    // is sent: its caller owns the stream and the executor.
+    if confirm {
+        confirm_close(&mut stream).await?;
+    }
     Ok(())
 }
 
@@ -46,7 +48,7 @@ where
 /// close_notify still counts as a close. A reset, a reply or a timeout is
 /// an error.
 #[cfg(feature = "runtime")]
-async fn confirm<S>(stream: &mut S) -> Result<(), Error>
+async fn confirm_close<S>(stream: &mut S) -> Result<(), Error>
 where
     S: AsyncRead + Unpin,
 {
@@ -71,4 +73,9 @@ where
         ))),
         Err(e) => Err(Error::io(e)),
     }
+}
+
+#[cfg(not(feature = "runtime"))]
+async fn confirm_close<S>(_: &mut S) -> Result<(), Error> {
+    Ok(())
 }

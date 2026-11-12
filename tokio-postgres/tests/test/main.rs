@@ -372,57 +372,6 @@ async fn cancel_query_raw() {
     }
 }
 
-/// A cancel request completes only once the server closes the cancel
-/// connection (it has processed the request), as libpq does.
-#[tokio::test]
-async fn cancel_query_raw_waits_for_the_server_to_close() {
-    let client = connect("user=postgres").await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = [0u8; 16];
-        socket.read_exact(&mut request).await.unwrap();
-        time::sleep(Duration::from_millis(300)).await;
-        request
-    });
-    let socket = TcpStream::connect(addr).await.unwrap();
-    let started = std::time::Instant::now();
-    client
-        .cancel_token()
-        .cancel_query_raw(socket, NoTls)
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() >= Duration::from_millis(250),
-        "returned before the server closed: {:?}",
-        started.elapsed()
-    );
-    let request = server.await.unwrap();
-    assert_eq!(&request[..8], &[0, 0, 0, 16, 4, 210, 22, 46]);
-
-    // A reply instead of a close is not a confirmation.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = [0u8; 16];
-        socket.read_exact(&mut request).await.unwrap();
-        socket.write_all(b"N").await.unwrap();
-        time::sleep(Duration::from_millis(100)).await;
-    });
-    let socket = TcpStream::connect(addr).await.unwrap();
-    client
-        .cancel_token()
-        .cancel_query_raw(socket, NoTls)
-        .await
-        .err()
-        .expect("unexpected data is an error");
-    server.await.unwrap();
-}
-
 #[tokio::test]
 async fn transaction_commit() {
     let mut client = connect("user=postgres").await;
