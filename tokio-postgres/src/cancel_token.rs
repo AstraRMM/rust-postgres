@@ -30,8 +30,9 @@ impl CancelToken {
     ///
     /// Returns once the server has closed the cancel connection, which it
     /// does after processing the request, so a successful return means the
-    /// request has already been acted on. Bound it with a timeout:
-    /// a peer that keeps the connection open keeps this pending.
+    /// request has already been acted on. A peer that keeps the connection
+    /// open, resets it or answers makes this fail (after 10 seconds for an
+    /// open connection), although the request was sent.
     ///
     /// Requires the `runtime` Cargo feature (enabled by default).
     #[cfg(feature = "runtime")]
