@@ -203,11 +203,11 @@ pub(crate) fn seed_aliases(config: &Config, i: usize) -> Vec<String> {
     aliases
 }
 
-/// [`seed_aliases`] of every configured host that has any.
+/// [`seed_aliases`] of every configured host, in order. A host without
+/// aliases (a Unix socket) has an empty list and is never deferred.
 pub(crate) fn all_seed_aliases(config: &Config) -> Vec<Vec<String>> {
     (0..cmp::max(config.host.len(), config.hostaddr.len()))
         .map(|i| seed_aliases(config, i))
-        .filter(|aliases| !aliases.is_empty())
         .collect()
 }
 
