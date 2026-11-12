@@ -33,7 +33,7 @@ wait_for() { # name timeout command...
 
 lint() {
   record fmt rustfmt --edition 2018 --check tokio-postgres/src/observe.rs
-  record fmt-qualification rustfmt --edition 2021 --check wire-qualification/src/lib.rs wire-qualification/src/bin/overhead.rs wire-qualification/tests/protocol.rs wire-qualification/tests/privacy.rs
+  record fmt-qualification rustfmt --edition 2021 --check wire-qualification/src/lib.rs wire-qualification/src/bin/overhead.rs wire-qualification/tests/protocol.rs wire-qualification/tests/privacy.rs wire-qualification/tests/copy_in.rs
   step clippy
   cargo clippy --locked -p yb-tokio-postgres -p yb-postgres -p wire-qualification --all-targets --features yb-tokio-postgres/rustls-aws-lc-rs >/tmp/wq-clippy.log 2>&1
   local clippy_rc=$?
@@ -89,6 +89,7 @@ wire() {
   containers || { status=1; return; }
   record wire-protocol cargo test --locked -p wire-qualification --test protocol -- --test-threads=1 --nocapture
   record wire-privacy cargo test --locked -p wire-qualification --test privacy -- --nocapture
+  record wire-copy-in cargo test --locked -p wire-qualification --test copy_in -- --nocapture
 }
 
 overhead() {
