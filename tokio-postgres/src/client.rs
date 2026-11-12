@@ -40,13 +40,23 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct Responses {
     receiver: mpsc::Receiver<BackendMessages>,
     cur: BackendMessages,
+    session: Arc<SessionShared>,
 }
 
 impl Responses {
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Message, Error>> {
         loop {
-            match self.cur.next().map_err(Error::parse)? {
-                Some(Message::ErrorResponse(body)) => return Poll::Ready(Err(Error::db(body))),
+            let message = match self.cur.next() {
+                Ok(message) => message,
+                Err(e) => {
+                    self.session.poison();
+                    return Poll::Ready(Err(Error::parse(e)));
+                }
+            };
+            match message {
+                Some(Message::ErrorResponse(body)) => {
+                    return Poll::Ready(self.check(Err(Error::db(body))))
+                }
                 Some(message) => return Poll::Ready(Ok(message)),
                 None => {}
             }
@@ -60,6 +70,25 @@ impl Responses {
 
     pub async fn next(&mut self) -> Result<Message, Error> {
         future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// The error for a response the request's protocol does not allow. It
+    /// poisons the session: the client and server may no longer agree on
+    /// which response belongs to which request.
+    pub fn unexpected(&self) -> Error {
+        self.session.poison();
+        Error::unexpected_message()
+    }
+
+    /// Passes `result` through, poisoning the session if it failed because a
+    /// response could not be parsed or was unexpected.
+    pub fn check<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if let Err(e) = &result {
+            if e.is_protocol_violation() {
+                self.session.poison();
+            }
+        }
+        result
     }
 }
 
@@ -137,6 +166,7 @@ impl InnerClient {
         Ok(Responses {
             receiver,
             cur: BackendMessages::empty(),
+            session: self.session.clone(),
         })
     }
 
@@ -706,6 +736,14 @@ impl Client {
     /// [`Portal`]: crate::Portal
     pub fn pending_caller_requests(&self) -> u64 {
         self.inner.session.caller_pending()
+    }
+
+    /// Whether a response broke the protocol of the request it was routed to
+    /// (an unexpected or unparseable message). Such a session may have lost
+    /// track of which response belongs to which request, so it should not be
+    /// reused for another caller; pools retire it. Never cleared.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.session.poisoned()
     }
 
     /// The number of `ParameterStatus` messages received after startup.

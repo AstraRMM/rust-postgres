@@ -78,7 +78,9 @@ struct Permits {
 }
 
 fn reusable(client: &Client) -> bool {
-    client.pending_caller_requests() == 0 && client.transaction_status() == TransactionStatus::Idle
+    client.pending_caller_requests() == 0
+        && client.transaction_status() == TransactionStatus::Idle
+        && !client.is_poisoned()
 }
 
 /// Removes a connection from the live registry and returns its permits when
@@ -564,6 +566,11 @@ impl<T: PoolTls> Shared<T> {
         }
         let client = &conn.client;
         if client.is_closed() {
+            return Err(Retire::Closed);
+        }
+        // A response broke its request's protocol: requests and responses
+        // may be out of step, so no cleanup can make the session safe.
+        if client.is_poisoned() {
             return Err(Retire::Closed);
         }
         if client.parameter_status_changes() != conn.param_baseline {
@@ -1884,7 +1891,9 @@ impl<T: PoolTls> PooledClient<T> {
         conn.cache.clear();
         bump(&conn.stats.statement_invalidations);
         conn.client.wait_until_settled().await;
-        !conn.client.is_closed() && conn.client.transaction_status() == TransactionStatus::Idle
+        !conn.client.is_closed()
+            && !conn.client.is_poisoned()
+            && conn.client.transaction_status() == TransactionStatus::Idle
     }
 
     /// Prepares `sql` with inferred parameter types, reusing this

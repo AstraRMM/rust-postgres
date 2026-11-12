@@ -93,23 +93,23 @@ async fn prepare_in(
 
     match responses.next().await? {
         Message::ParseComplete => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     let parameter_description = match responses.next().await? {
         Message::ParameterDescription(body) => body,
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     };
 
     let row_description = match responses.next().await? {
         Message::RowDescription(body) => Some(body),
         Message::NoData => None,
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     };
 
     let mut parameters = vec![];
     let mut it = parameter_description.parameters();
-    while let Some(oid) = it.next().map_err(Error::parse)? {
+    while let Some(oid) = responses.check(it.next().map_err(Error::parse))? {
         let type_ = get_type(client, oid, lineage).await?;
         parameters.push(type_);
     }
@@ -117,7 +117,7 @@ async fn prepare_in(
     let mut columns = vec![];
     if let Some(row_description) = row_description {
         let mut it = row_description.fields();
-        while let Some(field) = it.next().map_err(Error::parse)? {
+        while let Some(field) = responses.check(it.next().map_err(Error::parse))? {
             let type_ = get_type(client, field.type_oid(), lineage).await?;
             let column = Column::new(field.name().to_string(), type_);
             columns.push(column);

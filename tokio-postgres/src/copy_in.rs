@@ -111,10 +111,10 @@ where
                     let this = self.as_mut().project();
                     match ready!(this.responses.poll_next(cx))? {
                         Message::CommandComplete(body) => {
-                            let rows = extract_row_affected(&body)?;
+                            let rows = this.responses.check(extract_row_affected(&body))?;
                             return Poll::Ready(Ok(rows));
                         }
-                        _ => return Poll::Ready(Err(Error::unexpected_message())),
+                        _ => return Poll::Ready(Err(this.responses.unexpected())),
                     }
                 }
             }
@@ -194,7 +194,19 @@ where
 {
     debug!("executing copy in statement {}", statement.name());
 
-    let buf = query::encode(client, &statement, slice_iter(&[]))?;
+    // Exactly one `Sync` per request: `Flush` here, and the `Sync` after
+    // `CopyDone`/`CopyFail` (see `CopyInReceiver`). The server ignores
+    // `Flush` and `Sync` while in copy-in mode, and discards `CopyFail`
+    // outside it, so whether or not the statement enters copy-in mode the
+    // request ends with a single `ReadyForQuery`. A `Sync` here would end a
+    // statement that fails before copy-in mode, leaving the trailing `Sync`
+    // to produce a second `ReadyForQuery` that belongs to no request.
+    let buf = client.with_buf(|buf| {
+        query::encode_bind(&statement, slice_iter(&[]), "", buf)?;
+        frontend::execute("", 0, buf).map_err(Error::encode)?;
+        frontend::flush(buf);
+        Ok::<_, Error>(buf.split().freeze())
+    })?;
 
     let (mut sender, receiver) = mpsc::channel(1);
     let receiver = CopyInReceiver::new(receiver);
@@ -207,12 +219,12 @@ where
 
     match responses.next().await? {
         Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     match responses.next().await? {
         Message::CopyInResponse(_) => {}
-        _ => return Err(Error::unexpected_message()),
+        _ => return Err(responses.unexpected()),
     }
 
     Ok(CopyInSink {

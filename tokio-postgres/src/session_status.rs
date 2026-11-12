@@ -48,6 +48,8 @@ pub(crate) struct SessionShared {
     parameter_changes: AtomicU64,
     /// Set once the connection future has been dropped.
     closed: AtomicBool,
+    /// Set when a response broke its request's protocol; never cleared.
+    poisoned: AtomicBool,
     waker: AtomicWaker,
 }
 
@@ -59,6 +61,7 @@ impl SessionShared {
             status: AtomicU8::new(b'I'),
             parameter_changes: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
     }
@@ -87,6 +90,14 @@ impl SessionShared {
 
     pub(crate) fn parameter_changed(&self) {
         self.parameter_changes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     pub(crate) fn connection_dropped(&self) {
