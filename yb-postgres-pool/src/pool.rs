@@ -261,9 +261,6 @@ pub(crate) struct Shared<T: PoolTls> {
     signals_at_sweep: AtomicU64,
     /// Serializes maintenance passes.
     maintain_lock: tokio::sync::Mutex<()>,
-    /// Maintenance had neither a spare idle session nor a free permit for a
-    /// due topology refresh; the next checkout refreshes on its session.
-    refresh_starved: AtomicBool,
     /// Topology epoch and quarantine set at the last idle sweep.
     swept: Mutex<Option<(u64, Vec<String>)>>,
     /// Departed or fallback-tier connections await replacement.
@@ -484,15 +481,6 @@ impl<T: PoolTls> Shared<T> {
 
     /// Local checkout checks; no traffic unless `HealthCheck::AfterIdle`.
     async fn check_out(&self, conn: &mut NativeConnection) -> Result<(), PoolError> {
-        if !sweeping() && self.refresh_starved.swap(false, Ordering::SeqCst) {
-            if let Some(realm) = &self.realm {
-                let refresh = realm.refresh_with(&conn.client, &self.pg);
-                match tokio::time::timeout(self.config.connect_timeout, refresh).await {
-                    Ok(Ok(_)) => bump(&self.stats.topology_refreshes),
-                    _ => bump(&self.stats.topology_refresh_failures),
-                }
-            }
-        }
         let now = Instant::now();
         let reason = if self.is_closed() {
             Some(Retire::Shutdown)
@@ -945,7 +933,6 @@ impl<T: PoolTls> Pool<T> {
             signals_acked: AtomicU64::new(0),
             signals_at_sweep: AtomicU64::new(0),
             maintain_lock: tokio::sync::Mutex::new(()),
-            refresh_starved: AtomicBool::new(false),
             rebalance_pending: AtomicBool::new(false),
             requests_at_sweep: AtomicU64::new(0),
             rebalance_requests: AtomicU64::new(0),
@@ -1250,7 +1237,6 @@ impl<T: PoolTls> Pool<T> {
             Some(permits) => permits,
             None => {
                 bump(&shared.stats.topology_refresh_failures);
-                shared.refresh_starved.store(true, Ordering::SeqCst);
                 return;
             }
         };
