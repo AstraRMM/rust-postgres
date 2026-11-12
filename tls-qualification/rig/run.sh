@@ -92,6 +92,13 @@ tls() {
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select version()'
   docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' "$pg_image" "$yb_image"
 
+  step "hosts (tests/admission.rs dials suffix-admitted names)"
+  local sudo=; [[ $(id -u) == 0 ]] || sudo=sudo
+  for entry in "127.0.48.1 node-1.admit.qual.test" "127.0.48.2 node-2.admit.qual.test"; do
+    grep -qxF "$entry" /etc/hosts || echo "$entry" | $sudo tee -a /etc/hosts >/dev/null || return 1
+  done
+  getent hosts node-1.admit.qual.test node-2.admit.qual.test
+
   record tls-qualification env TLS_QUAL_FIXTURES="$fix" cargo test -p tls-qualification -- --test-threads=1 --nocapture
 }
 

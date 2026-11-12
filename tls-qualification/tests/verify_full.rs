@@ -221,6 +221,28 @@ async fn cancel_request_uses_verified_tls() {
 // ---------------------------------------------------------------- negative
 
 #[tokio::test]
+async fn cancel_request_without_verified_tls_is_not_sent() {
+    let tls = connector(&roots("ca-a.crt"));
+    let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+    let token = s.client.cancel_token();
+    let wrong = connector(&roots("ca-b.crt"));
+    let attempts = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wrong_ca = token.cancel_query(wrong).await;
+        let unverified = token.cancel_query(NoTls).await;
+        (wrong_ca, unverified)
+    };
+    let (query, (wrong_ca, unverified)) =
+        tokio::join!(s.client.simple_query("select pg_sleep(2)"), attempts);
+    let e = wrong_ca.expect_err("a cancel request over an unverified channel succeeded");
+    assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnknownIssuer), "{e}");
+    let e = unverified.expect_err("a cancel request without TLS succeeded");
+    assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnverifiedConnector), "{e}");
+    // Neither attempt reached the server: the query ran to completion.
+    query.expect("the query must not have been cancelled");
+}
+
+#[tokio::test]
 async fn wrong_ca_is_unknown_issuer() {
     let tls = connector(&roots("ca-b.crt"));
     expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::UnknownIssuer);
@@ -724,21 +746,49 @@ async fn yb_policy_maps_identity_to_tls_name() {
 
 #[tokio::test]
 async fn yb_discovery_never_crosses_realms() {
+    use yb_tokio_postgres::realm::Realm;
     let tls = connector(&roots("ca-a.crt"));
-    // Realm A refreshes the (still process-global) topology.
-    let a = open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &tls)
+    // One explicit realm shared by both configurations, so B's acquisitions
+    // see the topology A discovered. 127.0.0.2 presents a certificate this
+    // connector accepts; only B's trusted configuration keeps B away from it.
+    let shared = Realm::new("shared-across-configurations");
+    let with = |mut config: Config| {
+        config.realm(shared.clone());
+        config
+    };
+    let a = open_config(&with(yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0")), &tls)
         .await
         .unwrap();
     assert_eq!(servers(&a.client).await, vec!["127.0.0.2"]);
-    // Realm B reuses that snapshot (no refresh). Its trusted configuration
-    // does not admit 127.0.0.2, whose certificate would otherwise verify.
+    let snapshot: Vec<String> = shared.topology().unwrap().nodes().iter().map(|n| n.identity().to_string()).collect();
+    assert_eq!(snapshot, vec!["127.0.0.2"]);
+
+    // B reuses that snapshot (no refresh). Unrestricted balancing falls back
+    // to B's own seed rather than dialling the unadmitted node.
+    let b_conf = "load_balance=true yb_servers_refresh_interval=600";
     for _ in 0..5 {
-        let b = open_config(&yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=600"), &tls)
-            .await
-            .unwrap();
+        let b = open_config(&with(yb("yb-b.test", "127.0.0.3", b_conf)), &tls).await.unwrap();
         assert_ne!(b.client.node_identity(), Some("127.0.0.2"));
         assert_eq!(servers(&b.client).await, vec!["127.0.0.3"]);
     }
+    // Restricted routing has no seed fallback and fails closed instead.
+    let e = open_config(
+        &with(yb("yb-b.test", "127.0.0.3", "load_balance=only-primary yb_servers_refresh_interval=600")),
+        &tls,
+    )
+    .await
+    .err()
+    .expect("B must not be routed into A");
+    assert!(e.to_string().contains("admitted"), "{e}");
+    assert_eq!(shared.connection_counts().get("127.0.0.2"), Some(&1), "only A's session uses A");
+
+    // Control: if B's trusted configuration admitted 127.0.0.2, the shared
+    // snapshot would route B into A, so the checks above are not vacuous.
+    let mut crossing = with(yb("yb-b.test", "127.0.0.3", "load_balance=only-primary yb_servers_refresh_interval=600"));
+    crossing.endpoint_policy(EndpointPolicy::new().admit_node("127.0.0.2", NodeEndpoint::new()).unwrap());
+    let crossed = open_config(&crossing, &tls).await.unwrap();
+    assert_eq!(crossed.client.node_identity(), Some("127.0.0.2"));
+    assert_eq!(servers(&crossed.client).await, vec!["127.0.0.2"]);
 }
 
 #[tokio::test]

@@ -13,6 +13,9 @@ time = "0.3"
 yb-tokio-postgres = { path = "../tokio-postgres", features = ["rustls-aws-lc-rs"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "io-util"] }
 futures-util = "0.3"
+# Server side of the loopback TLS fixtures (tests/admission.rs, tests/certificate_fields.rs).
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["aws_lc_rs"] }
+sha2 = "0.10"
 
 [features]
 # Run the same suite with another provider: TLS_QUAL_PROVIDER=ring|fips.
