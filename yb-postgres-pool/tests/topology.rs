@@ -719,11 +719,7 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
     let new = set.pool(&gen1).unwrap();
     assert!(eventually(Duration::from_secs(5), || new.state().physical == 2).await);
     let during = (old.state().physical, new.state().physical);
-    assert_eq!(
-        node_of(&new).await.is_empty(),
-        false,
-        "the new generation serves"
-    );
+    assert!(!node_of(&new).await.is_empty(), "the new generation serves");
     let retiring = {
         let set = set.clone();
         let gen0 = gen0.clone();
