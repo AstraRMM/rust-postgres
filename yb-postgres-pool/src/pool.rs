@@ -1361,14 +1361,12 @@ impl<T: PoolTls> Pool<T> {
                 }
             }
             if opened > 0 {
-                SWEEPING
+                let left = SWEEPING
                     .scope((), async {
                         let held = self.take_idle().await;
                         let mut budget = opened.min(self.retireable(&held) as u64);
+                        let mut left = false;
                         for mut conn in held {
-                            if budget == 0 {
-                                break;
-                            }
                             if conn.retire.is_some() {
                                 continue;
                             }
@@ -1377,11 +1375,19 @@ impl<T: PoolTls> Pool<T> {
                                 NodeStanding::Departed => Retire::Topology,
                                 _ => continue,
                             };
+                            if budget == 0 {
+                                left = true;
+                                continue;
+                            }
                             conn.retire = Some(reason);
                             budget -= 1;
                         }
+                        left
                     })
                     .await;
+                if left {
+                    pending = true;
+                }
             }
         }
         shared.rebalance_pending.store(pending, Ordering::SeqCst);
@@ -1409,7 +1415,14 @@ impl<T: PoolTls> Pool<T> {
         let config = &self.inner.shared.config;
         let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
         let idle = held.len() as u32 - retiring;
-        let total = self.inner.pool.state().connections.saturating_sub(retiring);
+        let physical = self.inner.shared.live.lock().len() as u32;
+        let total = self
+            .inner
+            .pool
+            .state()
+            .connections
+            .min(physical)
+            .saturating_sub(retiring);
         total
             .saturating_sub(config.warm_floor)
             .min(idle.saturating_sub(config.min_idle.unwrap_or(0)))

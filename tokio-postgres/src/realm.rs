@@ -814,10 +814,7 @@ impl Realm {
     /// [`Config::yb_servers_refresh_interval`].
     pub fn refresh_due(&self, config: &Config) -> bool {
         match self.inner.snapshot.read().as_ref() {
-            Some(topology) => {
-                config.yb_servers_refresh_interval == Duration::ZERO
-                    || topology.fetched_at.elapsed() > config.yb_servers_refresh_interval
-            }
+            Some(topology) => !fresh_for(topology, config),
             None => true,
         }
     }
@@ -830,8 +827,8 @@ impl Realm {
     /// caller can fall back to [`refresh`](Self::refresh).
     pub async fn refresh_with(&self, client: &Client, config: &Config) -> Result<TopologyInfo, Error> {
         let snapshot = self.inner.snapshot.read().clone();
-        if !self.refresh_due(config) {
-            if let Some(topology) = &snapshot {
+        if let Some(topology) = &snapshot {
+            if fresh_for(topology, config) {
                 return Ok(self.info(topology));
             }
         }
@@ -1104,6 +1101,11 @@ impl Realm {
             epoch: 0,
         })
     }
+}
+
+fn fresh_for(topology: &Topology, config: &Config) -> bool {
+    config.yb_servers_refresh_interval != Duration::ZERO
+        && topology.fetched_at.elapsed() <= config.yb_servers_refresh_interval
 }
 
 fn invalid_topology(reason: &str) -> Error {
