@@ -56,6 +56,8 @@ struct SetInner<T: PoolTls> {
     limiter: ConnectionLimiter,
     resolver: Box<dyn PoolResolver<T>>,
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
+    /// Superseded generations still draining, awaited by `shutdown`.
+    retiring: Mutex<Vec<Pool<T>>>,
     closed: AtomicBool,
 }
 
@@ -98,6 +100,7 @@ impl<T: PoolTls> PoolSet<T> {
             config,
             resolver: Box::new(resolver),
             pools: Mutex::new(HashMap::new()),
+            retiring: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
         });
         let weak: Weak<SetInner<T>> = Arc::downgrade(&inner);
@@ -152,9 +155,15 @@ impl<T: PoolTls> PoolSet<T> {
             }
             pools.remove(key);
         }
-        let victim = if pools.len() >= self.inner.config.max_pools {
+        let superseded_keys: Vec<PoolKey> = pools
+            .keys()
+            .filter(|k| key.supersedes(k))
+            .cloned()
+            .collect();
+        let victim = if pools.len() - superseded_keys.len() >= self.inner.config.max_pools {
             let victim = pools
                 .iter()
+                .filter(|(k, _)| !superseded_keys.contains(k))
                 .filter(|(_, p)| !p.busy())
                 .max_by_key(|(_, p)| p.idle_for())
                 .map(|(k, _)| k.clone());
@@ -190,25 +199,32 @@ impl<T: PoolTls> PoolSet<T> {
                 });
             }
         }
-        let superseded: Vec<Pool<T>> = {
-            let older: Vec<PoolKey> = pools
-                .keys()
-                .filter(|k| key.supersedes(k))
-                .cloned()
-                .collect();
-            older.iter().filter_map(|k| pools.remove(k)).collect()
-        };
+        let superseded: Vec<Pool<T>> = superseded_keys
+            .iter()
+            .filter_map(|k| pools.remove(k))
+            .collect();
         if !superseded.is_empty() {
             log::info!(
                 "pool set: {} supersedes {} older generation pool(s)",
                 key,
                 superseded.len()
             );
+            self.inner
+                .retiring
+                .lock()
+                .extend(superseded.iter().cloned());
             let warming = pool.clone();
             let drain = self.inner.config.drain_timeout;
+            let inner = Arc::downgrade(&self.inner);
             tokio::spawn(async move {
                 warming.top_up().await;
                 futures_util::future::join_all(superseded.iter().map(|p| p.shutdown(drain))).await;
+                if let Some(inner) = inner.upgrade() {
+                    inner
+                        .retiring
+                        .lock()
+                        .retain(|p| !superseded.iter().any(|s| s.same_pool(p)));
+                }
                 warming.top_up().await;
             });
         }
@@ -274,7 +290,8 @@ impl<T: PoolTls> PoolSet<T> {
     /// Shuts every pool down within `drain` and refuses new pools.
     pub async fn shutdown(&self, drain: Duration) {
         self.inner.closed.store(true, Ordering::SeqCst);
-        let pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
+        let mut pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
+        pools.extend(self.inner.retiring.lock().drain(..));
         futures_util::future::join_all(pools.iter().map(|p| p.shutdown(drain))).await;
     }
 }

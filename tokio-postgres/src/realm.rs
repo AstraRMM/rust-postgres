@@ -532,7 +532,7 @@ impl Realm {
                         match outcome {
                             Ok((mut client, connection)) => {
                                 client.set_lease(Box::new(lease));
-                                client.set_placement(self.clone(), config);
+                                client.set_placement(self.clone(), config, identity.clone());
                                 return Ok((client, connection));
                             }
                             Err(e) => {
@@ -588,7 +588,7 @@ impl Realm {
                 let identity = self.seed_identity(&client, topology.as_deref());
                 if let Some(identity) = identity {
                     client.set_lease(Box::new(self.reserve(&identity)));
-                    client.set_placement(self.clone(), config);
+                    client.set_placement(self.clone(), config, identity);
                 }
                 Ok((client, connection))
             }

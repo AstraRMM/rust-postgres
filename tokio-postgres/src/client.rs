@@ -223,7 +223,7 @@ pub struct Client {
     #[cfg(feature = "runtime")]
     lease: Option<Box<dyn std::any::Any + Send + Sync>>,
     #[cfg(feature = "runtime")]
-    placement: Option<(crate::realm::Realm, Arc<crate::Config>)>,
+    placement: Option<(crate::realm::Realm, Arc<crate::Config>, String)>,
     ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
@@ -275,8 +275,13 @@ impl Client {
     }
 
     #[cfg(feature = "runtime")]
-    pub(crate) fn set_placement(&mut self, realm: crate::realm::Realm, config: &crate::Config) {
-        self.placement = Some((realm, Arc::new(config.clone())));
+    pub(crate) fn set_placement(
+        &mut self,
+        realm: crate::realm::Realm,
+        config: &crate::Config,
+        identity: String,
+    ) {
+        self.placement = Some((realm, Arc::new(config.clone()), identity));
     }
 
     /// Where this client's node stands in its realm's current topology
@@ -284,9 +289,9 @@ impl Client {
     /// only; [`Realm::refresh`](crate::realm::Realm::refresh) updates it.
     #[cfg(feature = "runtime")]
     pub fn node_standing(&self) -> crate::realm::NodeStanding {
-        match (&self.placement, self.node_identity()) {
-            (Some((realm, config)), Some(identity)) => realm.standing(config, identity),
-            _ => crate::realm::NodeStanding::Unknown,
+        match &self.placement {
+            Some((realm, config, identity)) => realm.standing(config, identity),
+            None => crate::realm::NodeStanding::Unknown,
         }
     }
 

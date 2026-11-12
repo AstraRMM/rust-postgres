@@ -832,3 +832,57 @@ async fn dropping_the_last_handle_stops_maintenance() {
         "maintenance kept running after the pool was dropped"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supersession_needs_no_free_pool_slot_and_shutdown_awaits_the_drain() {
+    let cluster = Cluster::new("sp");
+    let a = Node::start(&cluster).await;
+    cluster.publish(&[(&a, "z1")]);
+    let realm = Realm::new("slots");
+    let pg = driver_config(&a, &realm, "load_balance=true");
+    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
+        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(2, 3)))
+    };
+    let mut set_config = PoolSetConfig::default();
+    set_config.max_connections = 6;
+    set_config.max_pools = 1;
+    set_config.drain_timeout = Duration::from_secs(30);
+    let set = PoolSet::new(set_config, resolver).unwrap();
+    let gen0 = PoolKey::for_realm(&realm, "test", "test");
+    let gen1 = gen0.clone().with_config_generation(1);
+
+    let old = set.pool(&gen0).unwrap();
+    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
+    let in_flight = old.get().await.unwrap();
+    let new = set
+        .pool(&gen1)
+        .expect("a newer generation replaces its predecessor without a free pool slot");
+    assert!(eventually(Duration::from_secs(5), || new.state().physical == 2).await);
+    assert!(
+        old.state().physical >= 1,
+        "the borrowed session is still draining"
+    );
+
+    let started = Instant::now();
+    let shutdown = {
+        let set = set.clone();
+        tokio::spawn(async move { set.shutdown(Duration::from_millis(300)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(in_flight);
+    shutdown.await.unwrap();
+    println!(
+        "EVIDENCE supersession: max_pools 1; set shutdown returned in {:?}; old physical={} new physical={} counts={:?}",
+        started.elapsed(),
+        old.state().physical,
+        new.state().physical,
+        counts(&realm)
+    );
+    assert_eq!(
+        old.state().physical,
+        0,
+        "shutdown returned before the old generation drained"
+    );
+    assert_eq!(new.state().physical, 0);
+    assert!(counts(&realm).is_empty());
+}
