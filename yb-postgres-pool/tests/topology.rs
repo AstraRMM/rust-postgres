@@ -30,9 +30,11 @@ enum Behaviour {
     Refuse,
 }
 
+type NodeRow = (String, u16, &'static str, String);
+
 #[derive(Clone)]
 struct Cluster {
-    rows: Arc<Mutex<Vec<(String, u16, &'static str, String)>>>,
+    rows: Arc<Mutex<Vec<NodeRow>>>,
     discoveries: Arc<AtomicUsize>,
     region: String,
 }

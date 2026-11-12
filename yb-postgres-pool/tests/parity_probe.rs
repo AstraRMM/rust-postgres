@@ -588,8 +588,8 @@ async fn prometheus_export_is_grouped_and_bounded() {
         assert!(value.parse::<f64>().is_ok(), "{line}");
         series += 1;
     }
-    assert_eq!(families.len(), 30, "{text}");
-    assert_eq!(series, 2 * 42, "{text}");
+    assert_eq!(families.len(), 34, "{text}");
+    assert_eq!(series, 2 * 48, "{text}");
     for line in [
         "git_storage_pool_probes_total{pool=\"primary\",service=\"git-storage\",kind=\"readiness\"} 1",
         "git_storage_pool_probe_failures_total{pool=\"primary\",service=\"git-storage\",kind=\"readiness\"} 1",
