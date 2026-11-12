@@ -111,7 +111,7 @@ where
                     let this = self.as_mut().project();
                     match ready!(this.responses.poll_next(cx))? {
                         Message::CommandComplete(body) => {
-                            let rows = extract_row_affected(&body)?;
+                            let rows = this.responses.check(extract_row_affected(&body))?;
                             return Poll::Ready(Ok(rows));
                         }
                         _ => return Poll::Ready(Err(this.responses.unexpected())),

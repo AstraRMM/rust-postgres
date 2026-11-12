@@ -89,25 +89,30 @@ impl Stream for SimpleQueryStream {
         loop {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::CommandComplete(body) => {
-                    let rows = extract_row_affected(&body)?;
+                    let rows = this.responses.check(extract_row_affected(&body))?;
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(rows))));
                 }
                 Message::EmptyQueryResponse => {
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::CommandComplete(0))));
                 }
                 Message::RowDescription(body) => {
-                    let columns = body
-                        .fields()
-                        .map(|f| Ok(SimpleColumn::new(f.name().to_string())))
-                        .collect::<Vec<_>>()
-                        .map_err(Error::parse)?
+                    let columns = this
+                        .responses
+                        .check(
+                            body.fields()
+                                .map(|f| Ok(SimpleColumn::new(f.name().to_string())))
+                                .collect::<Vec<_>>()
+                                .map_err(Error::parse),
+                        )?
                         .into();
 
                     *this.columns = Some(columns);
                 }
                 Message::DataRow(body) => {
                     let row = match &this.columns {
-                        Some(columns) => SimpleQueryRow::new(columns.clone(), body)?,
+                        Some(columns) => this
+                            .responses
+                            .check(SimpleQueryRow::new(columns.clone(), body))?,
                         None => return Poll::Ready(Some(Err(this.responses.unexpected()))),
                     };
                     return Poll::Ready(Some(Ok(SimpleQueryMessage::Row(row))));

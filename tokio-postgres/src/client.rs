@@ -54,7 +54,9 @@ impl Responses {
                 }
             };
             match message {
-                Some(Message::ErrorResponse(body)) => return Poll::Ready(Err(Error::db(body))),
+                Some(Message::ErrorResponse(body)) => {
+                    return Poll::Ready(self.check(Err(Error::db(body))))
+                }
                 Some(message) => return Poll::Ready(Ok(message)),
                 None => {}
             }
@@ -76,6 +78,17 @@ impl Responses {
     pub fn unexpected(&self) -> Error {
         self.session.poison();
         Error::unexpected_message()
+    }
+
+    /// Passes `result` through, poisoning the session if it failed because a
+    /// response could not be parsed or was unexpected.
+    pub fn check<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if let Err(e) = &result {
+            if e.is_protocol_violation() {
+                self.session.poison();
+            }
+        }
+        result
     }
 }
 

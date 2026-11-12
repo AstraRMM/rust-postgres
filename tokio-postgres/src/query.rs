@@ -120,7 +120,7 @@ where
         match responses.next().await? {
             Message::DataRow(_) => {}
             Message::CommandComplete(body) => {
-                rows = extract_row_affected(&body)?;
+                rows = responses.check(extract_row_affected(&body))?;
             }
             Message::EmptyQueryResponse => rows = 0,
             Message::ReadyForQuery(_) => return Ok(rows),
@@ -227,10 +227,12 @@ impl Stream for RowStream {
         loop {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::DataRow(body) => {
-                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+                    return Poll::Ready(Some(Ok(this
+                        .responses
+                        .check(Row::new(this.statement.clone(), body))?)))
                 }
                 Message::CommandComplete(body) => {
-                    *this.rows_affected = Some(extract_row_affected(&body)?);
+                    *this.rows_affected = Some(this.responses.check(extract_row_affected(&body))?);
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),

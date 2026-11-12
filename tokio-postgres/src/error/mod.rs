@@ -540,6 +540,12 @@ impl Error {
         }
     }
 
+    /// An unexpected or unparseable server message: the response broke its
+    /// request's protocol.
+    pub(crate) fn is_protocol_violation(&self) -> bool {
+        matches!(self.0.kind, Kind::UnexpectedMessage | Kind::Parse)
+    }
+
     pub(crate) fn parse(e: io::Error) -> Error {
         Error::new(Kind::Parse, Some(Box::new(e)))
     }
