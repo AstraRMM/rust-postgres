@@ -1234,18 +1234,16 @@ impl<T: PoolTls> Pool<T> {
             .scope((), async {
                 let held = self.take_idle().await;
                 let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
+                let idle_spare = (held.len() as u32 - retiring)
+                    .saturating_sub(shared.config.min_idle.unwrap_or(0));
                 let mut surplus = self
                     .inner
                     .pool
                     .state()
                     .connections
                     .saturating_sub(retiring)
-                    .saturating_sub(
-                        shared
-                            .config
-                            .warm_floor
-                            .max(shared.config.min_idle.unwrap_or(0)),
-                    );
+                    .saturating_sub(shared.config.warm_floor)
+                    .min(idle_spare);
                 let mut need = 0u64;
                 let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
                     held.iter()

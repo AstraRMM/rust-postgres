@@ -1095,11 +1095,11 @@ async fn a_failing_new_generation_never_drains_the_old_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hand_off_is_bounded_when_every_old_session_is_borrowed() {
+async fn borrowed_old_sessions_are_never_cut_off_for_an_unverified_rotation() {
     let cluster = Cluster::new("hb");
     let a = Node::start(&cluster).await;
     cluster.publish(&[(&a, "z1")]);
-    let realm = Realm::new("bounded-hand-off");
+    let realm = Realm::new("borrowed-hand-off");
     let pg = driver_config(&a, &realm, "load_balance=true");
     let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
         Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(2, 2)))
@@ -1112,26 +1112,28 @@ async fn hand_off_is_bounded_when_every_old_session_is_borrowed() {
     let old = set.pool(&gen0).unwrap();
     assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
     let held = [old.get().await.unwrap(), old.get().await.unwrap()];
-    let started = Instant::now();
     let new = set
         .pool(&gen0.clone().with_credential_generation(1))
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     assert!(
-        eventually(Duration::from_secs(3), || old.is_closed()).await,
-        "the hand-off never reached its deadline"
+        !old.is_closed(),
+        "the rotation was not verified, yet the old generation drained"
     );
-    let drain_began = started.elapsed();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for client in &held {
+        assert!(client.simple_query("select node").await.is_ok());
+    }
+    let returned = Instant::now();
     drop(held);
-    let warmed = eventually(Duration::from_secs(5), || new.state().physical == 2).await;
+    let warmed = eventually(Duration::from_secs(5), || {
+        new.state().physical == 2 && old.is_closed() && old.state().physical == 0
+    })
+    .await;
     println!(
-        "EVIDENCE bounded hand-off: every old session borrowed, limit 2; drain began after {:?} \
-         (drain_timeout 500 ms); new generation warm={} physical={}",
-        drain_began,
-        warmed,
-        new.state().physical
+        "EVIDENCE borrowed hand-off: every old session borrowed past the 500 ms deadline and still \
+         served; after they returned, new generation warm and old drained in {:?}",
+        returned.elapsed()
     );
-    assert!(drain_began < Duration::from_millis(1500));
     assert!(warmed);
     set.shutdown(Duration::from_secs(1)).await;
 }

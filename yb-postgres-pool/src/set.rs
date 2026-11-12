@@ -337,12 +337,14 @@ impl<T: PoolTls> PoolSet<T> {
     }
 }
 
-/// Moves warm capacity from superseded generations to `warming` within
-/// `drain_timeout`. The old generations keep serving and keep their own
-/// floor; one old idle session is closed at a time only when the new
-/// generation is short of permits, and the old generations refill if a new
-/// connection then fails. If the new generation cannot connect by the
-/// deadline the old ones are left serving; otherwise they drain.
+/// Moves warm capacity from superseded generations to `warming`. The old
+/// generations keep serving and keep their own floor; one old idle session
+/// is closed at a time only when the new generation is short of permits,
+/// and the old generations refill if a new connection then fails (retried
+/// with backoff for as long as the set lives). The old generations drain
+/// (within `drain_timeout`) only once the new generation has connected and
+/// either reached its floor or `drain_timeout` has passed; borrowed old
+/// sessions are never cut off for an unverified rotation.
 async fn hand_off<T: PoolTls>(
     set: Weak<SetInner<T>>,
     warming: Pool<T>,
@@ -379,32 +381,35 @@ async fn hand_off<T: PoolTls>(
                 .map_or(true, |inner| inner.closed.load(Ordering::SeqCst))
     };
     set_superseded(false);
+    let connects = warming.state().stats.connects;
     let mut awaiting: Option<(u32, u32)> = None;
-    let ready = loop {
+    let mut failing = interval;
+    loop {
         if stopped() {
             if !cancel.load(Ordering::SeqCst) {
                 set_superseded(false);
             }
             return;
         }
+        if floor == 0 && min_idle == 0 {
+            break;
+        }
         let failures = warming.state().stats.connect_failures;
         warming.top_up().await;
         let state = warming.state();
-        if state.physical >= floor && state.idle >= min_idle {
-            break true;
+        let validated = state.stats.connects > connects;
+        let ready = state.physical >= floor && state.idle >= min_idle;
+        if validated && (ready || Instant::now() >= deadline) {
+            break;
         }
         if state.stats.connect_failures > failures {
             set_superseded(false);
             awaiting = None;
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(failing).await;
+            failing = (failing * 2).min(Duration::from_secs(5));
             continue;
         }
-        if Instant::now() >= deadline {
-            break true;
-        }
+        failing = interval;
         if let Some((before, waited)) = awaiting {
             if state.physical <= before && waited < 20 {
                 awaiting = Some((before, waited + 1));
@@ -422,14 +427,6 @@ async fn hand_off<T: PoolTls>(
         }
         awaiting = closed.then_some((state.physical, 0));
         tokio::time::sleep(interval).await;
-    };
-    if !ready {
-        log::warn!(
-            "pool set: {:?} could not connect within {:?}; the superseded generation keeps serving",
-            warming,
-            drain
-        );
-        return;
     }
     set_superseded(true);
     let draining = futures_util::future::join_all(old.iter().map(|(_, p)| p.shutdown(drain)));
