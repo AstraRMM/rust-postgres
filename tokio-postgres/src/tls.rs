@@ -209,6 +209,10 @@ pub enum TlsFailureKind {
     NotYetValid,
     /// The server certificate has been revoked by a configured CRL.
     Revoked,
+    /// A configured CRL needed to check the server chain is past its
+    /// `nextUpdate` and CRL expiry is enforced
+    /// (`rustls::CrlExpiration::Enforce`).
+    CrlExpired,
     /// The server certificate was rejected for another reason.
     InvalidCertificate,
     /// The server rejected the client certificate.

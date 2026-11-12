@@ -45,7 +45,7 @@ tls() {
   chmod 755 "$fix"/*.sh
 
   step "containers"
-  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated yb-a yb-b >/dev/null 2>&1
+  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained yb-a yb-b >/dev/null 2>&1
   pg() { local name=$1; shift; docker run -d --name "$name" --network host -e POSTGRES_PASSWORD=qualification-only \
     -v "$fix:/fixtures:ro" --entrypoint /fixtures/pg-entry.sh "$pg_image" "$@" >/dev/null; }
   pg pg-valid 55432 server-valid scram
@@ -54,10 +54,11 @@ tls() {
   pg pg-nossl 55435 none plain
   pg pg-tls12 55436 server-valid scram -c ssl_max_protocol_version=TLSv1.2
   pg pg-rotated 55437 server-rotated scram
+  pg pg-chained 55438 server-chained scram
   yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-entry.sh "$yb_image" "$2" "$3" "$4" >/dev/null; }
   yb yb-a 127.0.0.2 yb-a 0
   yb yb-b 127.0.0.3 yb-b 1
-  for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated; do
+  for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained; do
     wait_for "$name" 120 docker exec "$name" pg_isready -h 127.0.0.1 -p "$(docker inspect -f '{{index .Args 0}}' "$name")" || return 1
   done
   wait_for yb-a 420 docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select 1' || return 1

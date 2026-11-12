@@ -4,41 +4,31 @@
 //! fixture directory; nothing here is a real credential.
 
 use rcgen::{
-    date_time_ymd, BasicConstraints, Certificate, CertificateParams,
-    CertificateRevocationListParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyIdMethod, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SanType,
-    SerialNumber,
+    date_time_ymd, Certificate, CertificateParams, ExtendedKeyUsagePurpose, KeyPair,
+    KeyUsagePurpose, SanType, SerialNumber,
 };
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
+use tls_qualification::{ca_params, crl, name, CA_A_CN};
 
 struct Ca {
     cert: Certificate,
     key: KeyPair,
 }
 
-fn name(cn: &str) -> DistinguishedName {
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::OrganizationName, "AST-2128 qualification");
-    dn.push(DnType::CommonName, cn);
-    dn
+fn ca(cn: &str) -> Ca {
+    let key = KeyPair::generate().unwrap();
+    let cert = ca_params(cn, None).self_signed(&key).unwrap();
+    Ca { cert, key }
 }
 
-fn ca(cn: &str) -> Ca {
-    let mut params = CertificateParams::default();
-    params.distinguished_name = name(cn);
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    params.not_before = date_time_ymd(2024, 1, 1);
-    params.not_after = date_time_ymd(2036, 1, 1);
+fn intermediate(issuer: &Ca, cn: &str, serial: u64) -> Ca {
     let key = KeyPair::generate().unwrap();
-    let cert = params.self_signed(&key).unwrap();
+    let cert = ca_params(cn, Some(serial))
+        .signed_by(&key, &issuer.cert, &issuer.key)
+        .unwrap();
     Ca { cert, key }
 }
 
@@ -94,10 +84,12 @@ fn main() {
     let current = (date_time_ymd(2025, 1, 1), date_time_ymd(2035, 1, 1));
     let expired = (date_time_ymd(2020, 1, 1), date_time_ymd(2021, 1, 1));
 
-    let ca_a = ca("qualification CA A");
+    let ca_a = ca(CA_A_CN);
     let ca_a2 = ca("qualification CA A2 (rotated)");
     let ca_b = ca("qualification CA B (untrusted)");
     write(&dir, "ca-a.crt", &ca_a.cert.pem());
+    // Lets tests sign short-lived CRLs at test time (see `tls_qualification::load_ca`).
+    write(&dir, "ca-a.key", &ca_a.key.serialize_pem());
     write(&dir, "ca-a2.crt", &ca_a2.cert.pem());
     write(&dir, "ca-b.crt", &ca_b.cert.pem());
     write(
@@ -130,33 +122,36 @@ fn main() {
     // A key that matches no certificate.
     write(&dir, "unrelated.key", &KeyPair::generate().unwrap().serialize_pem());
 
-    let crl = CertificateRevocationListParams {
-        this_update: date_time_ymd(2025, 1, 1),
-        next_update: date_time_ymd(2035, 1, 1),
-        crl_number: SerialNumber::from(1u64),
-        issuing_distribution_point: None,
-        revoked_certs: vec![RevokedCertParams {
-            serial_number: SerialNumber::from(1001u64),
-            revocation_time: date_time_ymd(2025, 6, 1),
-            reason_code: Some(RevocationReason::KeyCompromise),
-            invalidity_date: None,
-        }],
-        key_identifier_method: KeyIdMethod::Sha256,
-    }
-    .signed_by(&ca_a.cert, &ca_a.key)
-    .unwrap();
-    write(&dir, "crl-a-revokes-server-valid.pem", &crl.pem().unwrap());
-    let empty_crl = CertificateRevocationListParams {
-        this_update: date_time_ymd(2025, 1, 1),
-        next_update: date_time_ymd(2035, 1, 1),
-        crl_number: SerialNumber::from(2u64),
-        issuing_distribution_point: None,
-        revoked_certs: vec![],
-        key_identifier_method: KeyIdMethod::Sha256,
-    }
-    .signed_by(&ca_a.cert, &ca_a.key)
-    .unwrap();
-    write(&dir, "crl-a-empty.pem", &empty_crl.pem().unwrap());
+    let (this_update, next_update) = (date_time_ymd(2025, 1, 1), date_time_ymd(2035, 1, 1));
+    let crl_pem = |issuer: &Ca, number: u64, next_update: OffsetDateTime, revoked: &[u64]| {
+        // thisUpdate must precede nextUpdate; the stale CRL is issued earlier.
+        let this_update = if next_update > this_update { this_update } else { date_time_ymd(2024, 1, 1) };
+        crl(&issuer.cert, &issuer.key, number, this_update, next_update, revoked)
+            .pem()
+            .unwrap()
+    };
+    write(&dir, "crl-a-revokes-server-valid.pem", &crl_pem(&ca_a, 1, next_update, &[1001]));
+    write(&dir, "crl-a-empty.pem", &crl_pem(&ca_a, 2, next_update, &[]));
+    // Past its nextUpdate, revoking nothing.
+    write(&dir, "crl-a-expired.pem", &crl_pem(&ca_a, 3, date_time_ymd(2024, 6, 1), &[]));
+    // nextUpdate from 2050 on is encoded as GeneralizedTime rather than UTCTime.
+    write(&dir, "crl-a-empty-2051.pem", &crl_pem(&ca_a, 4, date_time_ymd(2051, 3, 1), &[]));
+
+    // A three-level chain: root CA C -> intermediate CA C1 (serial 6001) ->
+    // server leaf. The server presents the leaf and the intermediate.
+    let ca_c = ca("qualification CA C");
+    let int_c1 = intermediate(&ca_c, "qualification intermediate CA C1", 6001);
+    write(&dir, "ca-c.crt", &ca_c.cert.pem());
+    let chained = leaf(&int_c1, "pg.test", &pg_sans, 5001, false, current);
+    write(
+        &dir,
+        "server-chained.crt",
+        &format!("{}{}", chained.0.pem(), int_c1.cert.pem()),
+    );
+    write(&dir, "server-chained.key", &chained.1.serialize_pem());
+    write(&dir, "crl-c-revokes-int-c1.pem", &crl_pem(&ca_c, 1, next_update, &[6001]));
+    write(&dir, "crl-c-empty.pem", &crl_pem(&ca_c, 2, next_update, &[]));
+    write(&dir, "crl-c1-empty.pem", &crl_pem(&int_c1, 1, next_update, &[]));
 
     println!("fixtures written to {}", dir.display());
 }

@@ -1,9 +1,10 @@
-//! Minimal, bounds-checked DER reading for the two certificate facts the
-//! adapter needs outside rustls: the signature algorithm (for RFC 5929
-//! `tls-server-end-point` channel binding) and the validity window (to reject
-//! credential material that is already outside its validity period when it is
-//! loaded). Chain and identity verification is never done here; that is
-//! rustls-webpki's job.
+//! Minimal, bounds-checked DER reading for the facts the adapter needs
+//! outside rustls: a certificate's signature algorithm (for RFC 5929
+//! `tls-server-end-point` channel binding), a certificate's validity window
+//! (to reject credential material that is already outside its validity period
+//! when it is loaded), and a CRL's `nextUpdate` (reported for alerting and
+//! checked at load when CRL expiry is enforced). Chain, identity and
+//! revocation verification is never done here; that is rustls-webpki's job.
 
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -73,6 +74,32 @@ pub(crate) fn validity(cert: &[u8]) -> Option<(i64, i64)> {
     let (tag, not_after, _) = read_tlv(rest)?;
     let not_after = parse_time(tag, not_after)?;
     Some((not_before, not_after))
+}
+
+/// Returns a CRL's `nextUpdate` as Unix seconds, or `None` when the CRL is
+/// malformed or has no `nextUpdate` (RFC 5280 §5.1.2.5 requires one;
+/// rustls-webpki rejects CRLs without it).
+///
+/// ```text
+/// CertificateList ::= SEQUENCE { tbsCertList, signatureAlgorithm, signatureValue }
+/// TBSCertList ::= SEQUENCE {
+///     version INTEGER OPTIONAL, signature AlgorithmIdentifier, issuer Name,
+///     thisUpdate Time, nextUpdate Time OPTIONAL, ... }
+/// ```
+pub(crate) fn crl_next_update(crl: &[u8]) -> Option<i64> {
+    let (list, _) = expect(crl, SEQUENCE)?;
+    let (tbs, _) = expect(list, SEQUENCE)?;
+    let mut rest = tbs;
+    let (tag, _, after) = read_tlv(rest)?;
+    if tag == INTEGER {
+        rest = after; // version
+    }
+    let (_, rest) = expect(rest, SEQUENCE)?; // signature
+    let (_, rest) = expect(rest, SEQUENCE)?; // issuer
+    let (tag, this_update, rest) = read_tlv(rest)?;
+    parse_time(tag, this_update)?;
+    let (tag, next_update, _) = read_tlv(rest)?;
+    parse_time(tag, next_update)
 }
 
 fn digits(input: &[u8]) -> Option<i64> {

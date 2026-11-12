@@ -1,19 +1,22 @@
 //! AST-2128 real-engine qualification of `sslmode=verify-full`.
 //!
 //! Requires the rig from `tls-qualification/rig/run.sh`: PostgreSQL 16
-//! fixtures on 55432-55437 and two single-node YugabyteDB 2025.2.5.2-b5
+//! fixtures on 55432-55438 and two single-node YugabyteDB 2025.2.5.2-b5
 //! universes ("realms") on 127.0.0.2 and 127.0.0.3. Fixtures are read from
 //! `TLS_QUAL_FIXTURES`.
 
+use rcgen::date_time_ymd;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tls_qualification::{crl, load_ca, pem, CA_A_CN};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use yb_tokio_postgres::endpoint::{EndpointPolicy, NodeEndpoint};
 use yb_tokio_postgres::rustls::{
-    MakeRustlsConnect, ProtocolVersions, TlsConfigErrorKind, TlsMaterial, TlsOptions,
+    CrlExpiration, MakeRustlsConnect, ProtocolVersions, RevocationDepth, TlsConfigErrorKind,
+    TlsMaterial, TlsOptions,
 };
 use yb_tokio_postgres::tls::TlsFailureKind;
 use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
@@ -25,6 +28,8 @@ const PG_EXPIRED: u16 = 55434;
 const PG_NOSSL: u16 = 55435;
 const PG_TLS12: u16 = 55436;
 const PG_ROTATED: u16 = 55437;
+/// Serves leaf + intermediate CA C1, chaining to root CA C.
+const PG_CHAINED: u16 = 55438;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(std::env::var("TLS_QUAL_FIXTURES").expect("TLS_QUAL_FIXTURES")).join(name)
@@ -57,6 +62,14 @@ fn connector(material: &TlsMaterial) -> MakeRustlsConnect {
         assert!(tls.current().fips(), "FIPS provider must report FIPS mode");
     }
     tls
+}
+
+fn connector_with(material: &TlsMaterial, f: impl FnOnce(TlsOptions) -> TlsOptions) -> MakeRustlsConnect {
+    MakeRustlsConnect::new(material, f(options())).unwrap()
+}
+
+fn unix(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 fn pg(port: u16, host: &str) -> String {
@@ -252,6 +265,153 @@ async fn revoked_server_certificate() {
     expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::Revoked);
     let clean = connector(&roots("ca-a.crt").with_crl(read("crl-a-empty.pem")));
     open(&pg(PG_VALID, "localhost"), &clean).await.unwrap();
+}
+
+// ------------------------------------------------------- CRL policy (ASTS-96)
+
+#[tokio::test]
+async fn crl_policy_defaults_are_unchanged() {
+    assert_eq!(
+        TlsOptions::new(),
+        TlsOptions::new()
+            .revocation_depth(RevocationDepth::EndEntity)
+            .crl_expiration(CrlExpiration::Ignore)
+    );
+    let tls = connector(&roots("ca-a.crt"));
+    assert_eq!(tls.current().revocation_depth(), RevocationDepth::EndEntity);
+    assert_eq!(tls.current().crl_expiration(), CrlExpiration::Ignore);
+    assert_eq!(tls.current().earliest_crl_next_update(), None);
+}
+
+#[tokio::test]
+async fn crl_next_update_is_reported_for_alerting() {
+    let utc = date_time_ymd(2035, 1, 1).unix_timestamp();
+    let generalized = date_time_ymd(2051, 3, 1).unix_timestamp();
+    let next = |m: TlsMaterial| unix(connector(&m).current().earliest_crl_next_update().unwrap());
+    assert_eq!(next(roots("ca-a.crt").with_crl(read("crl-a-empty.pem"))), utc);
+    assert_eq!(next(roots("ca-a.crt").with_crl(read("crl-a-empty-2051.pem"))), generalized);
+    // The earliest across every loaded CRL, including several in one PEM.
+    let both = [read("crl-a-empty-2051.pem"), read("crl-a-revokes-server-valid.pem")].concat();
+    assert_eq!(next(roots("ca-a.crt").with_crl(both)), utc);
+    let expired = date_time_ymd(2024, 6, 1).unix_timestamp();
+    assert_eq!(
+        next(roots("ca-a.crt").with_crl(read("crl-a-empty.pem")).with_crl(read("crl-a-expired.pem"))),
+        expired
+    );
+}
+
+#[tokio::test]
+async fn stale_crl_is_still_used_by_default_and_reported() {
+    let tls = connector(&roots("ca-a.crt").with_crl(read("crl-a-expired.pem")));
+    let next_update = tls.current().earliest_crl_next_update().unwrap();
+    assert!(next_update < SystemTime::now(), "the fixture CRL must be stale");
+    open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+}
+
+#[tokio::test]
+async fn enforced_crl_expiry_rejects_stale_material_and_keeps_the_current_generation() {
+    let enforce = |o: TlsOptions| o.crl_expiration(CrlExpiration::Enforce);
+    let stale = roots("ca-a.crt").with_crl(read("crl-a-expired.pem"));
+    let err = MakeRustlsConnect::new(&stale, enforce(options())).unwrap_err();
+    assert_eq!(err.kind(), TlsConfigErrorKind::CrlExpired, "{err}");
+
+    let tls = connector_with(&roots("ca-a.crt").with_crl(read("crl-a-empty.pem")), enforce);
+    assert_eq!(tls.current().crl_expiration(), CrlExpiration::Enforce);
+    let before = tls.current().id();
+    let err = tls.reload(&stale).unwrap_err();
+    assert_eq!(err.kind(), TlsConfigErrorKind::CrlExpired, "{err}");
+    assert_eq!(tls.current().id(), before);
+    open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
+}
+
+#[tokio::test]
+async fn enforced_crl_expiry_applies_to_a_crl_that_expires_after_loading() {
+    let (ca, key) = load_ca(CA_A_CN, std::str::from_utf8(&read("ca-a.key")).unwrap());
+    let now = time::OffsetDateTime::now_utc();
+    let short = crl(&ca, &key, 10, now - time::Duration::minutes(1), now + time::Duration::seconds(20), &[])
+        .pem()
+        .unwrap();
+    let material = roots("ca-a.crt").with_crl(short);
+    let enforced = connector_with(&material, |o| o.crl_expiration(CrlExpiration::Enforce));
+    let ignored = connector(&material);
+    open(&pg(PG_VALID, "localhost"), &enforced).await.unwrap();
+
+    // Wait until the reported nextUpdate has passed (whole-second precision).
+    let next_update = enforced.current().earliest_crl_next_update().unwrap();
+    let wait = next_update.duration_since(SystemTime::now()).unwrap_or_default() + Duration::from_secs(2);
+    tokio::time::sleep(wait).await;
+    assert!(next_update < SystemTime::now());
+    let e = expect_tls(open(&pg(PG_VALID, "localhost"), &enforced).await, TlsFailureKind::CrlExpired);
+    let rendered = format!("{e} {e:?}");
+    assert!(rendered.contains("nextUpdate"), "{rendered}");
+    open(&pg(PG_VALID, "localhost"), &ignored).await.unwrap();
+}
+
+#[tokio::test]
+async fn revoked_intermediate_is_refused_only_with_chain_depth() {
+    let chain = |o: TlsOptions| o.revocation_depth(RevocationDepth::Chain);
+    let revoked = || {
+        roots("ca-c.crt")
+            .with_crl(read("crl-c-revokes-int-c1.pem"))
+            .with_crl(read("crl-c1-empty.pem"))
+    };
+
+    // Default: only the end-entity certificate is checked.
+    let leaf_only = connector(&revoked());
+    open(&pg(PG_CHAINED, "localhost"), &leaf_only).await.unwrap();
+
+    let tls = connector_with(&revoked(), chain);
+    assert_eq!(tls.current().revocation_depth(), RevocationDepth::Chain);
+    let e = expect_tls(open(&pg(PG_CHAINED, "localhost"), &tls).await, TlsFailureKind::Revoked);
+    let rendered = format!("{e} {e:?}");
+    assert!(rendered.contains("has been revoked"), "{rendered}");
+
+    // Clean CRLs from every issuer in the chain: accepted.
+    let clean = connector_with(
+        &roots("ca-c.crt").with_crl(read("crl-c-empty.pem")).with_crl(read("crl-c1-empty.pem")),
+        chain,
+    );
+    open(&pg(PG_CHAINED, "localhost"), &clean).await.unwrap();
+
+    // No CRL from the root that issued the intermediate: fails closed.
+    let missing = connector_with(&roots("ca-c.crt").with_crl(read("crl-c1-empty.pem")), chain);
+    let e = expect_tls(open(&pg(PG_CHAINED, "localhost"), &missing).await, TlsFailureKind::Revoked);
+    let rendered = format!("{e} {e:?}");
+    assert!(rendered.contains("unknown"), "{rendered}");
+}
+
+#[tokio::test]
+async fn crl_der_reading_survives_truncation_and_corruption() {
+    let (ca, key) = load_ca(CA_A_CN, std::str::from_utf8(&read("ca-a.key")).unwrap());
+    let next_update = date_time_ymd(2035, 1, 1);
+    let der = crl(&ca, &key, 11, date_time_ymd(2025, 1, 1), next_update, &[1001])
+        .der()
+        .to_vec();
+    let load = |der: &[u8]| {
+        MakeRustlsConnect::new(&roots("ca-a.crt").with_crl(pem("X509 CRL", der)), options())
+    };
+    let tls = load(&der).unwrap();
+    assert_eq!(unix(tls.current().earliest_crl_next_update().unwrap()), next_update.unix_timestamp());
+
+    for len in 0..der.len() {
+        match load(&der[..len]) {
+            Ok(_) => panic!("a CRL truncated to {len} of {} bytes was accepted", der.len()),
+            Err(e) => assert_eq!(e.kind(), TlsConfigErrorKind::InvalidCrl, "len {len}: {e}"),
+        }
+    }
+    for i in 0..der.len() {
+        for value in [0x00, 0xff, der[i] ^ 0x01, der[i] ^ 0x80] {
+            let mut corrupt = der.clone();
+            corrupt[i] = value;
+            match load(&corrupt) {
+                Ok(tls) => {
+                    assert_eq!(tls.current().crls(), 1);
+                    assert!(tls.current().earliest_crl_next_update().is_some(), "byte {i}");
+                }
+                Err(e) => assert_eq!(e.kind(), TlsConfigErrorKind::InvalidCrl, "byte {i}: {e}"),
+            }
+        }
+    }
 }
 
 #[tokio::test]
