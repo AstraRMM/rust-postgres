@@ -617,7 +617,7 @@ impl From<yb_tokio_postgres::Config> for Config {
             config,
             notice_callback: Arc::new(|notice| {
                 // Notice text can quote SQL, parameters or row values (AST-2133).
-                info!("{} ({})", notice.severity(), notice.code().code())
+                info!("{}", yb_tokio_postgres::observe::RedactedDb(&notice))
             }),
         }
     }

@@ -1235,10 +1235,8 @@ impl Config {
                     .ok_or_else(|| Error::config_parse(Box::new(InvalidValue("yb_max_attempts"))))?;
                 self.yb_max_attempts(attempts);
             }
-            key => {
-                return Err(Error::config_parse(Box::new(UnknownOption(
-                    key.to_string(),
-                ))));
+            _ => {
+                return Err(Error::config_parse(Box::new(UnknownOption)));
             }
         }
 
@@ -1325,7 +1323,7 @@ impl fmt::Debug for Config {
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| Redaction {}))
             .field("dbname", &self.dbname)
-            .field("options", &self.options)
+            .field("options", &self.options.as_ref().map(|_| Redaction {}))
             .field("application_name", &self.application_name)
             .field("ssl_mode", &self.ssl_mode)
             .field("ssl_root_cert", &self.ssl_root_cert.as_ref().map(|_| Redaction {}))
@@ -1364,7 +1362,10 @@ impl fmt::Debug for Config {
 }
 
 /// Debug view of configured hosts: TCP hosts appear only as keyed endpoint
-/// labels, so a logged `Config` never reveals addresses or names.
+/// labels. Together with the endpoint policy's own redacted Debug and the
+/// omitted credentials, TLS inputs and `options`, a logged `Config` reveals
+/// no addresses or endpoint names; `user`, `dbname` and `application_name`
+/// are printed as configured.
 struct RedactedHosts<'a>(&'a [Host]);
 
 impl fmt::Debug for RedactedHosts<'_> {
@@ -1379,12 +1380,15 @@ impl fmt::Debug for RedactedHosts<'_> {
     }
 }
 
+/// An unrecognised connection-string key. The key text is not kept, since a
+/// malformed connection string can place other parts of the string, including
+/// credentials, where a key is expected.
 #[derive(Debug)]
-struct UnknownOption(String);
+struct UnknownOption;
 
 impl fmt::Display for UnknownOption {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "unknown option `{}`", self.0)
+        fmt.write_str("unknown option (name withheld)")
     }
 }
 

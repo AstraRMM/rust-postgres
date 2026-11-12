@@ -86,7 +86,10 @@ pub enum NodeRole {
 }
 
 /// One node of a validated topology snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` output shows the identity and public IP only as keyed
+/// [`endpoint::label`](crate::endpoint::label)s.
+#[derive(Clone, PartialEq, Eq)]
 pub struct NodeInfo {
     identity: String,
     port: u16,
@@ -125,6 +128,21 @@ impl NodeInfo {
             _ => return false,
         };
         cloud == self.cloud && region == self.region && (zone == "*" || zone == self.zone)
+    }
+}
+
+impl fmt::Debug for NodeInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeInfo")
+            .field("identity", &crate::endpoint::label(&self.identity))
+            .field("port", &self.port)
+            .field("role", &self.role)
+            .field("placement", &self.placement())
+            .field(
+                "public_ip",
+                &self.public_ip.as_deref().map(crate::endpoint::label),
+            )
+            .finish()
     }
 }
 
@@ -303,7 +321,7 @@ impl Realm {
             config.ssl_root_cert,
             config.ssl_cert,
             config.ssl_crl,
-            config.endpoint_policy,
+            config.endpoint_policy.as_deref().map(|p| p.key_material()),
             config.dbname,
         ));
         let mut realms = IMPLICIT_REALMS.lock();

@@ -24,7 +24,10 @@ use std::fmt;
 use std::net::IpAddr;
 
 /// How a trusted node identity is dialled and verified.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Its `Debug` output shows the dial address and TLS name only as keyed
+/// [`label`]s.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct NodeEndpoint {
     dial: Option<String>,
     tls_name: Option<String>,
@@ -58,6 +61,16 @@ impl NodeEndpoint {
     }
 }
 
+impl fmt::Debug for NodeEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeEndpoint")
+            .field("dial", &self.dial.as_deref().map(label))
+            .field("tls_name", &self.tls_name.as_deref().map(label))
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
 /// An error building an [`EndpointPolicy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointPolicyError(&'static str);
@@ -83,10 +96,43 @@ impl std::error::Error for EndpointPolicyError {}
 ///    [`EndpointPolicy::admit_dns_suffix`] (dialled and verified by that name).
 ///
 /// IP identities are only admitted explicitly or as seeds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Its `Debug` output shows node identities, dial addresses, TLS names and
+/// DNS suffixes only as keyed [`label`]s.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct EndpointPolicy {
     nodes: BTreeMap<String, NodeEndpoint>,
     dns_suffixes: Vec<String>,
+}
+
+impl fmt::Debug for EndpointPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Nodes<'a>(&'a BTreeMap<String, NodeEndpoint>);
+        impl fmt::Debug for Nodes<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_map()
+                    .entries(
+                        self.0
+                            .iter()
+                            .map(|(identity, node)| (label(identity), node)),
+                    )
+                    .finish()
+            }
+        }
+
+        f.debug_struct("EndpointPolicy")
+            .field("nodes", &Nodes(&self.nodes))
+            .field(
+                "dns_suffixes",
+                &self
+                    .dns_suffixes
+                    .iter()
+                    .map(String::as_str)
+                    .map(label)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl EndpointPolicy {
@@ -134,6 +180,17 @@ impl EndpointPolicy {
         }
         self.dns_suffixes.push(format!(".{}", suffix));
         Ok(self)
+    }
+
+    /// The complete, unredacted policy, used only as an in-memory realm key.
+    /// Never log it.
+    pub(crate) fn key_material(&self) -> String {
+        let nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(identity, node)| (identity, &node.dial, &node.tls_name, node.port))
+            .collect();
+        format!("{:?}|{:?}", nodes, self.dns_suffixes)
     }
 
     pub(crate) fn node(&self, identity: &str) -> Option<&NodeEndpoint> {

@@ -467,7 +467,7 @@ where
             if let AsyncMessage::Notice(notice) = message {
                 // Notice text can quote SQL, parameters or row values; log
                 // only its severity and SQLSTATE.
-                info!("{} ({})", notice.severity(), notice.code().code());
+                info!("{}", crate::observe::RedactedDb(&notice));
             }
         }
         Poll::Ready(Ok(()))

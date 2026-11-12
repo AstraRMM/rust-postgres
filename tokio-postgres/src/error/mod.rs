@@ -207,6 +207,12 @@ impl DbError {
         self.parsed_severity
     }
 
+    /// `parsed_severity`, or else `severity` when it names a known severity.
+    pub(crate) fn known_severity(&self) -> Option<Severity> {
+        self.parsed_severity
+            .or_else(|| Severity::from_str(&self.severity))
+    }
+
     /// The SQLSTATE code for the error.
     pub fn code(&self) -> &SqlState {
         &self.code
@@ -377,6 +383,17 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_kind(fmt)?;
+        if let Some(ref cause) = self.0.cause {
+            write!(fmt, ": {}", cause)?;
+        }
+        Ok(())
+    }
+}
+
+impl Error {
+    /// Writes the fixed description of the error's kind, without its cause.
+    pub(crate) fn fmt_kind(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0.kind {
             Kind::Io => fmt.write_str("error communicating with the server")?,
             Kind::UnexpectedMessage => fmt.write_str("unexpected message from server")?,
@@ -399,10 +416,13 @@ impl fmt::Display for Error {
             Kind::Connect => fmt.write_str("error connecting to server")?,
             Kind::Timeout => fmt.write_str("timeout waiting for server")?,
         };
-        if let Some(ref cause) = self.0.cause {
-            write!(fmt, ": {}", cause)?;
-        }
         Ok(())
+    }
+
+    /// Whether this is a parameter or column conversion error, whose cause
+    /// is written by a `ToSql`/`FromSql` implementation and can quote values.
+    pub(crate) fn is_conversion(&self) -> bool {
+        matches!(self.0.kind, Kind::ToSql(_) | Kind::FromSql(_))
     }
 }
 
