@@ -887,6 +887,7 @@ async fn an_unlisted_seed_has_no_standing() {
     let session = connect(&conf, &realm).await.unwrap();
     assert_eq!(node_of(&session).await, seed.ip);
     assert_eq!(session.client.node_standing(), NodeStanding::Unknown);
+}
 
 /// ASTS-83 (RUSTSEC-2026-0178): a DataRow with fewer fields than the row
 /// description is a protocol error, not an out-of-bounds panic, on both the
