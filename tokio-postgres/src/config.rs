@@ -33,6 +33,10 @@ use std::time::Duration;
 use std::{error, fmt, iter, mem};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Upper bound, in seconds, on the `yb_*` durations accepted from a
+/// connection string (one day).
+const MAX_YB_TIMEOUT_SECS: u64 = 86_400;
+
 /// Properties required of a session.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -290,6 +294,7 @@ pub enum Host {
 ///     node; TLS, authentication and other terminal failures never do.
 /// * `yb_acquire_timeout` - (default 30 seconds) Overall budget for one connection acquisition, covering topology
 ///     discovery, DNS, TCP, TLS, authentication and every retry. Also bounds direct (`load_balance=false`) connects.
+///     This and the other `yb_*` durations accept 1 to 86400 seconds.
 /// * `yb_attempt_timeout` - (default 10 seconds) Bound on one node attempt (DNS, TCP, TLS and authentication).
 /// * `yb_max_attempts` - (default 3, 1-32) How many eligible discovered nodes one acquisition may try after
 ///     transport failures.
@@ -1213,13 +1218,17 @@ impl Config {
                 }
             }
             "yb_acquire_timeout" | "yb_attempt_timeout" | "yb_topology_max_staleness" => {
-                let seconds = value.parse::<u64>().ok().filter(|s| *s > 0).ok_or_else(|| {
-                    Error::config_parse(Box::new(InvalidValue(match key {
-                        "yb_acquire_timeout" => "yb_acquire_timeout",
-                        "yb_attempt_timeout" => "yb_attempt_timeout",
-                        _ => "yb_topology_max_staleness",
-                    })))
-                })?;
+                let seconds = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|s| (1..=MAX_YB_TIMEOUT_SECS).contains(s))
+                    .ok_or_else(|| {
+                        Error::config_parse(Box::new(InvalidValue(match key {
+                            "yb_acquire_timeout" => "yb_acquire_timeout",
+                            "yb_attempt_timeout" => "yb_attempt_timeout",
+                            _ => "yb_topology_max_staleness",
+                        })))
+                    })?;
                 let duration = Duration::from_secs(seconds);
                 match key {
                     "yb_acquire_timeout" => self.yb_acquire_timeout(duration),

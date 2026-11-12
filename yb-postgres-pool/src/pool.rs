@@ -1705,7 +1705,8 @@ impl<T: PoolTls> Pool<T> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         self.drain_idle().await;
-        let deadline = Instant::now() + drain;
+        // `Duration::MAX` (or anything that overflows) waits without a bound.
+        let deadline = Instant::now().checked_add(drain);
         loop {
             let notified = shared.released.notified();
             tokio::pin!(notified);
@@ -1713,11 +1714,16 @@ impl<T: PoolTls> Pool<T> {
             if shared.borrowed.load(Ordering::SeqCst) == 0 {
                 break;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
+            match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let _ = tokio::time::timeout(deadline - now, notified).await;
+                }
+                None => notified.await,
             }
-            let _ = tokio::time::timeout(deadline - now, notified).await;
         }
         let borrowed_at_deadline = shared.borrowed.load(Ordering::SeqCst) as u32;
         let mut forced_closes = 0;
