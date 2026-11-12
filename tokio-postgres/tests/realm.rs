@@ -44,7 +44,15 @@ enum Discovery {
     SlowError(u64),
     /// Every DataRow carries fewer fields than its RowDescription announced.
     ShortRows,
+    /// The discovery query's `host` column has an unknown type whose lookup
+    /// names another unknown element type, without end.
+    TypeChain,
+    /// As `TypeChain`, but the element types refer back to each other.
+    TypeCycle,
 }
+
+/// The first unknown type OID the `TypeChain`/`TypeCycle` fixtures report.
+const UNKNOWN_TYPE: u32 = 100_000;
 
 #[derive(Clone, Debug)]
 struct NodeRow {
@@ -59,6 +67,7 @@ struct Cluster {
     rows: Arc<Mutex<Vec<NodeRow>>>,
     discovery: Arc<Mutex<Discovery>>,
     discoveries: Arc<AtomicUsize>,
+    type_lookups: Arc<AtomicUsize>,
     region: String,
 }
 
@@ -68,6 +77,7 @@ impl Cluster {
             rows: Arc::new(Mutex::new(Vec::new())),
             discovery: Arc::new(Mutex::new(Discovery::Rows)),
             discoveries: Arc::new(AtomicUsize::new(0)),
+            type_lookups: Arc::new(AtomicUsize::new(0)),
             region: region.to_string(),
         }
     }
@@ -164,9 +174,9 @@ async fn error(socket: &mut TcpStream, code: &str, text: &str) -> io::Result<()>
     message(socket, b'E', body.as_bytes()).await
 }
 
-fn metadata_description() -> Vec<u8> {
+fn metadata_description(host_type: u32) -> Vec<u8> {
     let columns = [
-        ("host", 25u32, -1i16),
+        ("host", host_type, -1i16),
         ("port", 20, 8),
         ("cloud", 25, -1),
         ("region", 25, -1),
@@ -187,6 +197,50 @@ fn metadata_description() -> Vec<u8> {
         payload.extend_from_slice(&0i16.to_be_bytes());
     }
     payload
+}
+
+/// The row description of the driver's `pg_type` lookup statement.
+fn typeinfo_description() -> Vec<u8> {
+    let columns = [
+        ("typname", 19u32),
+        ("typtype", 18),
+        ("typelem", 26),
+        ("rngsubtype", 26),
+        ("typbasetype", 26),
+        ("nspname", 19),
+        ("typrelid", 26),
+    ];
+    let mut payload = (columns.len() as u16).to_be_bytes().to_vec();
+    for (name, oid) in columns {
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
+        payload.extend_from_slice(&oid.to_be_bytes());
+        payload.extend_from_slice(&(-1i16).to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
+    }
+    payload
+}
+
+/// Splits a NUL-terminated string off the front of a frontend message body.
+fn cstr(body: &[u8]) -> (&[u8], &[u8]) {
+    let end = body.iter().position(|b| *b == 0).expect("NUL-terminated string");
+    (&body[..end], &body[end + 1..])
+}
+
+/// The value of the single binary parameter of a Bind message, if any.
+fn bind_parameter(body: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let (_portal, rest) = cstr(body);
+    let (statement, rest) = cstr(rest);
+    let formats = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    let rest = &rest[2 + 2 * formats..];
+    if u16::from_be_bytes([rest[0], rest[1]]) == 0 {
+        return (statement, None);
+    }
+    let len = i32::from_be_bytes([rest[2], rest[3], rest[4], rest[5]]) as usize;
+    (statement, Some(&rest[6..6 + len]))
 }
 
 fn data_row(values: &[Option<&[u8]>]) -> Vec<u8> {
@@ -242,6 +296,9 @@ async fn session(
     let _close = Close(open.clone());
 
     let mut discard_until_sync = false;
+    // Statements naming `pg_type`, and the type OID bound to the open portal.
+    let mut typeinfo_statements = Vec::<Vec<u8>>::new();
+    let mut typeinfo_oid = None;
     loop {
         let tag = match socket.read_u8().await {
             Ok(tag) => tag,
@@ -271,6 +328,12 @@ async fn session(
                 message(&mut socket, b'Z', b"I").await?;
             }
             b'P' => {
+                let (name, rest) = cstr(&body);
+                if cstr(rest).0.windows(7).any(|w| w == b"pg_type") {
+                    typeinfo_statements.push(name.to_vec());
+                    message(&mut socket, b'1', &[]).await?;
+                    continue;
+                }
                 cluster.discoveries.fetch_add(1, Ordering::SeqCst);
                 let discovery = *cluster.discovery.lock().unwrap();
                 match discovery {
@@ -291,11 +354,54 @@ async fn session(
                     _ => message(&mut socket, b'1', &[]).await?,
                 }
             }
-            b'D' => {
-                message(&mut socket, b't', &0u16.to_be_bytes()).await?;
-                message(&mut socket, b'T', &metadata_description()).await?;
+            b'D' if typeinfo_statements.iter().any(|name| name[..] == body[1..body.len() - 1]) => {
+                let mut parameters = 1u16.to_be_bytes().to_vec();
+                parameters.extend_from_slice(&26u32.to_be_bytes());
+                message(&mut socket, b't', &parameters).await?;
+                message(&mut socket, b'T', &typeinfo_description()).await?;
             }
-            b'B' => message(&mut socket, b'2', &[]).await?,
+            b'D' => {
+                let host_type = match *cluster.discovery.lock().unwrap() {
+                    Discovery::TypeChain | Discovery::TypeCycle => UNKNOWN_TYPE,
+                    _ => 25,
+                };
+                message(&mut socket, b't', &0u16.to_be_bytes()).await?;
+                message(&mut socket, b'T', &metadata_description(host_type)).await?;
+            }
+            b'B' => {
+                let (statement, parameter) = bind_parameter(&body);
+                typeinfo_oid = match parameter {
+                    Some(oid) if typeinfo_statements.iter().any(|name| name[..] == *statement) => {
+                        Some(u32::from_be_bytes([oid[0], oid[1], oid[2], oid[3]]))
+                    }
+                    _ => None,
+                };
+                message(&mut socket, b'2', &[]).await?
+            }
+            b'E' if typeinfo_oid.is_some() => {
+                let oid = typeinfo_oid.take().unwrap();
+                cluster.type_lookups.fetch_add(1, Ordering::SeqCst);
+                let element = match *cluster.discovery.lock().unwrap() {
+                    Discovery::TypeCycle if oid != UNKNOWN_TYPE => UNKNOWN_TYPE,
+                    _ => oid + 1,
+                };
+                let name = format!("t{}", oid);
+                message(
+                    &mut socket,
+                    b'D',
+                    &data_row(&[
+                        Some(name.as_bytes()),
+                        Some(b"b"),
+                        Some(&element.to_be_bytes()),
+                        None,
+                        Some(&0u32.to_be_bytes()),
+                        Some(b"public"),
+                        Some(&0u32.to_be_bytes()),
+                    ]),
+                )
+                .await?;
+                message(&mut socket, b'C', b"SELECT 1\0").await?;
+            }
             b'E' => {
                 let rows = if *cluster.discovery.lock().unwrap() == Discovery::Empty {
                     Vec::new()
@@ -914,4 +1020,26 @@ async fn short_data_rows_are_errors_not_panics() {
         .await
         .err()
         .expect("a short simple-query row must be rejected");
+}
+
+/// ASTS-90: the type lookups a statement description triggers are bounded in
+/// depth and refuse cycles, on the driver's own discovery query.
+#[tokio::test]
+async fn unknown_type_chains_and_cycles_are_bounded() {
+    for (mode, most) in [(Discovery::TypeChain, 16), (Discovery::TypeCycle, 2)] {
+        let cluster = Cluster::new("types");
+        let n1 = Node::start(&cluster).await;
+        cluster.publish(&[(&n1, "primary", "z1")]);
+        cluster.set_discovery(mode);
+        let realm = Realm::new("types");
+        let started = Instant::now();
+        connect(&config(&n1, "load_balance=only-primary"), &realm)
+            .await
+            .err()
+            .expect("an unresolvable discovery column type must fail restricted routing closed");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}: {:?}", mode, started.elapsed());
+        let lookups = cluster.type_lookups.load(Ordering::SeqCst);
+        assert!(lookups > 0 && lookups <= most, "{:?}: {} type lookups", mode, lookups);
+        assert!(realm.topology().is_none());
+    }
 }
