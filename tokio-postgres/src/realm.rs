@@ -28,7 +28,7 @@ use crate::config::{Config, Host};
 use crate::connect::{
     all_seed_aliases, allows_unbalanced_fallback, connect_host, connect_with_tls_ref,
     control_connection_config, error_chain, public_ip_mode_allowed, record_failure, resolve_node,
-    seeds_label, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
+    seed_aliases, seed_port, seeds_label, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
 };
 use crate::endpoint;
 use crate::tls::MakeTlsConnect;
@@ -1115,9 +1115,7 @@ impl Realm {
                     continue;
                 }
                 // The seed passes cover the seeds, under any identity.
-                if is_seed(config, &node.identity)
-                    || seed_endpoints.contains(&node.identity.to_ascii_lowercase())
-                {
+                if covered_by_seeds(config, &node.identity, node.port, &seed_endpoints) {
                     continue;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1423,16 +1421,23 @@ pub(crate) fn deadline_after(budget: Duration) -> Instant {
 /// About 30 years, as Tokio uses for an unbounded timer.
 const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
-/// Whether a node identity is one of the configured seeds (by name or address).
-fn is_seed(config: &Config, identity: &str) -> bool {
-    config
-        .host
-        .iter()
-        .any(|host| matches!(host, Host::Tcp(name) if name.eq_ignore_ascii_case(identity)))
-        || config
-            .hostaddr
-            .iter()
-            .any(|addr| addr.to_string() == identity)
+/// Whether a seed pass dials `identity` on `port`: a configured seed of
+/// that name or `hostaddr` on that port, or an address a seed resolved to
+/// (`seed_endpoints`, lower case) on a seed's port.
+fn covered_by_seeds(
+    config: &Config,
+    identity: &str,
+    port: u16,
+    seed_endpoints: &HashSet<String>,
+) -> bool {
+    let seeds = cmp::max(config.host.len(), config.hostaddr.len());
+    (0..seeds).any(|i| {
+        seed_port(config, i) == port
+            && seed_aliases(config, i)
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(identity))
+    }) || (seed_endpoints.contains(&identity.to_ascii_lowercase())
+        && (0..cmp::max(seeds, 1)).any(|i| seed_port(config, i) == port))
 }
 
 fn invalid_topology(reason: &str) -> Error {

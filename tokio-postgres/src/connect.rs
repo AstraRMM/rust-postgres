@@ -458,7 +458,7 @@ pub(crate) enum Refusal {
 
 /// The configured port of seed `i`: one port for every seed, one per seed,
 /// or 5433.
-fn seed_port(config: &Config, i: usize) -> u16 {
+pub(crate) fn seed_port(config: &Config, i: usize) -> u16 {
     config
         .port
         .get(i)

@@ -1230,6 +1230,26 @@ async fn a_failing_dns_seed_is_penalised_under_its_resolved_address() {
     assert_eq!(seed.tls_requests() - before, 2);
 }
 
+/// ASTS-86: a known node at a seed's address but on another port is not a
+/// seed: refresh still tries it when the seed fails.
+#[tokio::test]
+async fn a_known_node_on_another_port_than_its_seed_is_still_tried() {
+    let cluster = Cluster::new("port");
+    let seed = Node::start(&cluster).await;
+    let other = Node::start_at(&cluster, &seed.ip, 0).await;
+    cluster.publish(&[(&other, "primary", "z1")]);
+    let realm = Realm::new("other-port");
+    let conf = tls_config(
+        &seed,
+        "load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=60",
+    );
+    let _first = connect_tls(&conf, Some(&realm)).await.unwrap();
+    seed.set(Behaviour::RefuseTls);
+    let before = other.logins();
+    connect_tls(&conf, Some(&realm)).await.expect("the known node on the other port serves");
+    assert!(other.logins() - before >= 2, "discovery and the session reached it");
+}
+
 /// ASTS-86: with one seed penalised and the other down, refresh tries the
 /// known nodes before retrying the penalised seed.
 #[tokio::test]
