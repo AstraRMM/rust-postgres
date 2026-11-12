@@ -7,13 +7,16 @@
 
 use rcgen::date_time_ymd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tls_qualification::{crl, load_ca, pem, CA_A_CN};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use yb_tokio_postgres::endpoint::{EndpointPolicy, NodeEndpoint};
+use yb_tokio_postgres::realm::Realm;
 use yb_tokio_postgres::rustls::{
     CrlExpiration, MakeRustlsConnect, ProtocolVersions, RevocationDepth, TlsConfigErrorKind,
     TlsMaterial, TlsOptions,
@@ -745,4 +748,58 @@ async fn yb_discovery_tls_failure_does_not_fall_back() {
         open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &wrong).await,
         TlsFailureKind::UnknownIssuer,
     );
+}
+
+/// A plain TCP forwarder from an ephemeral port on `ip` to `ip:5433`, so the
+/// seed's configured port differs from the port `yb_servers()` reports (as
+/// with a connection manager or a port-mapped listener). Counts accepts.
+async fn forwarder(ip: &'static str) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
+    let listener = TcpListener::bind((ip, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect((ip, 5433)).await {
+                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (port, accepted, task)
+}
+
+#[tokio::test]
+async fn yb_seed_identity_is_admitted_only_on_the_seed_port() {
+    let tls = connector(&roots("ca-a.crt"));
+    let (port, accepted, task) = forwarder("127.0.0.2").await;
+    // yb_servers() reports 127.0.0.2:5433; the seed is configured on the
+    // forwarder's port, so the discovered node is not admitted.
+    let config = |load_balance: &str, realm: &str| {
+        let mut config: Config = format!(
+            "host=yb-a.test hostaddr=127.0.0.2 port={port} user=yugabyte dbname=yugabyte \
+             load_balance={load_balance}"
+        )
+        .parse()
+        .unwrap();
+        config.realm(Realm::new(realm));
+        config
+    };
+
+    let e = open_config(&config("only-primary", "port-restricted"), &tls)
+        .await
+        .err()
+        .expect("restricted routing must fail closed");
+    assert!(e.to_string().contains("no discovered node is admitted"), "{e}");
+    assert!(!e.is_security_failure(), "{e}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "control connection only");
+
+    // Unrestricted routing skips the node and connects through the seed.
+    let s = open_config(&config("true", "port-unrestricted"), &tls).await.unwrap();
+    assert_eq!(s.client.node_identity(), Some("yb-a.test"));
+    assert_eq!(accepted.load(Ordering::SeqCst), 3, "control and data through the seed port");
+    assert_eq!(scalar(&s.client, "select 1").await, "1");
+    task.abort();
 }

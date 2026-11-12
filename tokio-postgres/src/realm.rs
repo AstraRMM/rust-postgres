@@ -1111,6 +1111,15 @@ impl Realm {
                 public_ip,
             };
             debug!("Discovered {} as {:?} in {}", label, role, info.placement());
+            if matches!(
+                crate::connect::admit_node(config, &info.identity, info.port),
+                Err(crate::connect::Refusal::PortMismatch)
+            ) {
+                warn!(
+                    "Skipping {}: discovery reported port {}, which is not the trusted port for that node",
+                    label, info.port
+                );
+            }
             if nodes.insert(host, info).is_some() {
                 return Err(invalid_topology("an identity appears more than once"));
             }

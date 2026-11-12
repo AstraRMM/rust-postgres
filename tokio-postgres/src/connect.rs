@@ -200,56 +200,112 @@ pub(crate) fn public_ip_mode_allowed(config: &Config) -> bool {
 /// Resolves a discovered node identity through trusted configuration only.
 ///
 /// Returns `None` when the node is not admitted, or when its discovered port
-/// is invalid or conflicts with a pinned port.
+/// is invalid or not the trusted port for that identity.
 pub(crate) fn resolve_node(config: &Config, identity: &str, port: u16) -> Option<ResolvedEndpoint> {
+    admit_node(config, identity, port).ok()
+}
+
+/// Why trusted configuration refused a discovered node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// No seed or policy rule admits the identity.
+    NotAdmitted,
+    /// The identity is admitted, but not on the port discovery reported.
+    PortMismatch,
+}
+
+/// The configured port of seed `i`: one port for every seed, one per seed,
+/// or 5433.
+fn seed_port(config: &Config, i: usize) -> u16 {
+    config
+        .port
+        .get(i)
+        .or_else(|| config.port.first())
+        .copied()
+        .unwrap_or(5433)
+}
+
+/// [`resolve_node`] with the reason for a refusal.
+pub(crate) fn admit_node(
+    config: &Config,
+    identity: &str,
+    port: u16,
+) -> Result<ResolvedEndpoint, Refusal> {
     if port == 0 || identity.is_empty() {
-        return None;
+        return Err(Refusal::NotAdmitted);
     }
     let policy = config.endpoint_policy.as_deref();
     if let Some(node) = policy.and_then(|p| p.node(identity)) {
-        return ResolvedEndpoint::from_policy(identity, node, port);
+        return ResolvedEndpoint::from_policy(identity, node, port).ok_or(Refusal::PortMismatch);
     }
+    // Without verify-full and without a policy nothing is enforced: every
+    // discovered node is dialled on the port it reported.
+    let legacy_open = config.ssl_mode != SslMode::VerifyFull && policy.is_none();
     let identity_ip = identity.parse::<IpAddr>().ok();
+    let mut refusal = Refusal::NotAdmitted;
     // Configured seeds: a `host=name hostaddr=ip` pair says that `name` is
-    // served at `ip`, so either identity dials `ip` and verifies `name`.
+    // served at `ip` on the seed's port, so either identity dials `ip` and
+    // verifies `name`, and only on that port.
     for (i, seed) in config.host.iter().enumerate() {
         if let Host::Tcp(name) = seed {
             let hostaddr = config.hostaddr.get(i);
             let by_name = name.eq_ignore_ascii_case(identity);
             let by_addr = identity_ip.is_some() && hostaddr == identity_ip.as_ref();
             if by_name || by_addr {
-                return Some(ResolvedEndpoint {
-                    identity: identity.to_string(),
-                    dial: hostaddr.map_or_else(|| name.clone(), |addr| addr.to_string()),
-                    tls_name: name.clone(),
-                    port,
-                });
+                if legacy_open || port == seed_port(config, i) {
+                    return Ok(ResolvedEndpoint {
+                        identity: identity.to_string(),
+                        dial: hostaddr.map_or_else(|| name.clone(), |addr| addr.to_string()),
+                        tls_name: name.clone(),
+                        port,
+                    });
+                }
+                refusal = Refusal::PortMismatch;
             }
         }
     }
     if config.host.is_empty() {
         if let Some(ip) = identity_ip {
-            if config.hostaddr.contains(&ip) {
-                return Some(ResolvedEndpoint {
-                    identity: identity.to_string(),
-                    dial: ip.to_string(),
-                    tls_name: ip.to_string(),
-                    port,
-                });
+            for (i, addr) in config.hostaddr.iter().enumerate() {
+                if *addr == ip {
+                    if legacy_open || port == seed_port(config, i) {
+                        return Ok(ResolvedEndpoint {
+                            identity: identity.to_string(),
+                            dial: ip.to_string(),
+                            tls_name: ip.to_string(),
+                            port,
+                        });
+                    }
+                    refusal = Refusal::PortMismatch;
+                }
             }
         }
     }
-    let admitted_by_suffix = policy.map_or(false, |p| p.suffix_admits(identity));
-    let legacy_open = config.ssl_mode != SslMode::VerifyFull && policy.is_none();
-    if admitted_by_suffix || legacy_open {
-        return Some(ResolvedEndpoint {
+    // A seed identity reported on another port is not re-admitted by a
+    // suffix: the seed's configuration is the more specific statement.
+    if refusal == Refusal::PortMismatch {
+        return Err(refusal);
+    }
+    let suffix_ports = policy.map_or_else(Vec::new, |p| p.suffix_ports(identity));
+    if !suffix_ports.is_empty() {
+        let seeds = cmp::max(config.host.len(), config.hostaddr.len());
+        let admitted = suffix_ports.iter().any(|pin| match pin {
+            Some(pin) => *pin == port,
+            None => (0..cmp::max(seeds, 1)).any(|i| seed_port(config, i) == port),
+        });
+        if !admitted {
+            return Err(Refusal::PortMismatch);
+        }
+    }
+    if !suffix_ports.is_empty() || legacy_open {
+        return Ok(ResolvedEndpoint {
             identity: identity.to_string(),
             dial: identity.to_string(),
             tls_name: identity.to_string(),
             port,
         });
     }
-    None
+    Err(refusal)
 }
 
 fn host_label(host: &Host) -> String {

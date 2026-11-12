@@ -9,11 +9,21 @@
 //! * its **expected TLS name** — the DNS name or IP address the server
 //!   certificate must be valid for.
 //!
-//! Discovery only reports identities. Which identities are admitted, and how
-//! each maps to a dial address and TLS name, comes from trusted configuration
-//! (the configured seeds and an optional [`EndpointPolicy`]). Discovery can
-//! therefore never widen its own trust boundary, and a discovered node is never
-//! verified against the seed hostname.
+//! Discovery reports identities and ports. Which identities are admitted, on
+//! which port, and how each maps to a dial address and TLS name, comes from
+//! trusted configuration (the configured seeds and an optional
+//! [`EndpointPolicy`]):
+//!
+//! * a seed identity is admitted only on that seed's configured port;
+//! * a suffix-admitted identity only on the port given with the suffix, or on
+//!   a configured seed port when the suffix has none;
+//! * an identity listed with [`EndpointPolicy::admit_node`] only on its
+//!   [`NodeEndpoint::port`] pin when it has one, and on the discovered port
+//!   otherwise (an explicit operator choice).
+//!
+//! A discovered node is never verified against the seed hostname. Without
+//! `sslmode=verify-full` and without a policy, admission is not enforced and
+//! every discovered node is dialled as reported.
 
 use hmac::{Hmac, Mac};
 use lazy_static::lazy_static;
@@ -93,7 +103,13 @@ impl std::error::Error for EndpointPolicyError {}
 ///    `host=name hostaddr=ip` maps both identities to dial `ip` and verify
 ///    `name`), or
 /// 3. a DNS name under a suffix admitted with
-///    [`EndpointPolicy::admit_dns_suffix`] (dialled and verified by that name).
+///    [`EndpointPolicy::admit_dns_suffix`] or
+///    [`EndpointPolicy::admit_dns_suffix_on_port`] (dialled and verified by
+///    that name).
+///
+/// A seed identity is eligible only when discovery reports it on that seed's
+/// configured port, and a suffix-admitted identity only on the suffix's port.
+/// Nodes reported on any other port are skipped.
 ///
 /// IP identities are only admitted explicitly or as seeds.
 ///
@@ -102,7 +118,9 @@ impl std::error::Error for EndpointPolicyError {}
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct EndpointPolicy {
     nodes: BTreeMap<String, NodeEndpoint>,
-    dns_suffixes: Vec<String>,
+    /// Admitted suffixes (with a leading dot) and their port; `None` means
+    /// any configured seed port.
+    dns_suffixes: Vec<(String, Option<u16>)>,
 }
 
 impl fmt::Debug for EndpointPolicy {
@@ -127,8 +145,7 @@ impl fmt::Debug for EndpointPolicy {
                 &self
                     .dns_suffixes
                     .iter()
-                    .map(String::as_str)
-                    .map(label)
+                    .map(|(suffix, port)| (label(suffix), *port))
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -169,16 +186,39 @@ impl EndpointPolicy {
     }
 
     /// Admits discovered DNS identities under `suffix` (for example
-    /// `yb.internal` admits `node-1.yb.internal`). The suffix needs at least
-    /// two labels and cannot contain wildcards.
-    pub fn admit_dns_suffix(mut self, suffix: &str) -> Result<EndpointPolicy, EndpointPolicyError> {
+    /// `yb.internal` admits `node-1.yb.internal`) when discovery reports them
+    /// on one of the configured seed ports (`port`, default 5433). The suffix
+    /// needs at least two labels and cannot contain wildcards.
+    pub fn admit_dns_suffix(self, suffix: &str) -> Result<EndpointPolicy, EndpointPolicyError> {
+        self.push_suffix(suffix, None)
+    }
+
+    /// Admits discovered DNS identities under `suffix`, like
+    /// [`EndpointPolicy::admit_dns_suffix`], but only when discovery reports
+    /// them on `port`.
+    pub fn admit_dns_suffix_on_port(
+        self,
+        suffix: &str,
+        port: u16,
+    ) -> Result<EndpointPolicy, EndpointPolicyError> {
+        if port == 0 {
+            return Err(EndpointPolicyError("port pin must be between 1 and 65535"));
+        }
+        self.push_suffix(suffix, Some(port))
+    }
+
+    fn push_suffix(
+        mut self,
+        suffix: &str,
+        port: Option<u16>,
+    ) -> Result<EndpointPolicy, EndpointPolicyError> {
         let suffix = suffix.trim_start_matches('.').to_ascii_lowercase();
         if suffix.split('.').count() < 2 || !is_valid_dns_name(&suffix) {
             return Err(EndpointPolicyError(
                 "DNS suffix must be a valid name with at least two labels",
             ));
         }
-        self.dns_suffixes.push(format!(".{}", suffix));
+        self.dns_suffixes.push((format!(".{}", suffix), port));
         Ok(self)
     }
 
@@ -197,14 +237,20 @@ impl EndpointPolicy {
         self.nodes.get(&normalize_identity(identity)?)
     }
 
-    pub(crate) fn suffix_admits(&self, identity: &str) -> bool {
+    /// The ports of every suffix that admits `identity` (`None` meaning any
+    /// configured seed port); empty when no suffix admits it.
+    pub(crate) fn suffix_ports(&self, identity: &str) -> Vec<Option<u16>> {
         let identity = identity.to_ascii_lowercase();
-        identity.parse::<IpAddr>().is_err()
-            && is_valid_dns_name(&identity)
-            && self
-                .dns_suffixes
-                .iter()
-                .any(|suffix| identity.len() > suffix.len() && identity.ends_with(suffix.as_str()))
+        if identity.parse::<IpAddr>().is_ok() || !is_valid_dns_name(&identity) {
+            return Vec::new();
+        }
+        self.dns_suffixes
+            .iter()
+            .filter(|(suffix, _)| {
+                identity.len() > suffix.len() && identity.ends_with(suffix.as_str())
+            })
+            .map(|(_, port)| *port)
+            .collect()
     }
 }
 
