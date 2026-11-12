@@ -1126,10 +1126,11 @@ impl<T: PoolTls> Pool<T> {
     }
 
     /// Checks every idle connection: closes those whose transport ended or
-    /// whose node the policy now excludes, and replaces those on departed or
-    /// fallback-tier nodes with preferred-tier connections opened from free
-    /// permits before closing them (an unreachable new topology therefore
-    /// never empties the pool). Runs only when a pooled connection's task
+    /// whose node the policy now excludes. Those on departed or
+    /// fallback-tier nodes are closed outright while the pool holds more
+    /// than `warm_floor`; within the floor they are first replaced by
+    /// preferred-tier connections opened from free permits (an unreachable
+    /// new topology therefore never takes the pool below its floor). Runs only when a pooled connection's task
     /// has ended, the topology epoch or quarantine set changed, or a
     /// deferred replacement may now find free permits. Sends no traffic on
     /// the swept connections and leaves their idle timers untouched.
@@ -1141,10 +1142,12 @@ impl<T: PoolTls> Pool<T> {
             .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
         let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
         let changed = digest.is_some() && *shared.swept.lock() != digest;
+        let surplus = (shared.live.lock().len() as u32).saturating_sub(shared.config.warm_floor);
         let retry = shared.rebalance_pending.load(Ordering::SeqCst)
-            && Instant::now() >= shared.rebalance_retry.lock().0
-            && shared.capacity.in_use() < shared.capacity.max()
-            && shared.limiter.in_use() < shared.limiter.max();
+            && (surplus > 0
+                || (Instant::now() >= shared.rebalance_retry.lock().0
+                    && shared.capacity.in_use() < shared.capacity.max()
+                    && shared.limiter.in_use() < shared.limiter.max()));
         if !dead && !changed && !retry {
             return;
         }
@@ -1162,12 +1165,18 @@ impl<T: PoolTls> Pool<T> {
                     }
                 }
                 let (mut attempted, mut pending) = (false, false);
+                let mut surplus = surplus;
                 for mut conn in held {
                     let reason = match conn.client.node_standing() {
                         NodeStanding::Fallback => Retire::Rebalanced,
                         NodeStanding::Departed => Retire::Topology,
                         _ => continue,
                     };
+                    if surplus > 0 {
+                        surplus -= 1;
+                        conn.retire = Some(reason);
+                        continue;
+                    }
                     if !may_replace {
                         pending = true;
                         continue;
