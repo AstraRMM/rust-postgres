@@ -1,7 +1,7 @@
 //! SCRAM-SHA-256 with `channel_binding=require` and `require_auth` against
 //! the real engines: YugabyteDB 2025.2.5.2-b5 with an ECDSA (yb-a, 127.0.0.2)
 //! and an all-RSA (yb-c, 127.0.0.4) certificate chain, and PostgreSQL 16 with
-//! the RSA chain (55439). On YugabyteDB only the role `qual_scram` uses SCRAM;
+//! the ECDSA (55432) and RSA (55439) chains. On YugabyteDB only the role `qual_scram` uses SCRAM;
 //! every other role is trusted over TLS. Uses the rig from
 //! `tls-qualification/rig/run.sh`.
 
@@ -59,20 +59,32 @@ async fn scalar(client: &Client, sql: &str) -> String {
 
 const STRICT: &str = "channel_binding=require require_auth=scram-sha-256";
 
+/// YugabyteDB 2025.2.5.2-b5 offers only `SCRAM-SHA-256` over TLS, never
+/// `SCRAM-SHA-256-PLUS` (the rig logs the advertised mechanisms, and the
+/// server's own `ysqlsh` fails the same way with `PGCHANNELBINDING=require`).
+/// `channel_binding=require` therefore fails closed, before a SCRAM message is
+/// sent, with either certificate type. If a YugabyteDB upgrade starts offering
+/// channel binding this test fails: re-qualify and assert success instead.
 #[tokio::test]
-async fn yugabyte_scram_with_required_channel_binding_ecdsa() {
-    let client = open(&yb(YB_ECDSA, "qual_scram", PASSWORD, STRICT), &connector("ca-a.crt"))
-        .await
-        .expect("SCRAM-SHA-256-PLUS against YugabyteDB with an ECDSA certificate");
-    assert_eq!(scalar(&client, "select current_user").await, "qual_scram");
+async fn yugabyte_does_not_offer_channel_binding_so_require_fails_closed() {
+    for (node, ca) in [(YB_ECDSA, "ca-a.crt"), (YB_RSA, "ca-rsa.crt")] {
+        let e = open(&yb(node, "qual_scram", PASSWORD, STRICT), &connector(ca))
+            .await
+            .expect_err("YugabyteDB 2025.2 has no SCRAM-SHA-256-PLUS");
+        assert!(e.is_security_failure(), "{}: {e}", node.0);
+        assert!(e.to_string().contains("server did not use channel binding"), "{}: {e}", node.0);
+    }
 }
 
 #[tokio::test]
-async fn yugabyte_scram_with_required_channel_binding_rsa() {
-    let client = open(&yb(YB_RSA, "qual_scram", PASSWORD, STRICT), &connector("ca-rsa.crt"))
+async fn postgres_scram_with_required_channel_binding_ecdsa() {
+    let config: Config = format!("host=localhost port=55432 user=postgres password={PASSWORD} dbname=postgres {STRICT}")
+        .parse()
+        .unwrap();
+    let client = open(&config, &connector("ca-a.crt"))
         .await
-        .expect("SCRAM-SHA-256-PLUS against YugabyteDB with an RSA certificate");
-    assert_eq!(scalar(&client, "select current_user").await, "qual_scram");
+        .expect("SCRAM-SHA-256-PLUS against PostgreSQL with an ECDSA certificate");
+    assert_eq!(scalar(&client, "select current_user").await, "postgres");
 }
 
 #[tokio::test]
@@ -102,8 +114,7 @@ async fn yugabyte_enforces_scram_for_the_scram_role() {
     // SCRAM rather than the trust line.
     let e = open(&yb(YB_ECDSA, "qual_scram", "wrong-password", "require_auth=scram-sha-256"), &connector("ca-a.crt"))
         .await
-        .err()
-        .expect("wrong password must fail");
+        .expect_err("wrong password must fail");
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"), "{e}");
 }
 
@@ -115,8 +126,7 @@ async fn require_auth_refuses_trust_authentication_on_yugabyte() {
         let tls = connector(ca);
         let e = open(&yb(node, "yugabyte", PASSWORD, "require_auth=scram-sha-256"), &tls)
             .await
-            .err()
-            .expect("trust must be refused");
+            .expect_err("trust must be refused");
         assert!(e.is_security_failure(), "{e}");
         assert!(e.to_string().contains("require_auth"), "{e}");
         // The same role connects without the restriction (permissive default).

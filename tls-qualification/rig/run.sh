@@ -76,6 +76,15 @@ tls() {
       /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U qual_scram -d yugabyte -c 'select current_user'
     echo "PROBE ysqlsh-channel-binding-require ${node%%:*} rc=$?"
   done
+  # Which SASL mechanisms each engine offers over TLS (no credential sent).
+  for target in 127.0.0.2:5433:qual_scram:yugabyte 127.0.0.4:5433:qual_scram:yugabyte \
+    127.0.0.1:55432:postgres:postgres 127.0.0.1:55438:postgres:postgres; do
+    IFS=: read -r host port user db <<<"$target"
+    python3 -I tls-qualification/rig/sasl-mechanisms.py "$host" "$port" "$user" "$db"
+    echo "PROBE sasl-mechanisms $host:$port rc=$?"
+  done
+  docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte \
+    -c "select name, setting from pg_settings where name in ('ssl', 'ssl_library', 'password_encryption', 'ssl_min_protocol_version') order by name"
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select version()'

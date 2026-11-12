@@ -182,7 +182,7 @@ async fn scram_only_proceeds_with_scram() {
     let outcome = attempt(Request::Sasl, Some("scram-sha-256")).await;
     // The fixture does not finish the exchange, so the session fails, but
     // not because of require_auth: the client sent its SASLInitialResponse.
-    let e = outcome.result.err().expect("fixture never completes SCRAM");
+    let e = outcome.result.expect_err("fixture never completes SCRAM");
     assert!(!e.to_string().contains("require_auth"), "{}", e);
     assert_eq!(outcome.sent.first(), Some(&b'p'));
     assert!(contains(&outcome.sent, b"SCRAM-SHA-256\0"));
