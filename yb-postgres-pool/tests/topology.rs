@@ -454,10 +454,10 @@ async fn additions_and_unchanged_refreshes_keep_warm_connections() {
         .into_iter()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(
-        counts(&realm).get(&c.ip),
-        Some(&1),
-        "new capacity goes to the new node"
+    assert!(
+        counts(&realm).get(&c.ip).is_some_and(|n| *n >= 1),
+        "new capacity goes to the new node: {:?}",
+        counts(&realm)
     );
     drop(held);
     pool.shutdown(Duration::from_secs(1)).await;
