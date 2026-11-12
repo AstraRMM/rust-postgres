@@ -387,6 +387,14 @@ impl<T: PoolTls> Shared<T> {
         }
     }
 
+    /// Resolves once a checkout is waiting, so background discovery yields
+    /// the session or permit it holds.
+    async fn until_waiting(&self) {
+        while self.waiting.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn until_closed(&self) {
         loop {
             let notified = self.shutdown_signal.notified();
@@ -1196,7 +1204,7 @@ impl<T: PoolTls> Pool<T> {
                 }
             })
             .await;
-        if let Some(session) = session {
+        if let Some(mut session) = session {
             let budget = if last_idle {
                 shared.config.connect_timeout.min(Duration::from_secs(2))
             } else {
@@ -1207,6 +1215,13 @@ impl<T: PoolTls> Pool<T> {
             let outcome = tokio::select! {
                 biased;
                 _ = shared.until_closed() => None,
+                _ = shared.until_waiting() => {
+                    // The query may still be in flight: close the session so
+                    // the waiting caller can dial instead of waiting for it.
+                    session.retire = Some(Retire::Explicit);
+                    bump(&shared.stats.topology_refresh_failures);
+                    None
+                }
                 outcome = refresh => Some(outcome),
             };
             SWEEPING.sync_scope((), || drop(session));
@@ -1233,6 +1248,10 @@ impl<T: PoolTls> Pool<T> {
         let outcome = tokio::select! {
             biased;
             _ = shared.until_closed() => return,
+            _ = shared.until_waiting() => {
+                bump(&shared.stats.topology_refresh_failures);
+                return;
+            }
             outcome = refresh => outcome,
         };
         match outcome {
