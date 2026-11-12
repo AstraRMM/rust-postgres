@@ -3,6 +3,7 @@ use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use std::boxed::Box as StdBox;
+use std::cmp;
 use std::error::Error;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -298,9 +299,19 @@ impl<'a> FallibleIterator for HstoreEntries<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.remaining as usize;
+        // Every entry carries at least a key length and a value length, so a
+        // declared count larger than the buffer can hold is never preallocated.
+        let len = bounded_count(self.remaining, self.buf, 8);
         (len, Some(len))
     }
+}
+
+/// Bounds a declared element count by the number of elements of at least
+/// `min_size` bytes that `buf` can still hold. Collecting a decoder must not
+/// preallocate more than the value can contain.
+#[inline]
+fn bounded_count(remaining: i32, buf: &[u8], min_size: usize) -> usize {
+    cmp::min(cmp::max(remaining, 0) as usize, buf.len() / min_size)
 }
 
 /// Serializes a `VARBIT` or `BIT` value.
@@ -658,7 +669,8 @@ impl<'a> FallibleIterator for ArrayValues<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.remaining as usize;
+        // Every element carries at least its 4-byte length.
+        let len = bounded_count(self.remaining, self.buf, 4);
         (len, Some(len))
     }
 }
@@ -918,6 +930,9 @@ where
 pub fn path_from_sql(mut buf: &[u8]) -> Result<Path<'_>, StdBox<dyn Error + Sync + Send>> {
     let closed = buf.read_u8()? != 0;
     let points = buf.read_i32::<BigEndian>()?;
+    if points < 0 {
+        return Err("invalid point count".into());
+    }
 
     Ok(Path {
         closed,
@@ -978,7 +993,8 @@ impl<'a> FallibleIterator for PathPoints<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.remaining as usize;
+        // Every point is two 8-byte floats.
+        let len = bounded_count(self.remaining, self.buf, 16);
         (len, Some(len))
     }
 }

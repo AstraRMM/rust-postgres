@@ -87,6 +87,19 @@ fn hstore_invalid_length() {
 }
 
 #[test]
+fn hstore_declared_count_does_not_drive_preallocation() {
+    // A declared entry count is bounded by what the buffer can hold.
+    let buf: &[u8] = &[
+        0x7f, 0xff, 0xff, 0xff, // entry count: i32::MAX
+        0, 0, 0, 1, b'k', // key "k"
+        0xff, 0xff, 0xff, 0xff, // NULL value
+    ];
+    let entries = hstore_from_sql(buf).unwrap();
+    assert_eq!(entries.size_hint(), (1, Some(1)));
+    assert!(entries.collect::<HashMap<_, _>>().is_err());
+}
+
+#[test]
 fn varbit() {
     let len = 12;
     let bits = [0b0010_1011, 0b0000_1111];
@@ -133,6 +146,21 @@ fn array() {
     assert_eq!(array.element_type(), 10);
     assert_eq!(array.dimensions().collect::<Vec<_>>().unwrap(), dimensions);
     assert_eq!(array.values().collect::<Vec<_>>().unwrap(), values);
+}
+
+#[test]
+fn array_declared_count_does_not_drive_preallocation() {
+    let buf: &[u8] = &[
+        0, 0, 0, 1, // one dimension
+        0, 0, 0, 0, // no nulls
+        0, 0, 0, 25, // element type
+        0x7f, 0xff, 0xff, 0xff, // dimension length: i32::MAX
+        0, 0, 0, 1, // lower bound
+        0, 0, 0, 1, b'a', // a single element is present
+    ];
+    let array = array_from_sql(buf).unwrap();
+    assert_eq!(array.values().size_hint(), (1, Some(1)));
+    assert!(array.values().collect::<Vec<_>>().is_err());
 }
 
 #[test]
@@ -254,4 +282,26 @@ fn ltxtquery_wrong_version() {
     query.extend_from_slice("a & b*".as_bytes());
 
     assert!(ltree_from_sql(query.as_slice()).is_err())
+}
+
+#[test]
+fn path_declared_count_does_not_drive_preallocation() {
+    let mut buf = vec![
+        1, // closed
+        0x7f, 0xff, 0xff, 0xff, // point count: i32::MAX
+    ];
+    buf.extend_from_slice(&1.0f64.to_be_bytes());
+    buf.extend_from_slice(&2.0f64.to_be_bytes());
+    let path = path_from_sql(&buf).unwrap();
+    assert_eq!(path.points().size_hint(), (1, Some(1)));
+    assert!(path.points().collect::<Vec<_>>().is_err());
+}
+
+#[test]
+fn path_negative_point_count_is_rejected() {
+    let buf: &[u8] = &[
+        0, // open
+        0xff, 0xff, 0xff, 0xff, // point count: -1
+    ];
+    assert!(path_from_sql(buf).is_err());
 }
