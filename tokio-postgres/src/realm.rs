@@ -858,7 +858,7 @@ impl Realm {
         self.inner.discoveries.fetch_add(1, Ordering::SeqCst);
         let query = crate::observe::with_class(
             crate::observe::Class::Discovery,
-            client.query("select * from yb_servers()", &[]),
+            client.query("select * from pg_catalog.yb_servers()", &[]),
         );
         let outcome = match time::timeout(QUERY_TIMEOUT, query).await {
             Ok(Ok(rows)) => self.parse_topology(rows, &control_host, config),

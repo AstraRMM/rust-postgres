@@ -433,10 +433,11 @@ impl<T: PoolTls> Shared<T> {
                     log::debug!("pool {}: connection {} ended: {}", label, id, e);
                     *terminal_slot.lock() = Some(PoolError::from_driver(e));
                 }
-                if Arc::strong_count(&terminal_slot) > 1 {
+                let held = Arc::strong_count(&terminal_slot) > 1;
+                drop(connection);
+                if held {
                     died.fetch_add(1, Ordering::SeqCst);
                 }
-                drop(connection);
             });
             live.insert(id, handle.abort_handle());
             task = handle.abort_handle();
@@ -1211,12 +1212,17 @@ impl<T: PoolTls> Pool<T> {
                 None => return,
             }
         }
-        let permits = match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
-            (Ok(pool), Ok(process)) => Permits {
-                _pool: pool,
-                _process: process,
-            },
-            _ => {
+        let mut permits = self.discovery_permits();
+        if permits.is_none() && self.close_idle_for_discovery().await {
+            let deadline = Instant::now() + shared.config.connect_timeout;
+            while permits.is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                permits = self.discovery_permits();
+            }
+        }
+        let permits = match permits {
+            Some(permits) => permits,
+            None => {
                 bump(&shared.stats.topology_refresh_failures);
                 return;
             }
@@ -1407,6 +1413,37 @@ impl<T: PoolTls> Pool<T> {
         total
             .saturating_sub(config.warm_floor)
             .min(idle.saturating_sub(config.min_idle.unwrap_or(0)))
+    }
+
+    fn discovery_permits(&self) -> Option<Permits> {
+        let shared = &self.inner.shared;
+        match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
+            (Ok(pool), Ok(process)) => Some(Permits {
+                _pool: pool,
+                _process: process,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Closes one idle session so a control connection for discovery fits
+    /// within the limits (when the pooled sessions cannot run discovery
+    /// themselves); maintenance refills it.
+    async fn close_idle_for_discovery(&self) -> bool {
+        SWEEPING
+            .scope((), async {
+                if self.inner.pool.state().idle_connections == 0 {
+                    return false;
+                }
+                match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
+                    Ok(Ok(mut conn)) => {
+                        conn.retire = Some(Retire::Explicit);
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .await
     }
 
     /// Checks out every idle connection without waiting. bb8 discards the
