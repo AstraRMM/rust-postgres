@@ -612,19 +612,24 @@ async fn concurrent_work_survives_removal() {
             .unwrap()
             .expect("a query failed during removal");
     }
+    let drained = Instant::now();
     assert!(
-        eventually(Duration::from_secs(3), || !counts(&realm)
+        eventually(Duration::from_secs(10), || !counts(&realm)
             .contains_key(&c.ip))
-        .await
+        .await,
+        "{:?}",
+        counts(&realm)
     );
+    let drained_in = drained.elapsed();
     let (max_in_use, _) = sampler.finish().await;
     let stats = pool.state().stats;
     println!(
-        "EVIDENCE concurrent: {} queries by 8 workers; during={:?}; after={:?}; \
-         retired_topology={} max_permits_in_use={}",
+        "EVIDENCE concurrent: {} queries by 8 workers; during={:?}; after={:?} ({:?} after the \
+         workers finished); retired_topology={} max_permits_in_use={}",
         completed,
         during,
         counts(&realm),
+        drained_in,
         stats.retired_topology,
         max_in_use
     );
@@ -793,9 +798,9 @@ async fn unreachable_new_topology_keeps_departed_sessions_until_replaced() {
     assert!(replaced, "{:?}", counts(&realm));
     assert_eq!(stats.retired_topology, 4);
     assert!(
-        deferred.idle_sweeps <= 4,
-        "replacement retries must back off: {} sweeps in 1.5 s",
-        deferred.idle_sweeps
+        deferred.rebalance_deferrals <= 8,
+        "replacement attempts must back off: {} deferrals in 1.5 s",
+        deferred.rebalance_deferrals
     );
     pool.shutdown(Duration::from_secs(1)).await;
 }

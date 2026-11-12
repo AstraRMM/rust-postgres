@@ -1149,7 +1149,8 @@ impl<T: PoolTls> Pool<T> {
             return;
         }
         bump(&shared.stats.idle_sweeps);
-        let complete = SWEEPING
+        let may_replace = Instant::now() >= shared.rebalance_retry.lock().0;
+        let (attempted, pending) = SWEEPING
             .scope((), async {
                 let idle = self.inner.pool.state().idle_connections;
                 let mut held = Vec::new();
@@ -1160,39 +1161,45 @@ impl<T: PoolTls> Pool<T> {
                         _ => break,
                     }
                 }
-                let mut complete = true;
+                let (mut attempted, mut pending) = (false, false);
                 for mut conn in held {
                     let reason = match conn.client.node_standing() {
                         NodeStanding::Fallback => Retire::Rebalanced,
                         NodeStanding::Departed => Retire::Topology,
                         _ => continue,
                     };
-                    match self.replacement().await {
+                    if !may_replace {
+                        pending = true;
+                        continue;
+                    }
+                    attempted = true;
+                    let old = conn.client.node_identity().map(str::to_string);
+                    match self.replacement(old.as_deref()).await {
                         Some(replacement) => match self.inner.pool.add(replacement) {
                             Ok(()) => conn.retire = Some(reason),
                             Err(bb8::AddError::Broken(mut replacement))
                             | Err(bb8::AddError::NoCapacity(mut replacement)) => {
                                 replacement.retire = Some(Retire::Explicit);
                                 bump(&shared.stats.rebalance_deferrals);
-                                complete = false;
+                                pending = true;
                             }
                         },
                         None => {
                             bump(&shared.stats.rebalance_deferrals);
-                            complete = false;
+                            pending = true;
                         }
                     }
                 }
-                complete
+                (attempted, pending)
             })
             .await;
-        shared.rebalance_pending.store(!complete, Ordering::SeqCst);
-        {
+        shared.rebalance_pending.store(pending, Ordering::SeqCst);
+        if attempted {
             let mut retry = shared.rebalance_retry.lock();
-            let backoff = if complete {
-                REBALANCE_BACKOFF_MIN
-            } else {
+            let backoff = if pending {
                 (retry.1 * 2).min(REBALANCE_BACKOFF_MAX)
+            } else {
+                REBALANCE_BACKOFF_MIN
             };
             *retry = (Instant::now() + retry.1, backoff);
         }
@@ -1201,12 +1208,14 @@ impl<T: PoolTls> Pool<T> {
         }
     }
 
-    /// A connection to a preferred-tier node opened from free permits, or
-    /// `None` when no permit is free or the driver could only reach a
-    /// fallback, departed or seed node.
-    async fn replacement(&self) -> Option<NativeConnection> {
+    /// A connection to a preferred-tier node other than `old`, opened from
+    /// free permits, or `None` when no permit is free or the driver could
+    /// only reach `old` or a fallback, departed or seed node.
+    async fn replacement(&self, old: Option<&str>) -> Option<NativeConnection> {
         let mut conn = self.inner.shared.open(false).await.ok()?;
-        if conn.client.node_standing() == NodeStanding::Preferred {
+        if conn.client.node_standing() == NodeStanding::Preferred
+            && conn.client.node_identity() != old
+        {
             Some(conn)
         } else {
             conn.retire = Some(Retire::Explicit);
