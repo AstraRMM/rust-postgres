@@ -604,7 +604,12 @@ impl Realm {
                 let identity = self.seed_identity(&client, topology.as_deref());
                 if let Some(identity) = identity {
                     client.set_lease(Box::new(self.reserve(&identity)));
-                    client.set_placement(self.clone(), config, identity);
+                    let listed = topology
+                        .as_deref()
+                        .is_some_and(|t| t.nodes.contains_key(&identity));
+                    if listed {
+                        client.set_placement(self.clone(), config, identity);
+                    }
                 }
                 Ok((client, connection))
             }

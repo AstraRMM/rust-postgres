@@ -252,6 +252,10 @@ pub(crate) struct Shared<T: PoolTls> {
     warm_lock: tokio::sync::Mutex<()>,
     /// The realm of load-balanced connections, if load balancing is on.
     realm: Option<Realm>,
+    /// Connection tasks that ended while their session was still pooled or
+    /// borrowed, and the count the last sweep saw.
+    died: Arc<AtomicU64>,
+    swept_died: AtomicU64,
     /// Topology epoch and quarantine set at the last idle sweep.
     swept: Mutex<Option<(u64, Vec<String>)>>,
     /// Departed or fallback-tier connections await replacement.
@@ -409,6 +413,7 @@ impl<T: PoolTls> Shared<T> {
         let label = self.label.clone();
         let terminal: Arc<Mutex<Option<PoolError>>> = Arc::new(Mutex::new(None));
         let terminal_slot = terminal.clone();
+        let died = self.died.clone();
         let mut connection = connection;
         let task;
         {
@@ -424,6 +429,9 @@ impl<T: PoolTls> Shared<T> {
                     bump(&stats.terminal_failures);
                     log::debug!("pool {}: connection {} ended: {}", label, id, e);
                     *terminal_slot.lock() = Some(PoolError::from_driver(e));
+                }
+                if Arc::strong_count(&terminal_slot) > 1 {
+                    died.fetch_add(1, Ordering::SeqCst);
                 }
                 drop(connection);
             });
@@ -907,6 +915,8 @@ impl<T: PoolTls> Pool<T> {
             warm_lock: tokio::sync::Mutex::new(()),
             realm,
             swept: Mutex::new(None),
+            died: Arc::new(AtomicU64::new(0)),
+            swept_died: AtomicU64::new(0),
             rebalance_pending: AtomicBool::new(false),
             rebalance_requests: AtomicU64::new(0),
             sweep_lock: tokio::sync::Mutex::new(()),
@@ -1138,6 +1148,13 @@ impl<T: PoolTls> Pool<T> {
     /// then top up to `warm_floor`. Maintenance calls this every
     /// `maintenance_interval`.
     pub async fn maintain(&self) {
+        let shared = &self.inner.shared;
+        let unused = shared.config.warm_floor == 0
+            && shared.config.min_idle.unwrap_or(0) == 0
+            && shared.live.lock().is_empty();
+        if unused {
+            return;
+        }
         self.refresh_topology().await;
         self.sweep().await;
         self.top_up().await;
@@ -1184,7 +1201,8 @@ impl<T: PoolTls> Pool<T> {
             .realm
             .as_ref()
             .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
-        let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
+        let died = shared.died.load(Ordering::SeqCst);
+        let dead = died != shared.swept_died.load(Ordering::SeqCst);
         let changed = digest.is_some() && *shared.swept.lock() != digest;
         let state = self.inner.pool.state();
         let surplus = state
@@ -1208,6 +1226,7 @@ impl<T: PoolTls> Pool<T> {
             return;
         }
         bump(&shared.stats.idle_sweeps);
+        shared.swept_died.store(died, Ordering::SeqCst);
         let epoch_changed = match (&digest, &*shared.swept.lock()) {
             (Some((epoch, _)), Some((swept, _))) => epoch != swept,
             _ => false,

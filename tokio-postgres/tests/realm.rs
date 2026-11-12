@@ -863,3 +863,17 @@ async fn standing_follows_quarantine_expiry_removal_and_policy() {
     assert_eq!(client.node_standing(), NodeStanding::Unknown);
     assert!(direct.resolved_realm().is_none());
 }
+
+#[tokio::test]
+async fn an_unlisted_seed_has_no_standing() {
+    let cluster = Cluster::new("px");
+    let (seed, listed) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&listed, "primary", "z1")]);
+    listed.set(Behaviour::Refuse);
+    let realm = Realm::new("unlisted-seed");
+    let mut conf = config(&seed, "load_balance=true");
+    conf.yb_servers_refresh_interval(Duration::ZERO);
+    let session = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&session).await, seed.ip);
+    assert_eq!(session.client.node_standing(), NodeStanding::Unknown);
+}
