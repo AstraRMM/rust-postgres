@@ -373,7 +373,7 @@ async fn removal_retires_and_rewarms_within_bound() {
     })
     .await;
     let recovered_in = removed.elapsed();
-    let (max_in_use, _) = sampler.finish().await;
+    let (max_in_use, min_physical) = sampler.finish().await;
     let after = counts(&realm);
     let stats = pool.state().stats;
     println!(
@@ -388,6 +388,11 @@ async fn removal_retires_and_rewarms_within_bound() {
     );
     assert_eq!(stats.retired_topology, 2);
     assert!(max_in_use <= 8);
+    assert!(
+        min_physical >= 6,
+        "warm capacity dipped to {}",
+        min_physical
+    );
     assert!(recovered_in < Duration::from_secs(2), "{:?}", recovered_in);
     pool.shutdown(Duration::from_secs(1)).await;
 }
@@ -735,4 +740,90 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
     assert!(max_in_use <= 6);
     assert_eq!(counts(&realm).values().sum::<usize>(), 4);
     set.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreachable_new_topology_keeps_departed_sessions_until_replaced() {
+    let cluster = Cluster::new("ur");
+    let (a, b, d) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[(&a, "z1"), (&b, "z1")]);
+    let realm = Realm::new("unreachable");
+    let mut pg = driver_config(&a, &realm, "load_balance=true");
+    pg.failed_host_reconnect_delay_secs(Duration::from_millis(300));
+    let pool = Pool::new(pg, NoTls, pool_config(4, 6)).unwrap();
+    assert!(eventually(Duration::from_secs(5), || pool.state().physical == 4).await);
+    let before = counts(&realm);
+
+    d.set(Behaviour::Refuse);
+    cluster.publish(&[(&d, "z1")]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let during = counts(&realm);
+    let served = node_of(&pool).await;
+    let deferred = pool.state().stats;
+    assert_eq!(
+        during.get(&a.ip).copied().unwrap_or(0) + during.get(&b.ip).copied().unwrap_or(0),
+        4
+    );
+    assert!(served == a.ip || served == b.ip);
+    assert!(deferred.rebalance_deferrals > 0);
+    assert_eq!(deferred.retired_topology, 0);
+
+    d.set(Behaviour::Accept);
+    let replaced = eventually(Duration::from_secs(10), || {
+        counts(&realm).get(&d.ip) == Some(&4) && counts(&realm).len() == 1
+    })
+    .await;
+    let stats = pool.state().stats;
+    println!(
+        "EVIDENCE unreachable topology: before={:?}; topology swapped to an unreachable node; \
+         during={:?} (served by {}), deferrals={} retired=0, sweeps while waiting={}; \
+         after it accepts: {:?}, retired_topology={}",
+        before,
+        during,
+        served,
+        deferred.rebalance_deferrals,
+        deferred.idle_sweeps,
+        counts(&realm),
+        stats.retired_topology
+    );
+    assert!(replaced, "{:?}", counts(&realm));
+    assert_eq!(stats.retired_topology, 4);
+    assert!(
+        deferred.idle_sweeps <= 4,
+        "replacement retries must back off: {} sweeps in 1.5 s",
+        deferred.idle_sweeps
+    );
+    pool.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_the_last_handle_stops_maintenance() {
+    let cluster = Cluster::new("dr");
+    let a = Node::start(&cluster).await;
+    cluster.publish(&[(&a, "z1")]);
+    let realm = Realm::new("dropped");
+    let pool = Pool::new(
+        driver_config(&a, &realm, "load_balance=true"),
+        NoTls,
+        pool_config(3, 4),
+    )
+    .unwrap();
+    assert!(eventually(Duration::from_secs(5), || pool.state().physical == 3).await);
+    drop(pool);
+    assert!(
+        eventually(Duration::from_secs(3), || counts(&realm).is_empty()).await,
+        "{:?}",
+        counts(&realm)
+    );
+    let logins = a.logins();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        a.logins(),
+        logins,
+        "maintenance kept running after the pool was dropped"
+    );
 }

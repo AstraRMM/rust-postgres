@@ -840,7 +840,7 @@ async fn standing_follows_quarantine_expiry_removal_and_policy() {
     assert_eq!(info.nodes().len(), 1);
     assert_eq!(realm.topology_epoch(), first_epoch + 1);
     assert_eq!(info.epoch(), realm.topology_epoch());
-    assert_eq!(fallback.client.node_standing(), NodeStanding::Ineligible);
+    assert_eq!(fallback.client.node_standing(), NodeStanding::Departed);
     assert_eq!(preferred.client.node_standing(), NodeStanding::Preferred);
 
     cluster.publish(&[(&a, "read_replica", "z1"), (&b, "primary", "z2")]);

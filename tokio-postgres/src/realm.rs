@@ -170,8 +170,11 @@ pub enum NodeStanding {
     Preferred,
     /// Eligible, but a better preference tier has an available node again.
     Fallback,
-    /// Gone from the topology, or excluded by admission, role or strict
-    /// placement.
+    /// No longer listed in the topology. The node may still serve its
+    /// sessions (for example while it drains), so callers can keep using
+    /// them until replacements are established.
+    Departed,
+    /// Listed, but excluded by endpoint admission, role or strict placement.
     Ineligible,
     /// Load balancing is off, the realm has no snapshot, or the connection
     /// has no node identity.
@@ -1057,7 +1060,8 @@ pub(crate) fn standing_in(
     let policy = Policy::new(config);
     let node = match topology.nodes.get(identity) {
         Some(node) if policy.eligible(config, node) => node,
-        _ => return NodeStanding::Ineligible,
+        Some(_) => return NodeStanding::Ineligible,
+        None => return NodeStanding::Departed,
     };
     let own = match policy.tier(node) {
         Some(tier) => tier,

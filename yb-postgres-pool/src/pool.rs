@@ -254,8 +254,10 @@ pub(crate) struct Shared<T: PoolTls> {
     realm: Option<Realm>,
     /// Topology epoch and quarantine set at the last idle sweep.
     swept: Mutex<Option<(u64, Vec<String>)>>,
-    /// A sweep left fallback-tier connections for lack of free permits.
+    /// Departed or fallback-tier connections await replacement.
     rebalance_pending: AtomicBool,
+    /// Earliest next replacement retry and the current backoff.
+    rebalance_retry: Mutex<(Instant, Duration)>,
 }
 
 impl<T: PoolTls> Shared<T> {
@@ -513,8 +515,12 @@ impl<T: PoolTls> Shared<T> {
         if conn.generation.is_some_and(|g| !self.tls.is_current(g)) {
             return Err(Retire::SupersededTls);
         }
-        if client.node_standing() == NodeStanding::Ineligible {
-            return Err(Retire::Topology);
+        match client.node_standing() {
+            NodeStanding::Ineligible => return Err(Retire::Topology),
+            NodeStanding::Fallback | NodeStanding::Departed => {
+                self.rebalance_pending.store(true, Ordering::SeqCst);
+            }
+            _ => {}
         }
         Ok(!reusable(client))
     }
@@ -871,6 +877,7 @@ impl<T: PoolTls> Pool<T> {
             realm,
             swept: Mutex::new(None),
             rebalance_pending: AtomicBool::new(false),
+            rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
         });
         let pool = bb8::Pool::builder()
             .max_size(config.max_size)
@@ -1118,13 +1125,14 @@ impl<T: PoolTls> Pool<T> {
         }
     }
 
-    /// Checks every idle connection: closes those whose transport ended
-    /// or whose node is no longer eligible, and replaces fallback-tier ones
-    /// with preferred-tier connections opened from free permits before
-    /// closing them. Runs only when a pooled connection's task has ended, or
-    /// the topology epoch or quarantine set changed since the last complete
-    /// sweep. Sends no traffic on the swept connections and leaves their
-    /// idle timers untouched.
+    /// Checks every idle connection: closes those whose transport ended or
+    /// whose node the policy now excludes, and replaces those on departed or
+    /// fallback-tier nodes with preferred-tier connections opened from free
+    /// permits before closing them (an unreachable new topology therefore
+    /// never empties the pool). Runs only when a pooled connection's task
+    /// has ended, the topology epoch or quarantine set changed, or a
+    /// deferred replacement may now find free permits. Sends no traffic on
+    /// the swept connections and leaves their idle timers untouched.
     async fn sweep(&self) {
         let shared = &self.inner.shared;
         let digest = shared
@@ -1134,6 +1142,7 @@ impl<T: PoolTls> Pool<T> {
         let dead = (shared.live.lock().len() as u32) < self.inner.pool.state().connections;
         let changed = digest.is_some() && *shared.swept.lock() != digest;
         let retry = shared.rebalance_pending.load(Ordering::SeqCst)
+            && Instant::now() >= shared.rebalance_retry.lock().0
             && shared.capacity.in_use() < shared.capacity.max()
             && shared.limiter.in_use() < shared.limiter.max();
         if !dead && !changed && !retry {
@@ -1153,12 +1162,14 @@ impl<T: PoolTls> Pool<T> {
                 }
                 let mut complete = true;
                 for mut conn in held {
-                    if conn.client.node_standing() != NodeStanding::Fallback {
-                        continue;
-                    }
-                    match shared.open(false).await {
-                        Ok(replacement) => match self.inner.pool.add(replacement) {
-                            Ok(()) => conn.retire = Some(Retire::Rebalanced),
+                    let reason = match conn.client.node_standing() {
+                        NodeStanding::Fallback => Retire::Rebalanced,
+                        NodeStanding::Departed => Retire::Topology,
+                        _ => continue,
+                    };
+                    match self.replacement().await {
+                        Some(replacement) => match self.inner.pool.add(replacement) {
+                            Ok(()) => conn.retire = Some(reason),
                             Err(bb8::AddError::Broken(mut replacement))
                             | Err(bb8::AddError::NoCapacity(mut replacement)) => {
                                 replacement.retire = Some(Retire::Explicit);
@@ -1166,7 +1177,7 @@ impl<T: PoolTls> Pool<T> {
                                 complete = false;
                             }
                         },
-                        Err(_) => {
+                        None => {
                             bump(&shared.stats.rebalance_deferrals);
                             complete = false;
                         }
@@ -1176,8 +1187,30 @@ impl<T: PoolTls> Pool<T> {
             })
             .await;
         shared.rebalance_pending.store(!complete, Ordering::SeqCst);
+        {
+            let mut retry = shared.rebalance_retry.lock();
+            let backoff = if complete {
+                REBALANCE_BACKOFF_MIN
+            } else {
+                (retry.1 * 2).min(REBALANCE_BACKOFF_MAX)
+            };
+            *retry = (Instant::now() + retry.1, backoff);
+        }
         if digest.is_some() {
             *shared.swept.lock() = digest;
+        }
+    }
+
+    /// A connection to a preferred-tier node opened from free permits, or
+    /// `None` when no permit is free or the driver could only reach a
+    /// fallback, departed or seed node.
+    async fn replacement(&self) -> Option<NativeConnection> {
+        let mut conn = self.inner.shared.open(false).await.ok()?;
+        if conn.client.node_standing() == NodeStanding::Preferred {
+            Some(conn)
+        } else {
+            conn.retire = Some(Retire::Explicit);
+            None
         }
     }
 
@@ -1340,6 +1373,8 @@ impl<T: PoolTls> Pool<T> {
 }
 
 pub(crate) const PROBE_QUERY_FLOOR: Duration = Duration::from_millis(5);
+const REBALANCE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const REBALANCE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub(crate) fn probe_query_budget(budget: Duration, elapsed: Duration) -> Option<Duration> {
     Some(budget.saturating_sub(elapsed)).filter(|left| *left >= PROBE_QUERY_FLOOR)
