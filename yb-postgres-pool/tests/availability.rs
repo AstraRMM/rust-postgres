@@ -149,3 +149,63 @@ async fn abandoned_begin_rolls_back() {
             .unwrap();
     }
 }
+
+/// Return cleanup reuses a connection after a cancel only when the server
+/// confirmed the cancel (closed the cancel connection). A cancel left
+/// unconfirmed could still interrupt the next borrower's query, so the
+/// connection is retired even though its query finished on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unconfirmed_cleanup_cancel_retires() {
+    for e in engines() {
+        let app = format!("pt_avail_cancel_{}", e.name);
+        let (proxy_addr, wire) = proxy(e.addr).await;
+        let mut config = pool_config(&app);
+        config.max_size = 1;
+        config.cleanup_grace = Duration::from_millis(100);
+        config.cleanup_timeout = Duration::from_millis(1500);
+        let pool = Pool::new(e.config_at(proxy_addr), NoTls, config).unwrap();
+
+        // Confirmed: the cancel is answered and the session is kept.
+        let pid = {
+            let client = pool.get().await.unwrap();
+            let pid = backend_pid(&client).await;
+            let slow = client.simple_query("SELECT pg_sleep(30)");
+            assert!(tokio::time::timeout(Duration::from_millis(100), slow)
+                .await
+                .is_err());
+            pid
+        };
+        let client = pool.get().await.unwrap();
+        assert_eq!(backend_pid(&client).await, pid, "confirmed cancel kept it");
+        drop(client);
+
+        // Unconfirmed: the query ends by itself, the cancel never does.
+        wire.stall_cancels.store(true, Ordering::SeqCst);
+        {
+            let client = pool.get().await.unwrap();
+            let slow = client.simple_query("SELECT pg_sleep(0.6)");
+            assert!(tokio::time::timeout(Duration::from_millis(50), slow)
+                .await
+                .is_err());
+        }
+        assert!(
+            eventually(Duration::from_secs(5), || pool
+                .state()
+                .stats
+                .retired_cleanup_failed
+                == 1)
+            .await,
+            "{:?}",
+            pool.state().stats
+        );
+        wire.stall_cancels.store(false, Ordering::SeqCst);
+        let client = pool.get().await.unwrap();
+        assert_ne!(backend_pid(&client).await, pid, "replaced");
+        drop(client);
+        let stats = pool.state().stats;
+        assert_eq!(stats.cleanup_cancels, 2, "{stats:?}");
+        assert_eq!(wire.snapshot().cancels, 2);
+        assert_eq!(stats.connects, 2, "{stats:?}");
+        pool.shutdown(Duration::from_secs(1)).await;
+    }
+}

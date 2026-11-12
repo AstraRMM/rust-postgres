@@ -666,15 +666,20 @@ impl<T: PoolTls> Shared<T> {
         {
             bump(&self.stats.cleanup_cancels);
             let token = client.cancel_token();
-            if let Err(e) = tokio::time::timeout(remaining(), token.cancel_query(self.tls.clone()))
-                .await
-                .unwrap_or_else(|_| Ok(()))
-            {
-                log::debug!(
-                    "pool {}: cancel request failed: {}",
-                    self.label,
-                    yb_tokio_postgres::observe::Redacted(&e)
-                );
+            // A cancel that did not complete (the server did not confirm it
+            // by closing the cancel connection) could still land on the next
+            // borrower's query: retire the connection instead.
+            match tokio::time::timeout(remaining(), token.cancel_query(self.tls.clone())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "pool {}: cancel request failed: {}",
+                        self.label,
+                        yb_tokio_postgres::observe::Redacted(&e)
+                    );
+                    return false;
+                }
+                Err(_) => return false,
             }
             if tokio::time::timeout(remaining(), client.wait_until_settled())
                 .await

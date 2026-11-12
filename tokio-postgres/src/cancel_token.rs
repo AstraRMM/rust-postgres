@@ -28,6 +28,11 @@ impl CancelToken {
     /// normally, or that the connection associated with this token is still
     /// active.
     ///
+    /// Returns once the server has closed the cancel connection, which it
+    /// does after processing the request, so a successful return means the
+    /// request has already been acted on. Bound it with a timeout:
+    /// a peer that keeps the connection open keeps this pending.
+    ///
     /// Requires the `runtime` Cargo feature (enabled by default).
     #[cfg(feature = "runtime")]
     pub async fn cancel_query<T>(&self, tls: T) -> Result<(), Error>
