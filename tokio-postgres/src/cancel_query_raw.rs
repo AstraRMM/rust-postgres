@@ -3,8 +3,7 @@ use crate::tls::TlsConnect;
 use crate::{connect_tls, Error};
 use bytes::BytesMut;
 use postgres_protocol::message::frontend;
-use std::io;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// How long a cancel request waits for the server to close the connection.
 #[cfg(feature = "runtime")]
@@ -35,31 +34,41 @@ where
     // The server closes the connection once it has processed the request
     // (signalled the backend). Waiting for that, as libpq does, keeps a
     // cancel from arriving after the caller has moved on to its next query.
-    // Only a clean close confirms it; a TLS peer closing without
-    // close_notify still counts as a close. A reset or a reply is an error.
-    let mut byte = [0u8; 1];
-    let read = stream.read(&mut byte);
+    // Without the `runtime` feature there is no timer to bound that wait,
+    // so the request is only sent.
     #[cfg(feature = "runtime")]
-    let read = async {
-        tokio::time::timeout(CONFIRMATION_TIMEOUT, read)
-            .await
-            .unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the server did not confirm the cancel request",
-                ))
-            })
-    };
-    match read.await {
-        Ok(0) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-        Ok(_) => {
-            return Err(Error::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected data on the cancel connection",
-            )))
-        }
-        Err(e) => return Err(Error::io(e)),
-    }
+    confirm(&mut stream).await?;
     Ok(())
+}
+
+/// Waits (bounded) for the server to close the cancel connection. Only a
+/// clean close confirms the request; a TLS peer closing without
+/// close_notify still counts as a close. A reset, a reply or a timeout is
+/// an error.
+#[cfg(feature = "runtime")]
+async fn confirm<S>(stream: &mut S) -> Result<(), Error>
+where
+    S: AsyncRead + Unpin,
+{
+    use std::io;
+    use tokio::io::AsyncReadExt;
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(CONFIRMATION_TIMEOUT, stream.read(&mut byte))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the server did not confirm the cancel request",
+            ))
+        });
+    match read {
+        Ok(0) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+        Ok(_) => Err(Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected data on the cancel connection",
+        ))),
+        Err(e) => Err(Error::io(e)),
+    }
 }
