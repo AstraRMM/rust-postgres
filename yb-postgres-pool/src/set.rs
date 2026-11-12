@@ -238,7 +238,41 @@ impl<T: PoolTls> PoolSet<T> {
                 .maintenance_interval
                 .min(Duration::from_millis(100));
             let inner = Arc::downgrade(&self.inner);
+            for (_, old) in &superseded {
+                old.mark_superseded();
+            }
             tokio::spawn(async move {
+                let floor = warming.config().warm_floor;
+                let mut waited = 0u32;
+                let mut before = warming.state().physical;
+                loop {
+                    if inner.strong_count() == 0 {
+                        break;
+                    }
+                    warming.top_up().await;
+                    let ready = warming.state().physical;
+                    if ready >= floor {
+                        break;
+                    }
+                    if ready <= before && waited > 0 && waited < 20 {
+                        waited += 1;
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    let mut closed = false;
+                    for (_, old) in &superseded {
+                        if old.close_one_idle().await {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if !closed {
+                        break;
+                    }
+                    before = ready;
+                    waited = 1;
+                    tokio::time::sleep(interval).await;
+                }
                 let draining = futures_util::future::join_all(
                     superseded.iter().map(|(_, p)| p.shutdown(drain)),
                 );
@@ -271,9 +305,11 @@ impl<T: PoolTls> PoolSet<T> {
         }
         {
             let mut newest = self.inner.newest.lock();
-            let entry = newest.entry(key.identity()).or_insert((0, 0));
-            entry.0 = entry.0.max(key.credential_generation());
-            entry.1 = entry.1.max(key.config_generation());
+            if (key.credential_generation(), key.config_generation()) != (0, 0) {
+                let entry = newest.entry(key.identity()).or_insert((0, 0));
+                entry.0 = entry.0.max(key.credential_generation());
+                entry.1 = entry.1.max(key.config_generation());
+            }
         }
         pools.insert(key.clone(), pool.clone());
         Ok(pool)

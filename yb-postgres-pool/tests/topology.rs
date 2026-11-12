@@ -718,6 +718,10 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
 
     let replaced = Instant::now();
     let new = set.pool(&gen1).unwrap();
+    let combined = Sampler::start(&limiter, {
+        let (old, new) = (old.clone(), new.clone());
+        move || old.state().physical + new.state().physical
+    });
     let during = (old.state().physical, new.state().physical);
     let rows = in_flight.simple_query("select node").await.unwrap();
     assert!(
@@ -731,6 +735,7 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
     })
     .await;
     let warmed_in = replaced.elapsed();
+    let (_, min_combined) = combined.finish().await;
     let (max_in_use, _) = sampler.finish().await;
     println!(
         "EVIDENCE generations: limit 6, floor 4; old/new physical during={:?}; new floor reached \
@@ -740,7 +745,16 @@ async fn generation_replacement_warms_then_drains_within_the_limit() {
         max_in_use,
         counts(&realm)
     );
+    println!(
+        "EVIDENCE generations: minimum combined physical during hand-off={}",
+        min_combined
+    );
     assert!(warmed);
+    assert!(
+        min_combined >= 4,
+        "warm capacity dipped to {} during hand-off",
+        min_combined
+    );
     assert!(set.state(&gen0).is_none());
     assert!(max_in_use <= 6);
     assert_eq!(counts(&realm).values().sum::<usize>(), 4);

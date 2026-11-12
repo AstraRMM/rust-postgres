@@ -261,6 +261,8 @@ pub(crate) struct Shared<T: PoolTls> {
     /// Replacements opened by a sweep and not yet matched by the retirement
     /// of a departed or fallback-tier session.
     retire_credits: AtomicU64,
+    /// Superseded by a newer generation: maintenance opens nothing more.
+    superseded: AtomicBool,
     /// Serializes sweeps so concurrent passes cannot spend the same surplus.
     sweep_lock: tokio::sync::Mutex<()>,
     /// When the oldest idle session a sweep returned reaches `idle_timeout`
@@ -917,6 +919,7 @@ impl<T: PoolTls> Pool<T> {
             rebalance_pending: AtomicBool::new(false),
             rebalance_requests: AtomicU64::new(0),
             retire_credits: AtomicU64::new(0),
+            superseded: AtomicBool::new(false),
             sweep_lock: tokio::sync::Mutex::new(()),
             idle_deadline: Mutex::new(None),
             rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
@@ -1355,7 +1358,7 @@ impl<T: PoolTls> Pool<T> {
         let min_idle = shared.config.min_idle.unwrap_or(0);
         let mut opened = 0;
         let _serial = shared.warm_lock.lock().await;
-        while !shared.is_closed() {
+        while !shared.is_closed() && !shared.superseded.load(Ordering::SeqCst) {
             // Dials already in flight (bb8's or ours) count toward the floor.
             let state = self.inner.pool.state();
             let opening = shared.opening.load(Ordering::SeqCst) as u32;
@@ -1418,6 +1421,27 @@ impl<T: PoolTls> Pool<T> {
     /// example after a migration changed the schema).
     pub fn invalidate_statements(&self) {
         self.inner.shared.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Stops this pool's maintenance from opening connections; a newer
+    /// generation is taking over.
+    pub(crate) fn mark_superseded(&self) {
+        self.inner.shared.superseded.store(true, Ordering::SeqCst);
+    }
+
+    /// Closes one idle connection, if any; returns whether one was closed.
+    pub(crate) async fn close_one_idle(&self) -> bool {
+        if self.inner.pool.state().idle_connections == 0 {
+            return false;
+        }
+        match tokio::time::timeout(Duration::ZERO, SWEEPING.scope((), self.inner.pool.get())).await
+        {
+            Ok(Ok(mut conn)) => {
+                conn.retire = Some(Retire::Explicit);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn same_pool(&self, other: &Pool<T>) -> bool {

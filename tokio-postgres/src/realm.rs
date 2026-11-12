@@ -355,7 +355,7 @@ impl Realm {
             Some(topology) => topology,
             None => return NodeStanding::Unknown,
         };
-        let failures = self.failures(config.failed_host_reconnect_delay_secs);
+        let failures = self.failures_within(config.failed_host_reconnect_delay_secs);
         let public_only =
             public_ip_mode_allowed(config) && self.inner.public_mode.load(Ordering::SeqCst);
         standing_in(config, &topology, &failures, identity, public_only)
@@ -400,7 +400,7 @@ impl Realm {
     /// Nodes quarantined under `config`'s reconnect delay, sorted.
     pub fn quarantined(&self, config: &Config) -> Vec<String> {
         let mut nodes: Vec<String> = self
-            .failures(config.failed_host_reconnect_delay_secs)
+            .failures_within(config.failed_host_reconnect_delay_secs)
             .into_keys()
             .collect();
         nodes.sort();
@@ -438,6 +438,18 @@ impl Realm {
             .failures
             .lock()
             .insert(identity.to_string(), Instant::now());
+    }
+
+    /// Failures within `delay`, without pruning the shared map (other
+    /// configurations of the realm may use a longer delay).
+    fn failures_within(&self, delay: Duration) -> HashMap<String, Instant> {
+        self.inner
+            .failures
+            .lock()
+            .iter()
+            .filter(|(_, at)| at.elapsed() <= delay)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     fn failures(&self, delay: Duration) -> HashMap<String, Instant> {
