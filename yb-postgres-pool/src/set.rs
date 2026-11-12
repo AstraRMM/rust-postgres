@@ -378,7 +378,7 @@ async fn hand_off<T: PoolTls>(
             || warming.is_closed()
             || set
                 .upgrade()
-                .map_or(true, |inner| inner.closed.load(Ordering::SeqCst))
+                .is_none_or(|inner| inner.closed.load(Ordering::SeqCst))
     };
     set_superseded(false);
     let connects = warming.state().stats.connects;
