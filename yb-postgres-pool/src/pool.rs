@@ -261,6 +261,8 @@ pub(crate) struct Shared<T: PoolTls> {
     /// Replacements opened by a sweep and not yet matched by the retirement
     /// of a departed or fallback-tier session.
     retire_credits: AtomicU64,
+    /// Serializes sweeps so concurrent passes cannot spend the same surplus.
+    sweep_lock: tokio::sync::Mutex<()>,
     /// Earliest next replacement retry and the current backoff.
     rebalance_retry: Mutex<(Instant, Duration)>,
 }
@@ -912,6 +914,7 @@ impl<T: PoolTls> Pool<T> {
             rebalance_pending: AtomicBool::new(false),
             rebalance_requests: AtomicU64::new(0),
             retire_credits: AtomicU64::new(0),
+            sweep_lock: tokio::sync::Mutex::new(()),
             rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
         });
         let pool = bb8::Pool::builder()
@@ -1171,6 +1174,7 @@ impl<T: PoolTls> Pool<T> {
     /// the swept connections and leaves their idle timers untouched.
     async fn sweep(&self) {
         let shared = &self.inner.shared;
+        let _serial = shared.sweep_lock.lock().await;
         let digest = shared
             .realm
             .as_ref()
@@ -1269,10 +1273,10 @@ impl<T: PoolTls> Pool<T> {
                     .await;
             }
         }
-        if shared.rebalance_requests.load(Ordering::SeqCst) != requests {
-            pending = true;
-        }
         shared.rebalance_pending.store(pending, Ordering::SeqCst);
+        if shared.rebalance_requests.load(Ordering::SeqCst) != requests {
+            shared.rebalance_pending.store(true, Ordering::SeqCst);
+        }
         if attempted {
             let mut retry = shared.rebalance_retry.lock();
             let backoff = if pending {

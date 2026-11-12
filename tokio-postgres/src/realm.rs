@@ -133,6 +133,7 @@ impl NodeInfo {
 pub(crate) struct Topology {
     nodes: BTreeMap<String, NodeInfo>,
     fetched_at: Instant,
+    epoch: u64,
 }
 
 /// A read-only view of a realm's current topology snapshot.
@@ -332,13 +333,14 @@ impl Realm {
         TopologyInfo {
             nodes: topology.nodes.values().cloned().collect(),
             age: topology.fetched_at.elapsed(),
-            epoch: self.topology_epoch(),
+            epoch: topology.epoch,
         }
     }
 
     /// Number of refreshes whose snapshot differed in nodes or metadata
     /// from the one it replaced (including the first snapshot, and a
-    /// snapshot after one was discarded).
+    /// snapshot after one was discarded). A snapshot carries the value from
+    /// when it was installed ([`TopologyInfo::epoch`]).
     pub fn topology_epoch(&self) -> u64 {
         self.inner.change_epoch.load(Ordering::SeqCst)
     }
@@ -354,7 +356,9 @@ impl Realm {
             None => return NodeStanding::Unknown,
         };
         let failures = self.failures(config.failed_host_reconnect_delay_secs);
-        standing_in(config, &topology, &failures, identity)
+        let public_only =
+            public_ip_mode_allowed(config) && self.inner.public_mode.load(Ordering::SeqCst);
+        standing_in(config, &topology, &failures, identity, public_only)
     }
 
     /// Refreshes the snapshot if it is older than
@@ -693,19 +697,21 @@ impl Realm {
         }
         self.inner.attempt_epoch.fetch_add(1, Ordering::SeqCst);
         match discovered {
-            Ok(Ok(topology)) => {
-                let topology = Arc::new(topology);
+            Ok(Ok(mut topology)) => {
                 {
                     let mut failures = self.inner.failures.lock();
                     failures.retain(|identity, _| topology.nodes.contains_key(identity));
                 }
-                {
+                let topology = {
                     let mut current = self.inner.snapshot.write();
-                    if current.as_ref().map(|t| &t.nodes) != Some(&topology.nodes) {
-                        self.inner.change_epoch.fetch_add(1, Ordering::SeqCst);
-                    }
+                    topology.epoch = match current.as_ref() {
+                        Some(previous) if previous.nodes == topology.nodes => previous.epoch,
+                        _ => self.inner.change_epoch.fetch_add(1, Ordering::SeqCst) + 1,
+                    };
+                    let topology = Arc::new(topology);
                     *current = Some(topology.clone());
-                }
+                    topology
+                };
                 self.inner.refresh_epoch.fetch_add(1, Ordering::SeqCst);
                 Ok(topology)
             }
@@ -931,6 +937,7 @@ impl Realm {
         Ok(Topology {
             nodes,
             fetched_at: Instant::now(),
+            epoch: 0,
         })
     }
 }
@@ -1056,6 +1063,7 @@ pub(crate) fn standing_in(
     topology: &Topology,
     failures: &HashMap<String, Instant>,
     identity: &str,
+    public_only: bool,
 ) -> NodeStanding {
     let policy = Policy::new(config);
     let node = match topology.nodes.get(identity) {
@@ -1071,6 +1079,7 @@ pub(crate) fn standing_in(
         .nodes
         .values()
         .filter(|n| n.identity != identity && !failures.contains_key(&n.identity))
+        .filter(|n| !public_only || n.public_ip.is_some())
         .filter(|n| policy.eligible(config, n))
         .filter_map(|n| policy.tier(n))
         .min();
