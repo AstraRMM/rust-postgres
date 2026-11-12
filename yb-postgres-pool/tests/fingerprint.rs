@@ -156,9 +156,15 @@ async fn fingerprint_retires_unreported_session_changes() {
                     pid,
                     "SET LOCAL kept the session"
                 );
+                // The server now reads the placeholder as '' rather than
+                // NULL, which is why the fingerprint compares unset as empty.
                 assert_eq!(
-                    text(&client, "SELECT current_setting('app.tenant', true)").await,
-                    ""
+                    text(
+                        &client,
+                        "SELECT pg_catalog.quote_nullable(current_setting('app.tenant', true))"
+                    )
+                    .await,
+                    "''"
                 );
             }
 
@@ -239,23 +245,42 @@ async fn fingerprint_retires_unreported_session_changes() {
                 );
             }
 
-            // DISCARD ALL and RESET SESSION AUTHORIZATION drop the pool role
-            // (see the measurement below); the fingerprint catches both.
-            for reset in ["DISCARD ALL", "RESET SESSION AUTHORIZATION"] {
+            // After a session change and a reset, the next borrower gets
+            // the pool's role and search_path: either the reset restored
+            // them (the fingerprint matches) or the session is retired.
+            for reset in ["DISCARD ALL", "RESET SESSION AUTHORIZATION", "RESET ROLE"] {
                 let before = settled(&pool).await;
-                {
+                let pid = {
                     let client = pool.get().await.unwrap();
+                    client
+                        .batch_execute(&format!("SET ROLE {ROLE_B}"))
+                        .await
+                        .unwrap();
+                    client
+                        .batch_execute("SET search_path = public")
+                        .await
+                        .unwrap();
                     client.batch_execute(reset).await.unwrap();
-                }
+                    backend_pid(&client).await
+                };
+                let client = pool.get().await.unwrap();
+                let user = text(&client, "SELECT current_user").await;
+                let path = text(&client, "SELECT current_setting('search_path')")
+                    .await
+                    .replace(' ', "");
+                let same = backend_pid(&client).await == pid;
+                drop(client);
                 let after = settled(&pool).await;
                 let fingerprint =
                     after.retired_session_fingerprint - before.retired_session_fingerprint;
                 let dirty = after.retired_dirty_session - before.retired_dirty_session;
                 println!(
-                    "[{}] {:?}: {reset} retired by fingerprint {fingerprint}, by ParameterStatus {dirty}",
+                    "[{}] {:?}: SET ROLE + SET search_path + {reset}: next borrower {user} {path} (same session: {same}; retired by fingerprint {fingerprint}, by ParameterStatus {dirty})",
                     e.name, init
                 );
-                assert_eq!(fingerprint + dirty, 1, "{reset}: {after:?}");
+                assert_eq!(user, ROLE_A, "{reset}");
+                assert_eq!(path, format!("{SCHEMA},public"), "{reset}");
+                assert_eq!(same, fingerprint + dirty == 0, "{reset}: {after:?}");
             }
 
             let stats = settled(&pool).await;
@@ -275,6 +300,7 @@ async fn fingerprint_retires_unreported_session_changes() {
 /// non-superuser login. Pins the documentation on `SessionParameters`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resets_versus_pool_session_defaults() {
+    let mut all_failures = Vec::new();
     for e in engines() {
         let pg = non_superuser_login(&e, e.addr).await;
         for init in [SessionInit::StartupOptions, SessionInit::AfterConnect] {
@@ -312,8 +338,9 @@ async fn resets_versus_pool_session_defaults() {
                 );
                 let startup = init == SessionInit::StartupOptions;
                 let (want_user, want_path, want_digits) = match reset {
-                    "DISCARD ALL" if startup => (LOGIN, pool_path.as_str(), "2"),
+                    "DISCARD ALL" if startup => (ROLE_A, pool_path.as_str(), "2"),
                     "DISCARD ALL" => (LOGIN, "\"$user\",public", "1"),
+                    "RESET SESSION AUTHORIZATION" if startup => (ROLE_A, "public", "0"),
                     "RESET SESSION AUTHORIZATION" => (LOGIN, "public", "0"),
                     "RESET ROLE" if startup => (ROLE_A, "public", "0"),
                     "RESET ROLE" => (LOGIN, "public", "0"),
@@ -330,12 +357,65 @@ async fn resets_versus_pool_session_defaults() {
                 }
             }
             pool.shutdown(Duration::from_secs(1)).await;
-            assert!(
-                failures.is_empty(),
-                "[{}] {:?}: {failures:#?}",
-                e.name,
-                init
+            all_failures.extend(
+                failures
+                    .into_iter()
+                    .map(|f| format!("[{}] {:?}: {f}", e.name, init)),
             );
         }
+    }
+    assert!(all_failures.is_empty(), "{all_failures:#?}");
+}
+
+/// A return whose fingerprint task is dropped before it runs (its runtime
+/// shut down) must not put an unverified session back in the pool.
+#[test]
+fn unverified_return_is_retired_when_its_task_never_runs() {
+    let main = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    for e in engines() {
+        let app = format!("pt_fp_unpolled_{}", e.name);
+        let pg = main.block_on(non_superuser_login(&e, e.addr));
+        let mut config = role_pool_config(&app, SessionInit::StartupOptions);
+        config.session_fingerprint = Some(SessionFingerprint::default());
+        let pool = main.block_on(async { Pool::new(pg, NoTls, config).unwrap() });
+        let (client, pid) = main.block_on(async {
+            let client = pool.get().await.unwrap();
+            client
+                .batch_execute(&format!("SET ROLE {ROLE_B}"))
+                .await
+                .unwrap();
+            let pid = backend_pid(&client).await;
+            (client, pid)
+        });
+        // Return on a runtime that never polls the return task, then shut
+        // that runtime down.
+        let short = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = short.enter();
+            drop(client);
+        }
+        drop(short);
+        main.block_on(async {
+            let stats = settled(&pool).await;
+            let client = pool.get().await.unwrap();
+            let user = text(&client, "SELECT current_user").await;
+            let same = backend_pid(&client).await == pid;
+            println!(
+                "[{}] unpolled return: next borrower {user} (same session: {same}), {stats:?}",
+                e.name
+            );
+            assert_eq!(user, ROLE_A);
+            assert!(!same, "unverified session retired");
+            assert_eq!(stats.retired_cleanup_failed, 1, "{stats:?}");
+            drop(client);
+            pool.shutdown(Duration::from_secs(1)).await;
+        });
     }
 }

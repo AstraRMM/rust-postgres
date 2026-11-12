@@ -170,13 +170,14 @@ impl PlanCacheMode {
 /// database default, and only a reverted `DateStyle` or `TimeZone` is
 /// detected.
 ///
-/// Neither mode makes [`SessionConfig::role`] survive `DISCARD ALL` or
-/// `RESET SESSION AUTHORIZATION`: on PostgreSQL 16 and YugabyteDB 2025.2
-/// both set the current user back to the login user, whichever mode set the
-/// role. `RESET ROLE` returns to the pool's role only with startup options.
-/// A login user that is a superuser while the pool's role is not is
-/// reported (`is_superuser`) and retires the session; otherwise only
-/// [`SessionFingerprint`] detects the change.
+/// [`SessionConfig::role`] follows the same split (measured on PostgreSQL
+/// 16 and YugabyteDB 2025.2 by `tests/fingerprint.rs`). Set as a startup
+/// option, `DISCARD ALL`, `RESET SESSION AUTHORIZATION` and `RESET ROLE`
+/// return the current user to the pool's role. Set with
+/// [`SessionInit::AfterConnect`], all three return it to the login user.
+/// `RESET ALL` never changes the role. A login user that is a superuser
+/// while the pool's role is not is reported (`is_superuser`) and retires the
+/// session; otherwise only [`SessionFingerprint`] detects the change.
 ///
 /// [`ErrorKind::Config`]: crate::ErrorKind::Config
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -570,7 +571,11 @@ pub struct PoolConfig {
 /// Cost: one round trip per return and one per connect. The connection is
 /// back in the pool, and the lease ends, only after that round trip. Values
 /// set with `SET LOCAL` / `set_config(name, value, true)` end with their
-/// transaction and do not trip the check.
+/// transaction and do not trip the check. An unset listed setting and one
+/// set to the empty string compare equal: once a transaction-local
+/// `set_config` has defined a custom setting, the server itself reads it as
+/// empty rather than `NULL` for the rest of the session, so callers must not
+/// rely on `current_setting(name, true) IS NULL` on a pooled session.
 ///
 /// Not covered: temporary tables, session advisory locks, `LISTEN`,
 /// SQL-level `PREPARE`, and settings that are neither listed nor reported.
@@ -791,8 +796,10 @@ mod tests {
             let fingerprint = SessionFingerprint::new([bad]);
             assert!(fingerprint.validate().is_err(), "{bad:?}");
             assert!(fingerprint.query().is_err(), "{bad:?}");
-            let mut config = PoolConfig::default();
-            config.session_fingerprint = Some(fingerprint);
+            let config = PoolConfig {
+                session_fingerprint: Some(fingerprint),
+                ..PoolConfig::default()
+            };
             assert!(config.validate().is_err(), "{bad:?}");
         }
         let long = format!("{}.{}", "a".repeat(63), "b".repeat(64));
@@ -801,9 +808,15 @@ mod tests {
             .map(|i| format!("app.s{}", i))
             .collect();
         assert!(SessionFingerprint::new(many).validate().is_err());
-        let mut config = PoolConfig::default();
-        assert_eq!(config.session_fingerprint, None, "off by default");
-        config.session_fingerprint = Some(SessionFingerprint::new(["app.tenant_id"]));
+        assert_eq!(
+            PoolConfig::default().session_fingerprint,
+            None,
+            "off by default"
+        );
+        let config = PoolConfig {
+            session_fingerprint: Some(SessionFingerprint::new(["app.tenant_id"])),
+            ..PoolConfig::default()
+        };
         assert!(config.validate().is_ok());
     }
 }

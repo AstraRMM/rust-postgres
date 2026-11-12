@@ -2077,12 +2077,18 @@ impl<T: PoolTls> Drop for PooledClient<T> {
             Ok(needs_cleanup) => match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     let shared = self.shared.clone();
+                    // An unverified session is never reusable: if the task
+                    // is dropped before it finishes (runtime shutdown), the
+                    // connection is retired.
+                    if conn.fingerprint.is_some() {
+                        conn.retire = Some(Retire::CleanupFailed);
+                    }
                     handle.spawn(async move {
-                        if needs_cleanup && !shared.cleanup(&mut conn).await {
-                            conn.retire = Some(Retire::CleanupFailed);
-                        } else if let Err(reason) = shared.verify_fingerprint(&conn).await {
-                            conn.retire = Some(reason);
-                        }
+                        conn.retire = if needs_cleanup && !shared.cleanup(&mut conn).await {
+                            Some(Retire::CleanupFailed)
+                        } else {
+                            shared.verify_fingerprint(&conn).await.err()
+                        };
                         drop(conn);
                         drop(lease);
                     });
