@@ -57,12 +57,14 @@ tls() {
   pg pg-chained 55438 server-chained scram
   pg pg-rsa 55439 server-rsa scram
   yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-entry.sh "$yb_image" "${@:2}" >/dev/null; }
-  yb yb-a 127.0.0.2 yb-a 0
-  yb yb-b 127.0.0.3 yb-b 1
-  yb yb-c 127.0.0.4 yb-c-rsa 2 ca-rsa
+  # PostgreSQL listens on 554xx, inside the ephemeral port range: let every
+  # fixture bind before the YugabyteDB universes open outbound connections.
   for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa; do
     wait_for "$name" 120 docker exec "$name" pg_isready -h 127.0.0.1 -p "$(docker inspect -f '{{index .Args 0}}' "$name")" || return 1
   done
+  yb yb-a 127.0.0.2 yb-a 0
+  yb yb-b 127.0.0.3 yb-b 1
+  yb yb-c 127.0.0.4 yb-c-rsa 2 ca-rsa
   wait_for yb-a 420 docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select 1' || return 1
   wait_for yb-b 420 docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select 1' || return 1
   wait_for yb-c 420 docker exec -e PGSSLMODE=require yb-c /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select 1' || return 1
@@ -78,7 +80,7 @@ tls() {
   done
   # Which SASL mechanisms each engine offers over TLS (no credential sent).
   for target in 127.0.0.2:5433:qual_scram:yugabyte 127.0.0.4:5433:qual_scram:yugabyte \
-    127.0.0.1:55432:postgres:postgres 127.0.0.1:55438:postgres:postgres; do
+    127.0.0.1:55432:postgres:postgres 127.0.0.1:55439:postgres:postgres; do
     IFS=: read -r host port user db <<<"$target"
     python3 -I tls-qualification/rig/sasl-mechanisms.py "$host" "$port" "$user" "$db"
     echo "PROBE sasl-mechanisms $host:$port rc=$?"
