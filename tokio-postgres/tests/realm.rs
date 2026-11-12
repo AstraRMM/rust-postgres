@@ -1278,7 +1278,7 @@ async fn seed_identity_is_admitted_only_on_the_seed_port() {
         // The seed reported on its own port is admitted through discovery.
         cluster.publish(&[(&seed, "primary", "z1")]);
         let realm = Realm::new("port-match");
-        connect(&restricted, &realm).await.unwrap();
+        let _held = connect(&restricted, &realm).await.unwrap();
         assert_eq!(realm.connection_counts().get(&seed.ip), Some(&1), "{}", key);
 
         // Without verify-full and without a policy nothing is enforced and
@@ -1293,7 +1293,12 @@ async fn seed_identity_is_admitted_only_on_the_seed_port() {
 #[tokio::test]
 async fn per_seed_ports_do_not_admit_each_other() {
     let cluster = Cluster::new("ports");
-    let (s1, s2) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    let s1 = Node::start(&cluster).await;
+    let mut s2 = Node::start(&cluster).await;
+    // Distinct addresses can be given the same ephemeral port.
+    while s2.port == s1.port {
+        s2 = Node::start(&cluster).await;
+    }
     // s1's address on s2's port: a port the configuration names, but for
     // another seed.
     let decoy = Node::start_at(&cluster, &s1.ip, s2.port).await;
