@@ -123,36 +123,73 @@ mod test {
         Ok(types::timestamp_from_sql(&buf)?)
     }
 
+    const USEC_PER_DAY: i128 = 86_400_000_000;
+
+    fn decode_timestamp(raw: i64) -> Result<PrimitiveDateTime, Box<dyn Error + Sync + Send>> {
+        let raw = raw.to_be_bytes();
+        let offset = <OffsetDateTime as FromSql>::from_sql(&Type::TIMESTAMPTZ, &raw);
+        let primitive = <PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw);
+        assert_eq!(offset.is_ok(), primitive.is_ok());
+        primitive
+    }
+
     #[test]
     fn timestamp_out_of_range_errors() {
-        // `infinity` / `-infinity` and other values outside `time`'s year
-        // range must error rather than panic.
-        for raw in [
-            i64::MAX,
-            i64::MIN,
+        // `infinity` / `-infinity` and any other value outside `time`'s date
+        // range must error rather than panic. The range depends on whether
+        // `time`'s `large-dates` feature is enabled, so derive it from
+        // `Date::MIN` / `Date::MAX`: the first representable microsecond is
+        // `min` and the last is `max - 1`.
+        let min = (PrimitiveDateTime::new(Date::MIN, Time::MIDNIGHT) - base()).whole_microseconds();
+        let max = (PrimitiveDateTime::new(Date::MAX, Time::MIDNIGHT) - base()).whole_microseconds()
+            + USEC_PER_DAY;
+        let candidates = [
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
             1_000_000_000_000_000_000,
             -1_000_000_000_000_000_000,
-        ] {
-            let raw = raw.to_be_bytes();
-            assert!(<PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw).is_err());
-            assert!(<OffsetDateTime as FromSql>::from_sql(&Type::TIMESTAMPTZ, &raw).is_err());
+            min - 1,
+            min,
+            max - 1,
+            max,
+        ];
+        for raw in candidates {
+            let raw = match i64::try_from(raw) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let in_range = (min..max).contains(&i128::from(raw));
+            assert_eq!(decode_timestamp(raw).is_ok(), in_range, "raw {}", raw);
         }
     }
 
     #[test]
     fn timestamp_in_range_decodes() {
-        let raw = 0i64.to_be_bytes();
-        assert_eq!(
-            <PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw).unwrap(),
-            base()
-        );
+        assert_eq!(decode_timestamp(0).unwrap(), base());
     }
 
     #[test]
     fn date_out_of_range_errors() {
-        for raw in [i32::MAX, i32::MIN, 10_000_000, -10_000_000] {
-            let raw = raw.to_be_bytes();
-            assert!(<Date as FromSql>::from_sql(&Type::DATE, &raw).is_err());
+        let min = (Date::MIN - base().date()).whole_days();
+        let max = (Date::MAX - base().date()).whole_days();
+        let candidates = [
+            i64::from(i32::MAX),
+            i64::from(i32::MIN),
+            10_000_000,
+            -10_000_000,
+            min - 1,
+            min,
+            max,
+            max + 1,
+        ];
+        for raw in candidates {
+            let raw = match i32::try_from(raw) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let in_range = (min..=max).contains(&i64::from(raw));
+            let decoded = <Date as FromSql>::from_sql(&Type::DATE, &raw.to_be_bytes());
+            assert_eq!(decoded.is_ok(), in_range, "raw {}", raw);
         }
     }
 

@@ -29,10 +29,12 @@ fn date_in_range(julian_day: i64) -> bool {
 impl<'a> FromSql<'a> for PrimitiveDateTime {
     fn from_sql(_: &Type, raw: &[u8]) -> Result<PrimitiveDateTime, Box<dyn Error + Sync + Send>> {
         let t = types::timestamp_from_sql(raw)?;
-        // adding the sub-day remainder can shift the date by at most one day, so
-        // a one-day margin guarantees the add below cannot overflow the range.
-        let julian_day = base().date().julian_day() + Duration::microseconds(t).whole_days();
-        if !date_in_range(julian_day - 1) || !date_in_range(julian_day + 1) {
+        // `base()` is midnight, so the resulting date is the epoch date plus the
+        // floored number of whole days in `t`. The intermediate date `Add`
+        // computes lies between the epoch and that date, so checking the result
+        // is enough to guarantee the add below cannot overflow the range.
+        let julian_day = base().date().julian_day() + t.div_euclid(86_400_000_000);
+        if !date_in_range(julian_day) {
             return Err("value too large to decode".into());
         }
         Ok(base() + Duration::microseconds(t))
@@ -161,5 +163,33 @@ mod test {
     fn timestamp_in_range_decodes() {
         let raw = 0i64.to_be_bytes();
         assert!(<PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw).is_ok());
+    }
+
+    fn encode(value: PrimitiveDateTime) -> i64 {
+        let mut buf = BytesMut::new();
+        value.to_sql(&Type::TIMESTAMP, &mut buf).unwrap();
+        types::timestamp_from_sql(&buf).unwrap()
+    }
+
+    fn decode(raw: i64) -> Result<PrimitiveDateTime, Box<dyn Error + Sync + Send>> {
+        <PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw.to_be_bytes())
+    }
+
+    #[test]
+    fn timestamp_range_edges_round_trip() {
+        // the first and last representable instants decode; one microsecond
+        // beyond either errors.
+        let last = PrimitiveDateTime::new(
+            Date::try_from_ymd(100_000, 12, 31).unwrap(),
+            Time::try_from_hms_micro(23, 59, 59, 999_999).unwrap(),
+        );
+        let first =
+            PrimitiveDateTime::new(Date::try_from_ymd(-100_000, 1, 1).unwrap(), time!(00:00:00));
+        let last_raw = encode(last);
+        let first_raw = encode(first);
+        assert_eq!(decode(last_raw).unwrap(), last);
+        assert_eq!(decode(first_raw).unwrap(), first);
+        assert!(decode(last_raw + 1).is_err());
+        assert!(decode(first_raw - 1).is_err());
     }
 }
