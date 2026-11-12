@@ -239,10 +239,17 @@ pub fn is_stale_statement(error: &yb_tokio_postgres::Error) -> bool {
         return true;
     }
     let message = db.message();
-    (*db.code() == SqlState::FEATURE_NOT_SUPPORTED
+    let code = db.code();
+    // YugabyteDB reports schema and catalog version mismatches as an
+    // internal error (XX000) or a serialization failure (40001). The
+    // message is only trusted under those codes: other errors (data
+    // exceptions, constraint violations, RAISE) can echo stored or
+    // caller-supplied text.
+    (*code == SqlState::FEATURE_NOT_SUPPORTED
         && message.contains("cached plan must not change result type"))
-        || message.contains("schema version mismatch")
-        || message.contains("catalog version mismatch")
+        || ((*code == SqlState::INTERNAL_ERROR || *code == SqlState::T_R_SERIALIZATION_FAILURE)
+            && (message.contains("schema version mismatch")
+                || message.contains("catalog version mismatch")))
 }
 
 /// Maps a driver error onto an [`ErrorKind`].
