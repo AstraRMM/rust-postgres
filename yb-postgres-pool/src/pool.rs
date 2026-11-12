@@ -252,13 +252,15 @@ pub(crate) struct Shared<T: PoolTls> {
     warm_lock: tokio::sync::Mutex<()>,
     /// The realm of load-balanced connections, if load balancing is on.
     realm: Option<Realm>,
-    /// Connection tasks that ended while their session was still pooled or
-    /// borrowed, and the count the last sweep saw.
-    died: Arc<AtomicU64>,
-    swept_died: AtomicU64,
-    /// A connection arrived on a node that is not preferred; the next pass
-    /// sweeps.
-    recheck: AtomicBool,
+    /// Bumped when a connection task ends while its session is still held,
+    /// or a connection arrives on a node that is not preferred. A signal is
+    /// acknowledged only by the sweep after the one that saw it, since bb8
+    /// may not have queued the session yet.
+    signals: Arc<AtomicU64>,
+    signals_acked: AtomicU64,
+    signals_at_sweep: AtomicU64,
+    /// Serializes maintenance passes.
+    maintain_lock: tokio::sync::Mutex<()>,
     /// Topology epoch and quarantine set at the last idle sweep.
     swept: Mutex<Option<(u64, Vec<String>)>>,
     /// Departed or fallback-tier connections await replacement.
@@ -418,7 +420,7 @@ impl<T: PoolTls> Shared<T> {
         let label = self.label.clone();
         let terminal: Arc<Mutex<Option<PoolError>>> = Arc::new(Mutex::new(None));
         let terminal_slot = terminal.clone();
-        let died = self.died.clone();
+        let died = self.signals.clone();
         let mut connection = connection;
         let task;
         {
@@ -472,7 +474,7 @@ impl<T: PoolTls> Shared<T> {
             conn.client.node_standing(),
             NodeStanding::Fallback | NodeStanding::Departed | NodeStanding::Ineligible
         ) {
-            self.recheck.store(true, Ordering::SeqCst);
+            self.signals.fetch_add(1, Ordering::SeqCst);
         }
         Ok(conn)
     }
@@ -927,9 +929,10 @@ impl<T: PoolTls> Pool<T> {
             warm_lock: tokio::sync::Mutex::new(()),
             realm,
             swept: Mutex::new(None),
-            recheck: AtomicBool::new(false),
-            died: Arc::new(AtomicU64::new(0)),
-            swept_died: AtomicU64::new(0),
+            signals: Arc::new(AtomicU64::new(0)),
+            signals_acked: AtomicU64::new(0),
+            signals_at_sweep: AtomicU64::new(0),
+            maintain_lock: tokio::sync::Mutex::new(()),
             rebalance_pending: AtomicBool::new(false),
             requests_at_sweep: AtomicU64::new(0),
             rebalance_requests: AtomicU64::new(0),
@@ -1163,6 +1166,7 @@ impl<T: PoolTls> Pool<T> {
     /// `maintenance_interval`.
     pub async fn maintain(&self) {
         let shared = &self.inner.shared;
+        let _serial = shared.maintain_lock.lock().await;
         let unused = shared.config.warm_floor == 0
             && shared.config.min_idle.unwrap_or(0) == 0
             && shared.live.lock().is_empty()
@@ -1276,8 +1280,8 @@ impl<T: PoolTls> Pool<T> {
             .realm
             .as_ref()
             .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
-        let died = shared.died.load(Ordering::SeqCst);
-        let dead = died != shared.swept_died.load(Ordering::SeqCst);
+        let signals = shared.signals.load(Ordering::SeqCst);
+        let dead = signals != shared.signals_acked.load(Ordering::SeqCst);
         let changed = digest.is_some() && *shared.swept.lock() != digest;
         let state = self.inner.pool.state();
         let surplus = state
@@ -1297,12 +1301,12 @@ impl<T: PoolTls> Pool<T> {
             .idle_deadline
             .lock()
             .is_some_and(|deadline| Instant::now() >= deadline);
-        let recheck = shared.recheck.swap(false, Ordering::SeqCst);
-        if !dead && !changed && !retry && !idle_due && !recheck {
+        if !dead && !changed && !retry && !idle_due {
             return;
         }
         bump(&shared.stats.idle_sweeps);
-        shared.swept_died.store(died, Ordering::SeqCst);
+        let previous = shared.signals_at_sweep.swap(signals, Ordering::SeqCst);
+        shared.signals_acked.store(previous, Ordering::SeqCst);
         let epoch_changed = match (&digest, &*shared.swept.lock()) {
             (Some((epoch, _)), Some((swept, _))) => epoch != swept,
             _ => false,
