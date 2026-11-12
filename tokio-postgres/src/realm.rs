@@ -607,8 +607,9 @@ impl Realm {
                     let listed = topology
                         .as_deref()
                         .is_some_and(|t| t.nodes.contains_key(&identity));
-                    if listed {
-                        client.set_placement(self.clone(), config, identity);
+                    client.set_placement(self.clone(), config, identity);
+                    if !listed {
+                        client.mark_unlisted_seed();
                     }
                 }
                 Ok((client, connection))

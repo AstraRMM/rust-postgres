@@ -256,6 +256,9 @@ pub(crate) struct Shared<T: PoolTls> {
     /// borrowed, and the count the last sweep saw.
     died: Arc<AtomicU64>,
     swept_died: AtomicU64,
+    /// A connection arrived on a node that is not preferred; the next pass
+    /// sweeps.
+    recheck: AtomicBool,
     /// Topology epoch and quarantine set at the last idle sweep.
     swept: Mutex<Option<(u64, Vec<String>)>>,
     /// Departed or fallback-tier connections await replacement.
@@ -462,6 +465,12 @@ impl<T: PoolTls> Shared<T> {
             }
         }
         conn.param_baseline = conn.client.parameter_status_changes();
+        if matches!(
+            conn.client.node_standing(),
+            NodeStanding::Fallback | NodeStanding::Departed | NodeStanding::Ineligible
+        ) {
+            self.recheck.store(true, Ordering::SeqCst);
+        }
         Ok(conn)
     }
 
@@ -915,6 +924,7 @@ impl<T: PoolTls> Pool<T> {
             warm_lock: tokio::sync::Mutex::new(()),
             realm,
             swept: Mutex::new(None),
+            recheck: AtomicBool::new(false),
             died: Arc::new(AtomicU64::new(0)),
             swept_died: AtomicU64::new(0),
             rebalance_pending: AtomicBool::new(false),
@@ -1222,7 +1232,8 @@ impl<T: PoolTls> Pool<T> {
             .idle_deadline
             .lock()
             .is_some_and(|deadline| Instant::now() >= deadline);
-        if !dead && !changed && !retry && !idle_due {
+        let recheck = shared.recheck.swap(false, Ordering::SeqCst);
+        if !dead && !changed && !retry && !idle_due && !recheck {
             return;
         }
         bump(&shared.stats.idle_sweeps);
