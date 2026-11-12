@@ -1240,6 +1240,7 @@ impl<T: PoolTls> Pool<T> {
                 return;
             }
         };
+        let dialing = Dialing::start(shared.as_ref());
         let refresh = tokio::time::timeout(
             shared.config.connect_timeout,
             realm.refresh(shared.tls.clone(), &shared.pg),
@@ -1261,6 +1262,7 @@ impl<T: PoolTls> Pool<T> {
             }
             Err(_) => bump(&shared.stats.topology_refresh_failures),
         }
+        drop(dialing);
         drop(permits);
     }
 
