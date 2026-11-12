@@ -70,10 +70,35 @@ fn ca(
 }
 
 fn load(roots: &str) -> Result<MakeRustlsConnect, yb_tokio_postgres::rustls::TlsConfigError> {
-    MakeRustlsConnect::new(
+    let tls = MakeRustlsConnect::new(
         &TlsMaterial::from_pem(roots.as_bytes().to_vec()),
-        TlsOptions::new(),
-    )
+        client_options(),
+    )?;
+    check_provider(&tls);
+    Ok(tls)
+}
+
+/// Client provider under test, selected with `TLS_QUAL_PROVIDER` (default
+/// aws-lc-rs) exactly as in `verify_full.rs`, so the rig's provider matrix
+/// qualifies these scenarios too. The fixture servers always use aws-lc-rs.
+fn client_options() -> TlsOptions {
+    match std::env::var("TLS_QUAL_PROVIDER")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" | "aws-lc-rs" => TlsOptions::new(),
+        #[cfg(feature = "ring")]
+        "ring" => TlsOptions::new().provider(yb_tokio_postgres::rustls::Provider::Ring),
+        #[cfg(feature = "fips")]
+        "fips" => TlsOptions::new().provider(yb_tokio_postgres::rustls::Provider::AwsLcRsFips),
+        other => panic!("provider {other} is not compiled in"),
+    }
+}
+
+fn check_provider(tls: &MakeRustlsConnect) {
+    if std::env::var("TLS_QUAL_PROVIDER").as_deref() == Ok("fips") {
+        assert!(tls.current().fips(), "FIPS provider must report FIPS mode");
+    }
 }
 
 fn expiry(not_after: OffsetDateTime) -> std::time::SystemTime {
