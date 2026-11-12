@@ -437,6 +437,23 @@ impl Config {
         self.config.get_require_auth()
     }
 
+    /// Sets the largest backend message, in bytes of message body, that an
+    /// established session accepts. A larger message fails the connection
+    /// before it is buffered.
+    ///
+    /// Defaults to 1 GiB, the most a PostgreSQL server can send in one
+    /// message. Messages received during startup and authentication are
+    /// always limited to 128 KiB.
+    pub fn max_message_size(&mut self, max_message_size: usize) -> &mut Config {
+        self.config.max_message_size(max_message_size);
+        self
+    }
+
+    /// Gets the largest backend message size an established session accepts.
+    pub fn get_max_message_size(&self) -> usize {
+        self.config.get_max_message_size()
+    }
+
     /// Sets the host load balancing behavior.
     ///
     /// Defaults to `disable`.
