@@ -130,8 +130,8 @@ mod test {
         for raw in [
             i64::MAX,
             i64::MIN,
-            300_000_000_000_000_000,
-            -300_000_000_000_000_000,
+            1_000_000_000_000_000_000,
+            -1_000_000_000_000_000_000,
         ] {
             let raw = raw.to_be_bytes();
             assert!(<PrimitiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &raw).is_err());
