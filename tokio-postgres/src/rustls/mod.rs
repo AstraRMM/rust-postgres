@@ -7,7 +7,9 @@
 //!   only (never a platform or WebPKI store),
 //! * verifies the end-entity certificate against the expected TLS identity of
 //!   the endpoint being dialled (DNS or IP SAN), including discovered nodes,
-//! * checks configured CRLs, and
+//! * checks configured CRLs (see [`RevocationDepth`] and [`CrlExpiration`]
+//!   for what is checked, and [`GenerationInfo::earliest_crl_next_update`]
+//!   for monitoring CRL freshness), and
 //! * presents the configured client certificate for mutual TLS.
 //!
 //! Roots, client identity and CRLs are loaded together as one validated,
@@ -116,11 +118,62 @@ pub enum ProtocolVersions {
     Tls12AndTls13,
 }
 
-/// Provider and protocol settings for a [`MakeRustlsConnect`].
+/// Which server certificates are checked against the configured CRLs.
+///
+/// Only applies when `sslcrl` is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RevocationDepth {
+    /// Only the server's end-entity certificate (default). Its issuer must
+    /// have a CRL in `sslcrl`, or the handshake fails with an unknown
+    /// revocation status. Intermediate CA certificates are not checked.
+    #[default]
+    EndEntity,
+    /// Every certificate in the verified chain except the trust anchor: the
+    /// end-entity certificate and each intermediate CA certificate. Every
+    /// issuer in the chain, including the root that issued the top
+    /// intermediate, must then have a CRL in `sslcrl`; a certificate whose
+    /// issuer has no CRL fails the handshake with an unknown revocation
+    /// status.
+    Chain,
+}
+
+/// How a CRL whose `nextUpdate` has passed is treated.
+///
+/// Only applies when `sslcrl` is configured. Whatever the policy, each
+/// generation reports its earliest CRL `nextUpdate` through
+/// [`GenerationInfo::earliest_crl_next_update`], so operators can alert
+/// before (or once) a CRL goes stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CrlExpiration {
+    /// Keep using a CRL after its `nextUpdate` (default). A stale CRL still
+    /// refuses the certificates it lists, but certificates revoked since it
+    /// was issued are accepted. Monitor
+    /// [`GenerationInfo::earliest_crl_next_update`].
+    #[default]
+    Ignore,
+    /// Treat a CRL past its `nextUpdate` as unusable. Loading or reloading
+    /// material that contains such a CRL fails with
+    /// [`TlsConfigErrorKind::CrlExpired`] (a failed reload keeps the current
+    /// generation in service), and a handshake that consults a CRL that has
+    /// expired since it was loaded fails with
+    /// [`TlsFailureKind::CrlExpired`](crate::tls::TlsFailureKind::CrlExpired).
+    /// With this policy every new connection fails once a CRL expires until
+    /// fresh CRLs are reloaded, so the CRL refresh must be monitored.
+    Enforce,
+}
+
+/// Provider, protocol and revocation settings for a [`MakeRustlsConnect`].
+///
+/// The defaults are the default provider, TLS 1.3 only,
+/// [`RevocationDepth::EndEntity`] and [`CrlExpiration::Ignore`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TlsOptions {
     provider: Provider,
     protocol_versions: ProtocolVersions,
+    revocation_depth: RevocationDepth,
+    crl_expiration: CrlExpiration,
 }
 
 impl TlsOptions {
@@ -138,6 +191,20 @@ impl TlsOptions {
     /// Selects the permitted protocol versions.
     pub fn protocol_versions(mut self, versions: ProtocolVersions) -> TlsOptions {
         self.protocol_versions = versions;
+        self
+    }
+
+    /// Selects which server certificates are checked against the configured
+    /// CRLs (default [`RevocationDepth::EndEntity`]).
+    pub fn revocation_depth(mut self, depth: RevocationDepth) -> TlsOptions {
+        self.revocation_depth = depth;
+        self
+    }
+
+    /// Selects how a CRL past its `nextUpdate` is treated (default
+    /// [`CrlExpiration::Ignore`]).
+    pub fn crl_expiration(mut self, policy: CrlExpiration) -> TlsOptions {
+        self.crl_expiration = policy;
         self
     }
 }
@@ -175,6 +242,9 @@ pub enum TlsConfigErrorKind {
     KeyMismatch,
     /// A CRL could not be parsed or used.
     InvalidCrl,
+    /// A CRL is past its `nextUpdate` and [`CrlExpiration::Enforce`] is
+    /// selected.
+    CrlExpired,
     /// The provider rejected the requested protocol configuration.
     Provider,
     /// FIPS mode was requested but the configuration is not in FIPS mode.
@@ -377,6 +447,9 @@ pub struct GenerationInfo {
     protocol_versions: ProtocolVersions,
     fips: bool,
     earliest_not_after: Option<SystemTime>,
+    revocation_depth: RevocationDepth,
+    crl_expiration: CrlExpiration,
+    earliest_crl_next_update: Option<SystemTime>,
 }
 
 impl GenerationInfo {
@@ -418,6 +491,24 @@ impl GenerationInfo {
     /// The earliest expiry among the roots and client chain, for alerting.
     pub fn earliest_not_after(&self) -> Option<SystemTime> {
         self.earliest_not_after
+    }
+
+    /// Which server certificates are checked against the CRLs.
+    pub fn revocation_depth(&self) -> RevocationDepth {
+        self.revocation_depth
+    }
+
+    /// How a CRL past its `nextUpdate` is treated.
+    pub fn crl_expiration(&self) -> CrlExpiration {
+        self.crl_expiration
+    }
+
+    /// The earliest `nextUpdate` among the loaded CRLs, or `None` when no CRL
+    /// is configured, for alerting. A value in the past means a CRL is stale:
+    /// with [`CrlExpiration::Ignore`] it is still used, with
+    /// [`CrlExpiration::Enforce`] handshakes that consult it fail.
+    pub fn earliest_crl_next_update(&self) -> Option<SystemTime> {
+        self.earliest_crl_next_update
     }
 }
 
@@ -488,6 +579,14 @@ fn check_validity(
     Ok(())
 }
 
+fn unix_to_system_time(t: i64) -> Option<SystemTime> {
+    if t >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(t as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(t.unsigned_abs()))
+    }
+}
+
 fn build_generation(
     material: &TlsMaterial,
     options: TlsOptions,
@@ -533,12 +632,27 @@ fn build_generation(
     }
 
     let mut crls = Vec::new();
+    let mut earliest_crl_next_update: Option<i64> = None;
     for pem in &material.crls {
         let before = crls.len();
         for item in CertificateRevocationListDer::pem_slice_iter(pem) {
-            crls.push(
-                item.map_err(|_| TlsConfigError::new(K::InvalidCrl, "sslcrl is not valid PEM"))?,
-            );
+            let crl =
+                item.map_err(|_| TlsConfigError::new(K::InvalidCrl, "sslcrl is not valid PEM"))?;
+            let next_update = der::crl_next_update(&crl).ok_or_else(|| {
+                TlsConfigError::new(
+                    K::InvalidCrl,
+                    "sslcrl contains a CRL without a readable nextUpdate",
+                )
+            })?;
+            if options.crl_expiration == CrlExpiration::Enforce && now >= next_update {
+                return Err(TlsConfigError::new(
+                    K::CrlExpired,
+                    "sslcrl contains a CRL past its nextUpdate and CRL expiry is enforced",
+                ));
+            }
+            earliest_crl_next_update =
+                Some(earliest_crl_next_update.map_or(next_update, |e| e.min(next_update)));
+            crls.push(crl);
         }
         if crls.len() == before {
             return Err(TlsConfigError::new(K::InvalidCrl, "sslcrl contains no CRLs"));
@@ -549,7 +663,13 @@ fn build_generation(
     let mut verifier =
         WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone());
     if !crls.is_empty() {
-        verifier = verifier.with_crls(crls).only_check_end_entity_revocation();
+        verifier = verifier.with_crls(crls);
+        if options.revocation_depth == RevocationDepth::EndEntity {
+            verifier = verifier.only_check_end_entity_revocation();
+        }
+        if options.crl_expiration == CrlExpiration::Enforce {
+            verifier = verifier.enforce_revocation_expiration();
+        }
     }
     let verifier = verifier.build().map_err(|_| {
         TlsConfigError::new(
@@ -663,9 +783,10 @@ fn build_generation(
             provider: options.provider,
             protocol_versions: options.protocol_versions,
             fips,
-            earliest_not_after: earliest
-                .filter(|t| *t >= 0)
-                .map(|t| UNIX_EPOCH + Duration::from_secs(t as u64)),
+            earliest_not_after: earliest.and_then(unix_to_system_time),
+            revocation_depth: options.revocation_depth,
+            crl_expiration: options.crl_expiration,
+            earliest_crl_next_update: earliest_crl_next_update.and_then(unix_to_system_time),
         },
         client_config: Arc::new(client_config),
         revocation: Revocation::new(),
@@ -1082,6 +1203,10 @@ pub(crate) fn classify_rustls_error(e: &::rustls::Error) -> (TlsFailureKind, &'s
             C::UnknownRevocationStatus => (
                 K::Revoked,
                 "server certificate revocation status is unknown for the configured CRLs",
+            ),
+            C::ExpiredRevocationList | C::ExpiredRevocationListContext { .. } => (
+                K::CrlExpired,
+                "a CRL needed to check the server certificate is past its nextUpdate",
             ),
             _ => (K::InvalidCertificate, "server certificate was rejected"),
         },
