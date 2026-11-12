@@ -1240,7 +1240,12 @@ impl<T: PoolTls> Pool<T> {
                     .state()
                     .connections
                     .saturating_sub(retiring)
-                    .saturating_sub(shared.config.warm_floor);
+                    .saturating_sub(
+                        shared
+                            .config
+                            .warm_floor
+                            .max(shared.config.min_idle.unwrap_or(0)),
+                    );
                 let mut need = 0u64;
                 let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
                     held.iter()
@@ -1439,10 +1444,13 @@ impl<T: PoolTls> Pool<T> {
         self.inner.shared.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Stops this pool's maintenance from opening connections; a newer
-    /// generation is taking over.
-    pub(crate) fn mark_superseded(&self) {
-        self.inner.shared.superseded.store(true, Ordering::SeqCst);
+    /// While set, maintenance opens no connections (a newer generation is
+    /// taking over its permits).
+    pub(crate) fn set_superseded(&self, superseded: bool) {
+        self.inner
+            .shared
+            .superseded
+            .store(superseded, Ordering::SeqCst);
     }
 
     /// Closes one idle connection, if any; returns whether one was closed.

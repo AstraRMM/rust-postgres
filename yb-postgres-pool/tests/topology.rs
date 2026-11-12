@@ -1093,3 +1093,45 @@ async fn a_failing_new_generation_never_drains_the_old_one() {
     );
     set.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hand_off_is_bounded_when_every_old_session_is_borrowed() {
+    let cluster = Cluster::new("hb");
+    let a = Node::start(&cluster).await;
+    cluster.publish(&[(&a, "z1")]);
+    let realm = Realm::new("bounded-hand-off");
+    let pg = driver_config(&a, &realm, "load_balance=true");
+    let resolver = move |_: &PoolKey| -> Result<PoolSpec<NoTls>, PoolError> {
+        Ok(PoolSpec::new(pg.clone(), NoTls, pool_config(2, 2)))
+    };
+    let mut set_config = PoolSetConfig::default();
+    set_config.max_connections = 2;
+    set_config.drain_timeout = Duration::from_millis(500);
+    let set = PoolSet::new(set_config, resolver).unwrap();
+    let gen0 = PoolKey::for_realm(&realm, "test", "test");
+    let old = set.pool(&gen0).unwrap();
+    assert!(eventually(Duration::from_secs(5), || old.state().physical == 2).await);
+    let held = [old.get().await.unwrap(), old.get().await.unwrap()];
+    let started = Instant::now();
+    let new = set
+        .pool(&gen0.clone().with_credential_generation(1))
+        .unwrap();
+    assert!(
+        eventually(Duration::from_secs(3), || old.is_closed()).await,
+        "the hand-off never reached its deadline"
+    );
+    let drain_began = started.elapsed();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(held);
+    let warmed = eventually(Duration::from_secs(5), || new.state().physical == 2).await;
+    println!(
+        "EVIDENCE bounded hand-off: every old session borrowed, limit 2; drain began after {:?} \
+         (drain_timeout 500 ms); new generation warm={} physical={}",
+        drain_began,
+        warmed,
+        new.state().physical
+    );
+    assert!(drain_began < Duration::from_millis(1500));
+    assert!(warmed);
+    set.shutdown(Duration::from_secs(1)).await;
+}

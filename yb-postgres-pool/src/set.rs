@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use yb_tokio_postgres::Config;
 
 /// Everything needed to open a pool for one key.
@@ -58,6 +58,9 @@ struct SetInner<T: PoolTls> {
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
     /// Superseded generations still draining, awaited by `shutdown`.
     retiring: Mutex<HashMap<PoolKey, Pool<T>>>,
+    /// The running generation hand-off per identity; a newer rotation
+    /// cancels it and takes over its pools.
+    handoffs: Mutex<HashMap<PoolKey, Arc<AtomicBool>>>,
     /// The highest credential and configuration generation created per
     /// identity; a key below either is refused.
     newest: Mutex<HashMap<PoolKey, (u64, u64)>>,
@@ -105,6 +108,7 @@ impl<T: PoolTls> PoolSet<T> {
             pools: Mutex::new(HashMap::new()),
             retiring: Mutex::new(HashMap::new()),
             newest: Mutex::new(HashMap::new()),
+            handoffs: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let weak: Weak<SetInner<T>> = Arc::downgrade(&inner);
@@ -217,10 +221,19 @@ impl<T: PoolTls> PoolSet<T> {
                 });
             }
         }
-        let superseded: Vec<(PoolKey, Pool<T>)> = superseded_keys
+        let mut superseded: Vec<(PoolKey, Pool<T>)> = superseded_keys
             .iter()
             .filter_map(|k| pools.remove(k).map(|p| (k.clone(), p)))
             .collect();
+        {
+            let retiring = self.inner.retiring.lock();
+            superseded.extend(
+                retiring
+                    .iter()
+                    .filter(|(k, _)| key.supersedes(k))
+                    .map(|(k, p)| (k.clone(), p.clone())),
+            );
+        }
         if !superseded.is_empty() {
             log::info!(
                 "pool set: {} supersedes {} older generation pool(s)",
@@ -231,92 +244,21 @@ impl<T: PoolTls> PoolSet<T> {
                 .retiring
                 .lock()
                 .extend(superseded.iter().cloned());
-            let warming = pool.clone();
-            let drain = self.inner.config.drain_timeout;
-            let interval = warming
-                .config()
-                .maintenance_interval
-                .min(Duration::from_millis(100));
-            let inner = Arc::downgrade(&self.inner);
-            for (_, old) in &superseded {
-                old.mark_superseded();
+            let cancel = Arc::new(AtomicBool::new(false));
+            if let Some(previous) = self
+                .inner
+                .handoffs
+                .lock()
+                .insert(key.identity(), cancel.clone())
+            {
+                previous.store(true, Ordering::SeqCst);
             }
-            tokio::spawn(async move {
-                let floor = warming.config().warm_floor;
-                let min_idle = warming.config().min_idle.unwrap_or(0);
-                let mut waited = 0u32;
-                let mut before = warming.state().physical;
-                loop {
-                    if inner.strong_count() == 0 {
-                        return;
-                    }
-                    let failures = warming.state().stats.connect_failures;
-                    warming.top_up().await;
-                    let state = warming.state();
-                    if state.physical >= floor && state.idle >= min_idle {
-                        break;
-                    }
-                    if state.stats.connect_failures > failures {
-                        // The new generation cannot connect yet: keep the
-                        // old one serving and retry.
-                        waited = 0;
-                        before = state.physical;
-                        tokio::time::sleep(interval).await;
-                        continue;
-                    }
-                    if state.physical <= before && waited > 0 && waited < 20 {
-                        waited += 1;
-                        tokio::time::sleep(interval).await;
-                        continue;
-                    }
-                    let mut closed = false;
-                    for (_, old) in &superseded {
-                        if old.close_one_idle().await {
-                            closed = true;
-                            break;
-                        }
-                    }
-                    if !closed && state.physical < floor {
-                        tokio::time::sleep(interval).await;
-                        waited = 0;
-                        continue;
-                    }
-                    if !closed {
-                        break;
-                    }
-                    before = state.physical;
-                    waited = 1;
-                    tokio::time::sleep(interval).await;
-                }
-                let draining = futures_util::future::join_all(
-                    superseded.iter().map(|(_, p)| p.shutdown(drain)),
-                );
-                tokio::pin!(draining);
-                let mut warming = Some(warming);
-                loop {
-                    if inner.strong_count() == 0 {
-                        warming = None;
-                    }
-                    if let Some(warming) = &warming {
-                        warming.top_up().await;
-                    }
-                    tokio::select! {
-                        _ = &mut draining => break,
-                        _ = tokio::time::sleep(interval) => {}
-                    }
-                }
-                if let Some(inner) = inner.upgrade() {
-                    let mut retiring = inner.retiring.lock();
-                    for (key, old) in &superseded {
-                        if retiring.get(key).is_some_and(|p| p.same_pool(old)) {
-                            retiring.remove(key);
-                        }
-                    }
-                }
-                if let Some(warming) = warming {
-                    warming.top_up().await;
-                }
-            });
+            tokio::spawn(hand_off(
+                Arc::downgrade(&self.inner),
+                pool.clone(),
+                superseded,
+                cancel,
+            ));
         }
         {
             let mut newest = self.inner.newest.lock();
@@ -392,5 +334,124 @@ impl<T: PoolTls> PoolSet<T> {
         let mut pools: Vec<Pool<T>> = self.inner.pools.lock().drain().map(|(_, p)| p).collect();
         pools.extend(self.inner.retiring.lock().drain().map(|(_, p)| p));
         futures_util::future::join_all(pools.iter().map(|p| p.shutdown(drain))).await;
+    }
+}
+
+/// Moves warm capacity from superseded generations to `warming` within
+/// `drain_timeout`. The old generations keep serving and keep their own
+/// floor; one old idle session is closed at a time only when the new
+/// generation is short of permits, and the old generations refill if a new
+/// connection then fails. If the new generation cannot connect by the
+/// deadline the old ones are left serving; otherwise they drain.
+async fn hand_off<T: PoolTls>(
+    set: Weak<SetInner<T>>,
+    warming: Pool<T>,
+    old: Vec<(PoolKey, Pool<T>)>,
+    cancel: Arc<AtomicBool>,
+) {
+    let (drain, closed_set) = match set.upgrade() {
+        Some(inner) => (
+            inner.config.drain_timeout,
+            inner.closed.load(Ordering::SeqCst),
+        ),
+        None => return,
+    };
+    if closed_set {
+        return;
+    }
+    let interval = warming
+        .config()
+        .maintenance_interval
+        .min(Duration::from_millis(100));
+    let floor = warming.config().warm_floor;
+    let min_idle = warming.config().min_idle.unwrap_or(0);
+    let deadline = Instant::now() + drain;
+    let set_superseded = |value: bool| {
+        for (_, pool) in &old {
+            pool.set_superseded(value);
+        }
+    };
+    let stopped = || {
+        cancel.load(Ordering::SeqCst)
+            || warming.is_closed()
+            || set
+                .upgrade()
+                .map_or(true, |inner| inner.closed.load(Ordering::SeqCst))
+    };
+    set_superseded(false);
+    let mut awaiting: Option<(u32, u32)> = None;
+    let ready = loop {
+        if stopped() {
+            if !cancel.load(Ordering::SeqCst) {
+                set_superseded(false);
+            }
+            return;
+        }
+        let failures = warming.state().stats.connect_failures;
+        warming.top_up().await;
+        let state = warming.state();
+        if state.physical >= floor && state.idle >= min_idle {
+            break true;
+        }
+        if state.stats.connect_failures > failures {
+            set_superseded(false);
+            awaiting = None;
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(interval).await;
+            continue;
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        if let Some((before, waited)) = awaiting {
+            if state.physical <= before && waited < 20 {
+                awaiting = Some((before, waited + 1));
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        }
+        set_superseded(true);
+        let mut closed = false;
+        for (_, pool) in &old {
+            if pool.close_one_idle().await {
+                closed = true;
+                break;
+            }
+        }
+        awaiting = closed.then_some((state.physical, 0));
+        tokio::time::sleep(interval).await;
+    };
+    if !ready {
+        log::warn!(
+            "pool set: {:?} could not connect within {:?}; the superseded generation keeps serving",
+            warming,
+            drain
+        );
+        return;
+    }
+    set_superseded(true);
+    let draining = futures_util::future::join_all(old.iter().map(|(_, p)| p.shutdown(drain)));
+    tokio::pin!(draining);
+    loop {
+        if !cancel.load(Ordering::SeqCst) && !warming.is_closed() {
+            warming.top_up().await;
+        }
+        tokio::select! {
+            _ = &mut draining => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+    if let Some(inner) = set.upgrade() {
+        let mut retiring = inner.retiring.lock();
+        for (key, pool) in &old {
+            if retiring.get(key).is_some_and(|p| p.same_pool(pool)) {
+                retiring.remove(key);
+            }
+        }
+    }
+    if !cancel.load(Ordering::SeqCst) && !warming.is_closed() {
+        warming.top_up().await;
     }
 }
