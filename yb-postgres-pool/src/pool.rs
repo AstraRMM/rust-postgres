@@ -290,7 +290,7 @@ impl<T: PoolTls> Shared<T> {
         *self.last_fatal.lock() = Some(error.clone());
         self.fatal_seq.fetch_add(1, Ordering::SeqCst);
         self.fatal.notify_waiters();
-        log::warn!("pool {}: connect failed: {}", self.label, error);
+        log::warn!("pool {}: connect failed: {}", self.label, error.redacted());
     }
 
     /// Opens one physical connection within `connect_timeout`. With
@@ -434,7 +434,12 @@ impl<T: PoolTls> Shared<T> {
                 // a borrower that sees the closed client can find it.
                 if let Err(e) = (&mut connection).await {
                     bump(&stats.terminal_failures);
-                    log::debug!("pool {}: connection {} ended: {}", label, id, e);
+                    log::debug!(
+                        "pool {}: connection {} ended: {}",
+                        label,
+                        id,
+                        yb_tokio_postgres::observe::Redacted(&e)
+                    );
                     *terminal_slot.lock() = Some(PoolError::from_driver(e));
                 }
                 let held = Arc::strong_count(&terminal_slot) > 1;
@@ -615,7 +620,11 @@ impl<T: PoolTls> Shared<T> {
                 .await
                 .unwrap_or_else(|_| Ok(()))
             {
-                log::debug!("pool {}: cancel request failed: {}", self.label, e);
+                log::debug!(
+                    "pool {}: cancel request failed: {}",
+                    self.label,
+                    yb_tokio_postgres::observe::Redacted(&e)
+                );
             }
             if tokio::time::timeout(remaining(), client.wait_until_settled())
                 .await
@@ -677,7 +686,8 @@ impl<T: PoolTls> Shared<T> {
                     _ => {
                         let message = format!(
                             "no connection within {:?}; last connect failure: {}",
-                            budget, last
+                            budget,
+                            last.redacted()
                         );
                         last.with_kind(ErrorKind::AcquireTimeout)
                             .with_message(message)
@@ -764,7 +774,7 @@ struct LogSink(String);
 
 impl bb8::ErrorSink<PoolError> for LogSink {
     fn sink(&self, error: PoolError) {
-        log::debug!("pool {}: {}", self.0, error);
+        log::debug!("pool {}: {}", self.0, error.redacted());
     }
 
     fn boxed_clone(&self) -> Box<dyn bb8::ErrorSink<PoolError>> {

@@ -157,6 +157,14 @@ impl PoolError {
         self.source.as_deref()
     }
 
+    /// Formats the error for logs: the kind, the pool's own message and the
+    /// driver error reduced by
+    /// [`observe::Redacted`](yb_tokio_postgres::observe::Redacted), so no
+    /// server message, detail or hint text is included.
+    pub fn redacted(&self) -> impl fmt::Display + '_ {
+        RedactedPoolError(self)
+    }
+
     /// Whether the failure means the physical connection is unusable.
     pub fn is_transport(&self) -> bool {
         matches!(self.kind, ErrorKind::Transport | ErrorKind::AmbiguousCommit)
@@ -189,6 +197,21 @@ impl fmt::Display for PoolError {
         }
         if let Some(source) = &self.source {
             write!(f, ": {}", source)?;
+        }
+        Ok(())
+    }
+}
+
+struct RedactedPoolError<'a>(&'a PoolError);
+
+impl fmt::Display for RedactedPoolError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.kind)?;
+        if let Some(message) = &self.0.message {
+            write!(f, ": {}", message)?;
+        }
+        if let Some(source) = &self.0.source {
+            write!(f, ": {}", yb_tokio_postgres::observe::Redacted(source))?;
         }
         Ok(())
     }

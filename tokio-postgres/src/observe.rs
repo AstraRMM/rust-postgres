@@ -1228,33 +1228,68 @@ impl SocketObservation {
 
 /// Formats an [`Error`](crate::Error) for logs without server-supplied text.
 ///
-/// Database errors are reduced to their severity and SQLSTATE; the message,
-/// detail, hint, position and `where` fields (which can quote SQL, parameter
-/// values or keys) are omitted. Other errors print their kind and cause
-/// chain, which the driver builds from fixed text and redacted endpoint
-/// labels.
+/// Database errors are reduced to their severity and SQLSTATE (see
+/// [`RedactedDb`]); the message, detail, hint, position and `where` fields
+/// (which can quote SQL, parameter values or keys) are omitted. Parameter and
+/// column conversion errors print only their kind and index, since the
+/// conversion's own message can quote the value. Other errors print their
+/// kind and cause chain, which the driver builds from fixed text and redacted
+/// endpoint labels.
 pub struct Redacted<'a>(pub &'a crate::Error);
 
 impl fmt::Display for Redacted<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use std::error::Error as _;
         if let Some(db) = self.0.as_db_error() {
-            return write!(f, "db error: {} ({})", db.severity(), db.code().code());
+            return write!(f, "db error: {}", RedactedDb(db));
         }
-        write!(f, "{}", self.0)?;
+        self.0.fmt_kind(f)?;
+        if self.0.is_conversion() {
+            return Ok(());
+        }
         let mut source = self.0.source();
-        // The top-level Display already includes the direct cause.
-        if let Some(cause) = source {
-            source = cause.source();
-        }
         while let Some(cause) = source {
-            match cause.downcast_ref::<crate::error::DbError>() {
-                Some(db) => write!(f, ": db error: {} ({})", db.severity(), db.code().code())?,
-                None => write!(f, ": {}", cause)?,
+            if let Some(db) = cause.downcast_ref::<crate::error::DbError>() {
+                write!(f, ": db error: {}", RedactedDb(db))?;
+            } else if let Some(e) = cause.downcast_ref::<crate::Error>() {
+                // A nested driver error is redacted by the same rules.
+                return write!(f, ": {}", Redacted(e));
+            } else {
+                write!(f, ": {}", cause)?;
             }
             source = cause.source();
         }
         Ok(())
+    }
+}
+
+/// Formats a [`DbError`](crate::error::DbError) (an error or notice) as
+/// `SEVERITY (SQLSTATE)` using only values the driver validates.
+///
+/// The severity is the parsed, non-localized [`Severity`](crate::error::Severity)
+/// (`UNKNOWN` when the server sent none the driver recognises), and the
+/// SQLSTATE is printed only when it is five ASCII letters or digits
+/// (`?????` otherwise). Neither field can carry other server text.
+pub struct RedactedDb<'a>(pub &'a crate::error::DbError);
+
+impl fmt::Display for RedactedDb<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.known_severity() {
+            Some(severity) => write!(f, "{}", severity)?,
+            None => f.write_str("UNKNOWN")?,
+        }
+        let code = self.0.code().code();
+        if code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            write!(f, " ({})", code)
+        } else {
+            f.write_str(" (?????)")
+        }
+    }
+}
+
+impl fmt::Debug for RedactedDb<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 

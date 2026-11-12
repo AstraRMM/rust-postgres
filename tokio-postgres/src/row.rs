@@ -217,11 +217,18 @@ impl AsName for SimpleColumn {
 }
 
 /// A row of data returned from the database by a simple query.
-#[derive(Debug)]
 pub struct SimpleQueryRow {
     columns: Arc<[SimpleColumn]>,
     body: DataRowBody,
     ranges: Vec<Option<Range<usize>>>,
+}
+
+impl fmt::Debug for SimpleQueryRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimpleQueryRow")
+            .field("columns", &self.columns())
+            .finish()
+    }
 }
 
 impl SimpleQueryRow {
