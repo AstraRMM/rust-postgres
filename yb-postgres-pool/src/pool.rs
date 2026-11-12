@@ -19,7 +19,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::AbortHandle;
 use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::types::{ToSql, Type};
-use yb_tokio_postgres::{Client, Config, Row, Statement, TransactionStatus};
+use yb_tokio_postgres::{Client, Config, Row, SimpleQueryMessage, Statement, TransactionStatus};
 
 tokio::task_local! {
     static SWEEPING: ();
@@ -41,6 +41,8 @@ pub struct NativeConnection {
     created: Instant,
     idle_since: Instant,
     param_baseline: u64,
+    /// Connect-time session fingerprint, when the pool checks one.
+    fingerprint: Option<Vec<Option<String>>>,
     retire: Option<Retire>,
 }
 
@@ -220,6 +222,7 @@ pub(crate) struct Shared<T: PoolTls> {
     tls: T,
     pub(crate) config: PoolConfig,
     init_sql: Option<String>,
+    fingerprint_sql: Option<String>,
     limiter: ConnectionLimiter,
     /// `max_size` permits, held per physical connection exactly like the
     /// process-wide ones, so physical connections (including dials in
@@ -467,6 +470,7 @@ impl<T: PoolTls> Shared<T> {
             created: Instant::now(),
             idle_since: Instant::now(),
             param_baseline: 0,
+            fingerprint: None,
             retire: None,
         };
         if let Some(sql) = &self.init_sql {
@@ -474,6 +478,25 @@ impl<T: PoolTls> Shared<T> {
             if let Err(e) = conn.client.batch_execute(sql).await {
                 conn.retire = Some(Retire::Closed);
                 return Err(PoolError::from_driver(e).with_message("session initialization failed"));
+            }
+        }
+        if let Some(sql) = &self.fingerprint_sql {
+            bump(&self.stats.session_fingerprint_checks);
+            match session_fingerprint(&conn.client, sql).await {
+                Ok(row) if !row.is_empty() => conn.fingerprint = Some(row),
+                Ok(_) => {
+                    conn.retire = Some(Retire::Closed);
+                    return Err(PoolError::new(
+                        ErrorKind::Transport,
+                        "session fingerprint returned no row",
+                    ));
+                }
+                Err(e) => {
+                    conn.retire = Some(Retire::Closed);
+                    return Err(
+                        PoolError::from_driver(e).with_message("session fingerprint failed")
+                    );
+                }
             }
         }
         conn.param_baseline = conn.client.parameter_status_changes();
@@ -484,6 +507,26 @@ impl<T: PoolTls> Shared<T> {
             self.signals.fetch_add(1, Ordering::SeqCst);
         }
         Ok(conn)
+    }
+
+    /// Compares the session with its connect-time fingerprint, within
+    /// `cleanup_timeout`. Only called on a reusable connection.
+    async fn verify_fingerprint(&self, conn: &NativeConnection) -> Result<(), Retire> {
+        let (sql, baseline) = match (&self.fingerprint_sql, &conn.fingerprint) {
+            (Some(sql), Some(baseline)) => (sql, baseline),
+            _ => return Ok(()),
+        };
+        bump(&self.stats.session_fingerprint_checks);
+        match tokio::time::timeout(
+            self.config.cleanup_timeout,
+            session_fingerprint(&conn.client, sql),
+        )
+        .await
+        {
+            Ok(Ok(row)) if row == *baseline => Ok(()),
+            Ok(Ok(_)) => Err(Retire::SessionFingerprint),
+            _ => Err(Retire::CleanupFailed),
+        }
     }
 
     /// Local checkout checks; no traffic unless `HealthCheck::AfterIdle`.
@@ -743,6 +786,21 @@ impl<T: PoolTls> Shared<T> {
     }
 }
 
+/// Runs the fingerprint query and returns its first row as text.
+async fn session_fingerprint(
+    client: &Client,
+    sql: &str,
+) -> Result<Vec<Option<String>>, yb_tokio_postgres::Error> {
+    for message in client.simple_query(sql).await? {
+        if let SimpleQueryMessage::Row(row) = message {
+            return Ok((0..row.len())
+                .map(|i| row.get(i).map(str::to_string))
+                .collect());
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// The bb8 manager.
 pub struct Manager<T: PoolTls> {
     shared: Arc<Shared<T>>,
@@ -917,11 +975,16 @@ impl<T: PoolTls> Pool<T> {
             pg.yb_attempt_timeout(config.connect_timeout);
         }
         let realm = pg.resolved_realm();
+        let fingerprint_sql = match &config.session_fingerprint {
+            Some(fingerprint) => Some(fingerprint.query()?),
+            None => None,
+        };
         let shared = Arc::new(Shared {
             pg,
             tls,
             config: config.clone(),
             init_sql,
+            fingerprint_sql,
             limiter,
             capacity: ConnectionLimiter::new(config.max_size),
             stats: Arc::new(Stats::default()),
@@ -1756,7 +1819,12 @@ impl<T: PoolTls> Drop for Lease<T> {
 /// SQL-level `PREPARE`, temporary tables and session advisory locks are not
 /// detectable in general (only `GUC_REPORT` settings are). Use
 /// transaction-local settings, or call `mark_session_dirty` after any
-/// session-level change.
+/// session-level change. With
+/// [`PoolConfig::session_fingerprint`](crate::PoolConfig::session_fingerprint)
+/// every return, clean or after cleanup, also costs one query that compares
+/// the current and session user, `search_path`, `row_security` and the
+/// listed settings with their connect-time values; a difference closes the
+/// connection.
 pub struct PooledClient<T: PoolTls> {
     conn: Option<bb8::PooledConnection<'static, Manager<T>>>,
     lease: Option<Lease<T>>,
@@ -2004,14 +2072,16 @@ impl<T: PoolTls> Drop for PooledClient<T> {
         };
         let lease = self.lease.take();
         match self.shared.assess(&conn) {
-            Ok(false) => {}
+            Ok(false) if conn.fingerprint.is_none() => {}
             Err(reason) => conn.retire = Some(reason),
-            Ok(true) => match tokio::runtime::Handle::try_current() {
+            Ok(needs_cleanup) => match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     let shared = self.shared.clone();
                     handle.spawn(async move {
-                        if !shared.cleanup(&mut conn).await {
+                        if needs_cleanup && !shared.cleanup(&mut conn).await {
                             conn.retire = Some(Retire::CleanupFailed);
+                        } else if let Err(reason) = shared.verify_fingerprint(&conn).await {
+                            conn.retire = Some(reason);
                         }
                         drop(conn);
                         drop(lease);

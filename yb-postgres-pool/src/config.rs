@@ -163,11 +163,20 @@ impl PlanCacheMode {
 /// or the next borrower gets the changed value.
 ///
 /// Prefer [`SessionInit::StartupOptions`] for parity. Startup options become
-/// the session defaults, so `RESET ALL` and `DISCARD ALL` return to the
-/// pool's values. With [`SessionInit::AfterConnect`] the values are plain
-/// session `SET`s: `RESET ALL` or `DISCARD ALL` reverts all four to the
-/// server, role or database default, and only a reverted `DateStyle` or
-/// `TimeZone` is detected.
+/// the session defaults, so `RESET ALL` and `DISCARD ALL` return these four
+/// parameters (and `search_path` and the timeouts) to the pool's values.
+/// With [`SessionInit::AfterConnect`] the values are plain session `SET`s:
+/// `RESET ALL` or `DISCARD ALL` reverts all four to the server, role or
+/// database default, and only a reverted `DateStyle` or `TimeZone` is
+/// detected.
+///
+/// Neither mode makes [`SessionConfig::role`] survive `DISCARD ALL` or
+/// `RESET SESSION AUTHORIZATION`: on PostgreSQL 16 and YugabyteDB 2025.2
+/// both set the current user back to the login user, whichever mode set the
+/// role. `RESET ROLE` returns to the pool's role only with startup options.
+/// A login user that is a superuser while the pool's role is not is
+/// reported (`is_superuser`) and retires the session; otherwise only
+/// [`SessionFingerprint`] detects the change.
 ///
 /// [`ErrorKind::Config`]: crate::ErrorKind::Config
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -532,6 +541,99 @@ pub struct PoolConfig {
     pub queue_strategy: QueueStrategy,
     /// Session state for every connection.
     pub session: SessionConfig,
+    /// Return-time session fingerprint; `None` (the default) sends nothing
+    /// on return. See [`SessionFingerprint`].
+    pub session_fingerprint: Option<SessionFingerprint>,
+}
+
+/// Opt-in check that a returned session still has the identity and settings
+/// it was opened with.
+///
+/// Without it, a clean return costs no round trip and the pool detects only
+/// what the protocol reports: transaction status, requests in flight and
+/// `GUC_REPORT` settings. `SET ROLE` between roles with the same
+/// `is_superuser`, `search_path`, `row_security` and session-level
+/// `set_config` survive into the next lease unless the borrower calls
+/// [`PooledClient::mark_session_dirty`](crate::PooledClient::mark_session_dirty).
+///
+/// With it, every new connection records one row right after session
+/// initialization, and every return sends the same single simple query and
+/// compares: `current_user`, `session_user`, `search_path`, `row_security`
+/// and each name in [`settings`](Self::settings) (read with
+/// `current_setting(name, true)`, an unset name reading as empty). A
+/// difference retires the connection (counted in
+/// [`PoolStats::retired_session_fingerprint`](crate::PoolStats::retired_session_fingerprint));
+/// a check that fails or does not finish within `cleanup_timeout` retires it
+/// as failed cleanup. Every query is counted in
+/// [`PoolStats::session_fingerprint_checks`](crate::PoolStats::session_fingerprint_checks).
+///
+/// Cost: one round trip per return and one per connect. The connection is
+/// back in the pool, and the lease ends, only after that round trip. Values
+/// set with `SET LOCAL` / `set_config(name, value, true)` end with their
+/// transaction and do not trip the check.
+///
+/// Not covered: temporary tables, session advisory locks, `LISTEN`,
+/// SQL-level `PREPARE`, and settings that are neither listed nor reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionFingerprint {
+    /// Further setting names to compare, for example `app.tenant_id`. Each
+    /// is one or more lowercase unquoted identifiers joined by `.`, at most
+    /// 127 characters; at most [`MAX_FINGERPRINT_SETTINGS`] names.
+    pub settings: Vec<String>,
+}
+
+/// Upper bound on [`SessionFingerprint::settings`].
+pub const MAX_FINGERPRINT_SETTINGS: usize = 32;
+
+impl SessionFingerprint {
+    /// A fingerprint over the fixed fields plus `settings`.
+    pub fn new<I, S>(settings: I) -> SessionFingerprint
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        SessionFingerprint {
+            settings: settings.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Validates the setting names.
+    pub fn validate(&self) -> Result<(), PoolError> {
+        if self.settings.len() > MAX_FINGERPRINT_SETTINGS {
+            return Err(PoolError::config(format!(
+                "session fingerprint lists more than {} settings",
+                MAX_FINGERPRINT_SETTINGS
+            )));
+        }
+        for name in &self.settings {
+            if name.len() > 127 || !name.split('.').all(identifier_ok) {
+                return Err(PoolError::config(
+                    "session fingerprint settings must be lowercase unquoted identifiers joined by '.'",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The fingerprint query. Names are validated to `[a-z0-9_$.]`, so they
+    /// need no escaping inside a string literal; functions are
+    /// schema-qualified so a session `search_path` cannot shadow them.
+    pub(crate) fn query(&self) -> Result<String, PoolError> {
+        self.validate()?;
+        let mut sql = String::from(
+            "SELECT current_user, session_user, \
+             pg_catalog.current_setting('search_path'), \
+             pg_catalog.current_setting('row_security')",
+        );
+        for name in &self.settings {
+            sql.push_str(&format!(
+                ", COALESCE(pg_catalog.current_setting('{}', true), '')",
+                name
+            ));
+        }
+        Ok(sql)
+    }
 }
 
 impl Default for PoolConfig {
@@ -552,6 +654,7 @@ impl Default for PoolConfig {
             reaper_rate: Duration::from_secs(5),
             queue_strategy: QueueStrategy::Lifo,
             session: SessionConfig::default(),
+            session_fingerprint: None,
         }
     }
 }
@@ -602,6 +705,9 @@ impl PoolConfig {
                 MAX_STATEMENT_CACHE_CAPACITY
             )));
         }
+        if let Some(fingerprint) = &self.session_fingerprint {
+            fingerprint.validate()?;
+        }
         self.session.validate()
     }
 }
@@ -650,5 +756,54 @@ impl PoolSetConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PoolConfig, SessionFingerprint, MAX_FINGERPRINT_SETTINGS};
+
+    #[test]
+    fn fingerprint_query_lists_only_validated_names() {
+        assert_eq!(
+            SessionFingerprint::default().query().unwrap(),
+            "SELECT current_user, session_user, pg_catalog.current_setting('search_path'), \
+             pg_catalog.current_setting('row_security')"
+        );
+        let fingerprint = SessionFingerprint::new(["app.tenant_id", "work_mem", "x.y.z$1"]);
+        assert!(fingerprint.query().unwrap().ends_with(
+            ", COALESCE(pg_catalog.current_setting('app.tenant_id', true), ''), \
+             COALESCE(pg_catalog.current_setting('work_mem', true), ''), \
+             COALESCE(pg_catalog.current_setting('x.y.z$1', true), '')"
+        ));
+        for bad in [
+            "",
+            "App.tenant",
+            "app..tenant",
+            "app.",
+            ".app",
+            "app.tenant'",
+            "app.tenant', false) --",
+            "a b",
+            "1app",
+            "app\\x",
+        ] {
+            let fingerprint = SessionFingerprint::new([bad]);
+            assert!(fingerprint.validate().is_err(), "{bad:?}");
+            assert!(fingerprint.query().is_err(), "{bad:?}");
+            let mut config = PoolConfig::default();
+            config.session_fingerprint = Some(fingerprint);
+            assert!(config.validate().is_err(), "{bad:?}");
+        }
+        let long = format!("{}.{}", "a".repeat(63), "b".repeat(64));
+        assert!(SessionFingerprint::new([long]).validate().is_err());
+        let many: Vec<String> = (0..=MAX_FINGERPRINT_SETTINGS)
+            .map(|i| format!("app.s{}", i))
+            .collect();
+        assert!(SessionFingerprint::new(many).validate().is_err());
+        let mut config = PoolConfig::default();
+        assert_eq!(config.session_fingerprint, None, "off by default");
+        config.session_fingerprint = Some(SessionFingerprint::new(["app.tenant_id"]));
+        assert!(config.validate().is_ok());
     }
 }
