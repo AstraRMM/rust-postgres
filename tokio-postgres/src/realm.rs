@@ -1084,6 +1084,8 @@ impl Realm {
             None => (Some(Seeds::All), None),
         };
         let mut last = None;
+        // Configured hosts a seed pass tries in this refresh.
+        let mut seed_tried = Vec::new();
         if let Some(select) = first {
             let seeded = self
                 .discover_through_seeds(
@@ -1094,6 +1096,7 @@ impl Realm {
                     deadline,
                     &deferred,
                     select,
+                    &mut seed_tried,
                 )
                 .await?;
             match seeded {
@@ -1106,6 +1109,15 @@ impl Realm {
             // Including any penalty the seed pass just recorded.
             let penalties = self.penalties(delay);
             let seed_endpoints = self.seed_endpoints(config, delay);
+            if last_pass.is_some() {
+                let pending =
+                    (0..cmp::max(config.host.len(), config.hostaddr.len())).filter(|&i| {
+                        seed_aliases(config, i)
+                            .iter()
+                            .any(|alias| deferred.contains(&alias.to_ascii_lowercase()))
+                    });
+                seed_tried.extend(pending);
+            }
             // Penalised nodes failed recently: try every other known node
             // first (stable sort).
             let mut known: Vec<&NodeInfo> = previous.nodes.values().collect();
@@ -1115,7 +1127,13 @@ impl Realm {
                     continue;
                 }
                 // The seed passes cover the seeds, under any identity.
-                if covered_by_seeds(config, &node.identity, node.port, &seed_endpoints) {
+                if covered_by_seeds(
+                    config,
+                    &node.identity,
+                    node.port,
+                    &seed_endpoints,
+                    &seed_tried,
+                ) {
                     continue;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1194,6 +1212,7 @@ impl Realm {
                     deadline,
                     &deferred,
                     select,
+                    &mut Vec::new(),
                 )
                 .await?;
             match seeded {
@@ -1224,6 +1243,7 @@ impl Realm {
         deadline: Instant,
         deferred: &[String],
         select: Seeds,
+        tried: &mut Vec<usize>,
     ) -> Result<Result<Topology, Error>, Error>
     where
         T: MakeTlsConnect<Socket>,
@@ -1234,6 +1254,7 @@ impl Realm {
             .select(select);
         let outcome = connect_with_tls_ref(tls, control, &mut pass).await;
         self.penalize_seeds(&pass);
+        tried.extend(pass.tried.iter().copied());
         let e = match outcome {
             Ok((client, connection)) => {
                 info!(
@@ -1421,23 +1442,25 @@ pub(crate) fn deadline_after(budget: Duration) -> Instant {
 /// About 30 years, as Tokio uses for an unbounded timer.
 const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
-/// Whether a seed pass dials `identity` on `port`: a configured seed of
+/// Whether a seed pass of this refresh dials `identity` on `port`: one of
+/// the configured hosts in `seeds` (tried, or left for the last pass) with
 /// that name or `hostaddr` on that port, or an address a seed resolved to
-/// (`seed_endpoints`, lower case) on a seed's port.
+/// (`seed_endpoints`, lower case) on one of their ports.
 fn covered_by_seeds(
     config: &Config,
     identity: &str,
     port: u16,
     seed_endpoints: &HashSet<String>,
+    seeds: &[usize],
 ) -> bool {
-    let seeds = cmp::max(config.host.len(), config.hostaddr.len());
-    (0..seeds).any(|i| {
+    let resolved = seed_endpoints.contains(&identity.to_ascii_lowercase());
+    seeds.iter().any(|&i| {
         seed_port(config, i) == port
-            && seed_aliases(config, i)
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(identity))
-    }) || (seed_endpoints.contains(&identity.to_ascii_lowercase())
-        && (0..cmp::max(seeds, 1)).any(|i| seed_port(config, i) == port))
+            && (resolved
+                || seed_aliases(config, i)
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(identity)))
+    })
 }
 
 fn invalid_topology(reason: &str) -> Error {

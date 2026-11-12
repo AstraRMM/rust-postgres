@@ -121,6 +121,8 @@ pub(crate) struct SeedPass {
     /// The aliases ([`seed_aliases`]) of each seed whose own endpoint
     /// failed ([`is_node_scoped_failure`]), one entry per failure.
     pub(crate) node_failures: Vec<Vec<String>>,
+    /// Indices of the configured hosts this pass attempted.
+    pub(crate) tried: Vec<usize>,
 }
 
 impl SeedPass {
@@ -132,6 +134,7 @@ impl SeedPass {
             deferred: Vec::new(),
             failure: None,
             node_failures: Vec::new(),
+            tried: Vec::new(),
         }
     }
 
@@ -350,6 +353,7 @@ where
         // The host attempt bounds itself, so a TLS error recorded on one of
         // its resolved addresses is returned rather than lost to a timeout.
         let mut host = HostAttempt::bounded(attempt_timeout);
+        pass.tried.push(i);
         let outcome = connect_host(
             addr,
             hostname,

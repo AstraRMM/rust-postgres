@@ -1250,6 +1250,28 @@ async fn a_known_node_on_another_port_than_its_seed_is_still_tried() {
     assert!(other.logins() - before >= 2, "discovery and the session reached it");
 }
 
+/// ASTS-86: when the first seed connects but its topology query fails, a
+/// seed the pass never reached is still tried as a known node.
+#[tokio::test]
+async fn an_untried_seed_still_serves_refresh_as_a_known_node() {
+    let cluster = Cluster::new("untried");
+    let (s1, s2) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&s1, "primary", "z1"), (&s2, "primary", "z1")]);
+    let realm = Realm::new("untried");
+    let conf: Config = format!(
+        "host={},{} port={},{} user=test dbname=test sslmode=disable connect_timeout=2 \
+         load_balance=only-primary yb_servers_refresh_interval=0",
+        s1.ip, s2.ip, s1.port, s2.port
+    )
+    .parse()
+    .unwrap();
+    let _first = connect(&conf, &realm).await.unwrap();
+    s1.set(Behaviour::DiscoveryShutdown);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let info = realm.refresh(NoTls, &conf).await.expect("s2 serves the refresh");
+    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
+}
+
 /// ASTS-86: with one seed penalised and the other down, refresh tries the
 /// known nodes before retrying the penalised seed.
 #[tokio::test]
