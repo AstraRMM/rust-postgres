@@ -922,5 +922,52 @@ async fn stale_generation_keys_cannot_undo_a_rotation() {
     );
     drop(in_flight);
     assert!(eventually(Duration::from_secs(3), || old.state().physical == 0).await);
+    drop(new);
+    set.retire(&gen1, Duration::ZERO).await;
+    assert_eq!(set.active_pools(), 0);
+    let after_eviction = set.pool(&gen0).unwrap_err();
+    assert_eq!(
+        after_eviction.kind(),
+        yb_postgres_pool::ErrorKind::PoolClosed,
+        "a superseded key is refused even with no newer pool alive"
+    );
     set.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweeps_do_not_extend_idle_timeout() {
+    let cluster = Cluster::new("it");
+    let (a, b) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&a, "z1"), (&b, "z1")]);
+    let realm = Realm::new("idle-timeout");
+    let mut config = pool_config(2, 4);
+    config.idle_timeout = Some(Duration::from_millis(800));
+    config.reaper_rate = Duration::from_secs(30);
+    let pool = Pool::new(
+        driver_config(&a, &realm, "load_balance=true"),
+        NoTls,
+        config,
+    )
+    .unwrap();
+    assert!(eventually(Duration::from_secs(5), || pool.state().physical == 2).await);
+    let warmed = Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c = Node::start(&cluster).await;
+    cluster.publish(&[(&a, "z1"), (&b, "z1"), (&c, "z1")]);
+    let retired = eventually(Duration::from_secs(3), || {
+        pool.state().stats.retired_idle >= 2
+    })
+    .await;
+    let after = warmed.elapsed();
+    println!(
+        "EVIDENCE idle timeout: idle_timeout 800 ms, bb8 reaper every 30 s, topology sweep at ~500 ms; \
+         both warm sessions retired as idle {:?} after warming; retired_idle={} physical={}",
+        after,
+        pool.state().stats.retired_idle,
+        pool.state().physical
+    );
+    assert!(retired);
+    assert!(after < Duration::from_millis(1500), "{:?}", after);
+    assert!(eventually(Duration::from_secs(2), || pool.state().physical == 2).await);
+    pool.shutdown(Duration::from_secs(1)).await;
 }
