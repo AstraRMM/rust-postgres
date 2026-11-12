@@ -1224,6 +1224,11 @@ impl<T: PoolTls> Pool<T> {
                 }
                 outcome = refresh => Some(outcome),
             };
+            if let Some(timeout) = shared.config.idle_timeout {
+                let deadline = session.idle_since + timeout;
+                let mut scheduled = shared.idle_deadline.lock();
+                *scheduled = Some(scheduled.map_or(deadline, |d| d.min(deadline)));
+            }
             SWEEPING.sync_scope((), || drop(session));
             match outcome {
                 Some(Ok(Ok(_))) => {
