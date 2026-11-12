@@ -228,7 +228,7 @@ pub struct PoolStats {
     pub statement_invalidations: u64,
     /// Autocommit queries retried once after a stale-statement error.
     pub stale_statement_retries: u64,
-    /// Connections opened by warm-floor maintenance.
+    /// Connections opened by maintenance for `warm_floor` or `min_idle`.
     pub warm_connects: u64,
     /// Gauge: connections short of `warm_floor` after the last maintenance pass.
     pub warm_deficit: u64,

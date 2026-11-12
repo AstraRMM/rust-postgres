@@ -923,7 +923,7 @@ impl<T: PoolTls> Pool<T> {
         });
         let pool = bb8::Pool::builder()
             .max_size(config.max_size)
-            .min_idle(config.min_idle)
+            .min_idle(None)
             .test_on_check_out(true)
             .max_lifetime(config.max_lifetime)
             .idle_timeout(config.idle_timeout)
@@ -942,7 +942,8 @@ impl<T: PoolTls> Pool<T> {
                 shared: shared.clone(),
             });
         let inner = Arc::new(Inner { pool, shared });
-        if config.warm_floor > 0 || inner.shared.realm.is_some() {
+        if config.warm_floor > 0 || config.min_idle.unwrap_or(0) > 0 || inner.shared.realm.is_some()
+        {
             let weak = Arc::downgrade(&inner);
             let interval = config.maintenance_interval;
             tokio::spawn(async move {
@@ -1351,13 +1352,17 @@ impl<T: PoolTls> Pool<T> {
     pub async fn top_up(&self) -> u32 {
         let shared = &self.inner.shared;
         let floor = shared.config.warm_floor;
+        let min_idle = shared.config.min_idle.unwrap_or(0);
         let mut opened = 0;
         let _serial = shared.warm_lock.lock().await;
         while !shared.is_closed() {
             // Dials already in flight (bb8's or ours) count toward the floor.
-            let have =
-                self.inner.pool.state().connections + shared.opening.load(Ordering::SeqCst) as u32;
-            if have >= floor {
+            let state = self.inner.pool.state();
+            let opening = shared.opening.load(Ordering::SeqCst) as u32;
+            let have = state.connections + opening;
+            let idle = state.idle_connections + opening;
+            let short_of_idle = idle < min_idle && have < shared.config.max_size;
+            if have >= floor && !short_of_idle {
                 shared.stats.warm_deficit.store(0, Ordering::Relaxed);
                 break;
             }

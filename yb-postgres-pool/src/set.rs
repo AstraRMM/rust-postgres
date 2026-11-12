@@ -58,8 +58,9 @@ struct SetInner<T: PoolTls> {
     pools: Mutex<HashMap<PoolKey, Pool<T>>>,
     /// Superseded generations still draining, awaited by `shutdown`.
     retiring: Mutex<HashMap<PoolKey, Pool<T>>>,
-    /// The newest generation created per identity; older ones are refused.
-    newest: Mutex<HashMap<PoolKey, PoolKey>>,
+    /// The highest credential and configuration generation created per
+    /// identity; a key below either is refused.
+    newest: Mutex<HashMap<PoolKey, (u64, u64)>>,
     closed: AtomicBool,
 }
 
@@ -163,7 +164,9 @@ impl<T: PoolTls> PoolSet<T> {
             .newest
             .lock()
             .get(&key.identity())
-            .is_some_and(|newest| newest.supersedes(key))
+            .is_some_and(|&(credential, config)| {
+                key.credential_generation() < credential || key.config_generation() < config
+            })
         {
             return Err(PoolError::new(
                 ErrorKind::PoolClosed,
@@ -268,10 +271,9 @@ impl<T: PoolTls> PoolSet<T> {
         }
         {
             let mut newest = self.inner.newest.lock();
-            let entry = newest.entry(key.identity()).or_insert_with(|| key.clone());
-            if key.supersedes(entry) {
-                *entry = key.clone();
-            }
+            let entry = newest.entry(key.identity()).or_insert((0, 0));
+            entry.0 = entry.0.max(key.credential_generation());
+            entry.1 = entry.1.max(key.config_generation());
         }
         pools.insert(key.clone(), pool.clone());
         Ok(pool)

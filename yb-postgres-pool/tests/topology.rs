@@ -907,6 +907,13 @@ async fn stale_generation_keys_cannot_undo_a_rotation() {
     let old = set.pool(&gen0).unwrap();
     let in_flight = old.get().await.unwrap();
     let new = set.pool(&gen1).unwrap();
+    let mixed = gen0.clone().with_config_generation(1);
+    let regressed = set.pool(&mixed).unwrap_err();
+    assert_eq!(
+        regressed.kind(),
+        yb_postgres_pool::ErrorKind::PoolClosed,
+        "a key below either newest generation is refused: {regressed}"
+    );
     let stale = set.pool(&gen0).unwrap_err();
     assert_eq!(
         stale.kind(),
@@ -969,5 +976,50 @@ async fn sweeps_do_not_extend_idle_timeout() {
     assert!(retired);
     assert!(after < Duration::from_millis(1500), "{:?}", after);
     assert!(eventually(Duration::from_secs(2), || pool.state().physical == 2).await);
+    pool.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn min_idle_is_kept_by_maintenance_and_sweeps_open_nothing() {
+    let cluster = Cluster::new("mi");
+    let (a, b, c) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[(&a, "z1"), (&b, "z1")]);
+    let realm = Realm::new("min-idle");
+    let mut config = pool_config(0, 6);
+    config.min_idle = Some(3);
+    let pool = Pool::new(
+        driver_config(&a, &realm, "load_balance=true"),
+        NoTls,
+        config,
+    )
+    .unwrap();
+    assert!(eventually(Duration::from_secs(5), || pool.state().idle == 3).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = pool.state().stats;
+    cluster.publish(&[(&a, "z1"), (&b, "z1"), (&c, "z1")]);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let after = pool.state().stats;
+    println!(
+        "EVIDENCE min_idle: 3 idle kept by maintenance; topology change swept {} time(s); connects {} -> {}",
+        after.idle_sweeps - before.idle_sweeps,
+        before.connects,
+        after.connects
+    );
+    assert!(after.idle_sweeps > before.idle_sweeps);
+    assert_eq!(
+        after.connects, before.connects,
+        "a sweep opened connections"
+    );
+    let held = pool.get().await.unwrap();
+    assert!(
+        eventually(Duration::from_secs(3), || pool.state().idle == 3
+            && pool.state().pooled == 4)
+        .await
+    );
+    drop(held);
     pool.shutdown(Duration::from_secs(1)).await;
 }
