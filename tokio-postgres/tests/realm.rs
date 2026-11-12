@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use yb_tokio_postgres::endpoint::EndpointPolicy;
 use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
 
@@ -1207,5 +1208,142 @@ async fn oversized_discovery_answers_are_rejected() {
         let result = connect(&config(&n1, "load_balance=only-primary"), &realm).await;
         assert_eq!(result.is_ok(), accepted, "{:?}", mode);
         assert_eq!(realm.topology().is_some(), accepted, "{:?}", mode);
+    }
+}
+
+// ------------------------------------------- ASTS-87 discovered-port pinning
+//
+// An endpoint policy enforces admission without TLS, so these run on the
+// plaintext fixture; `tls-qualification` repeats the seed case under
+// verify-full against YugabyteDB.
+
+fn admitting(conninfo: String, policy: EndpointPolicy) -> Config {
+    let mut config: Config = conninfo.parse().unwrap();
+    config.endpoint_policy(policy);
+    config
+}
+
+fn not_admitted(e: &Error) -> bool {
+    e.to_string().contains("no discovered node is admitted")
+}
+
+fn other_port(port: u16) -> u16 {
+    if port == u16::MAX {
+        1
+    } else {
+        port + 1
+    }
+}
+
+fn publish_rows(cluster: &Cluster, rows: &[(&str, u16)]) {
+    *cluster.rows.lock().unwrap() = rows
+        .iter()
+        .map(|(host, port)| NodeRow {
+            host: host.to_string(),
+            port: *port,
+            node_type: "primary",
+            zone: "z1".to_string(),
+        })
+        .collect();
+}
+
+#[tokio::test]
+async fn seed_identity_is_admitted_only_on_the_seed_port() {
+    for key in ["host", "hostaddr"] {
+        let cluster = Cluster::new("port");
+        let seed = Node::start(&cluster).await;
+        // Another listener on the seed's address, on a port no seed names.
+        let other = Node::start_at(&cluster, &seed.ip, 0).await;
+        let conninfo = |lb: &str| {
+            format!(
+                "{key}={} port={} user=test dbname=test sslmode=disable connect_timeout=2 load_balance={lb}",
+                seed.ip, seed.port
+            )
+        };
+        cluster.publish(&[(&other, "primary", "z1")]);
+
+        // Restricted routing fails closed without dialling the other port.
+        let restricted = admitting(conninfo("only-primary"), EndpointPolicy::new());
+        let before = seed.logins();
+        let e = connect(&restricted, &Realm::new("port-restricted")).await.err().expect("refused");
+        assert!(not_admitted(&e), "{}: {}", key, e);
+        assert_eq!((other.logins(), seed.logins() - before), (0, 1), "{}", key);
+
+        // Unrestricted routing skips the node and uses the seed itself.
+        let unrestricted = admitting(conninfo("any"), EndpointPolicy::new());
+        let s = connect(&unrestricted, &Realm::new("port-unrestricted")).await.unwrap();
+        assert_eq!(node_of(&s).await, seed.ip);
+        assert_eq!(other.logins(), 0, "{}", key);
+
+        // The seed reported on its own port is admitted through discovery.
+        cluster.publish(&[(&seed, "primary", "z1")]);
+        let realm = Realm::new("port-match");
+        connect(&restricted, &realm).await.unwrap();
+        assert_eq!(realm.connection_counts().get(&seed.ip), Some(&1), "{}", key);
+
+        // Without verify-full and without a policy nothing is enforced and
+        // the reported port is dialled, as before.
+        cluster.publish(&[(&other, "primary", "z1")]);
+        let open: Config = conninfo("only-primary").parse().unwrap();
+        connect(&open, &Realm::new("port-open")).await.unwrap();
+        assert_eq!(other.logins(), 1, "{}", key);
+    }
+}
+
+#[tokio::test]
+async fn per_seed_ports_do_not_admit_each_other() {
+    let cluster = Cluster::new("ports");
+    let (s1, s2) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    // s1's address on s2's port: a port the configuration names, but for
+    // another seed.
+    let decoy = Node::start_at(&cluster, &s1.ip, s2.port).await;
+    cluster.publish(&[(&decoy, "primary", "z1"), (&s2, "primary", "z1")]);
+    let config = admitting(
+        format!(
+            "host={},{} port={},{} user=test dbname=test sslmode=disable connect_timeout=2 load_balance=only-primary",
+            s1.ip, s2.ip, s1.port, s2.port
+        ),
+        EndpointPolicy::new(),
+    );
+    let realm = Realm::new("per-seed-ports");
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        let s = connect(&config, &realm).await.unwrap();
+        assert_eq!(node_of(&s).await, s2.ip);
+        sessions.push(s);
+    }
+    assert_eq!(decoy.logins(), 0);
+    assert!(realm.failed_nodes().is_empty());
+    assert_eq!(realm.connection_counts().get(&s1.ip), None);
+}
+
+#[tokio::test]
+async fn suffix_admission_requires_its_port() {
+    assert!(EndpointPolicy::new().admit_dns_suffix_on_port("yb.invalid", 0).is_err());
+    let cluster = Cluster::new("suffix");
+    let seed = Node::start(&cluster).await;
+    let conninfo = || {
+        format!(
+            "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2 \
+             load_balance=only-primary yb_attempt_timeout=5",
+            seed.ip, seed.port
+        )
+    };
+    // `.invalid` never resolves, so an admitted node fails to dial with a
+    // transport error, while a refused one never becomes a candidate.
+    let pinned = other_port(seed.port);
+    for (policy, refused_port, admitted_port) in [
+        // Without a port the suffix admits only the configured seed port.
+        (EndpointPolicy::new().admit_dns_suffix("yb.invalid").unwrap(), pinned, seed.port),
+        (EndpointPolicy::new().admit_dns_suffix_on_port("yb.invalid", pinned).unwrap(), seed.port, pinned),
+    ] {
+        let config = admitting(conninfo(), policy);
+        publish_rows(&cluster, &[("n1.yb.invalid", refused_port)]);
+        let e = connect(&config, &Realm::new("suffix-refused")).await.err().expect("refused");
+        assert!(not_admitted(&e), "{}", e);
+
+        publish_rows(&cluster, &[("n1.yb.invalid", admitted_port)]);
+        let e = connect(&config, &Realm::new("suffix-admitted")).await.err().expect("unresolvable");
+        assert!(!not_admitted(&e), "{}", e);
     }
 }
