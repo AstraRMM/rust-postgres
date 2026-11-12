@@ -177,10 +177,10 @@ where
                 },
             };
 
-            // The codec ends a completed request's chunk with its
-            // ReadyForQuery, whose last byte is the transaction status.
+            // A completed chunk whose ReadyForQuery is malformed publishes
+            // byte 0 (unknown status), never the previous status.
             let ready_status = if request_complete {
-                messages.ready_status()
+                Some(messages.ready_status().unwrap_or(0))
             } else {
                 None
             };
