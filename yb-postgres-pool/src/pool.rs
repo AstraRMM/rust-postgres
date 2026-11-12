@@ -1161,7 +1161,8 @@ impl<T: PoolTls> Pool<T> {
         let shared = &self.inner.shared;
         let unused = shared.config.warm_floor == 0
             && shared.config.min_idle.unwrap_or(0) == 0
-            && shared.live.lock().is_empty();
+            && shared.live.lock().is_empty()
+            && self.inner.pool.state().connections == 0;
         if unused {
             return;
         }
@@ -1175,6 +1176,16 @@ impl<T: PoolTls> Pool<T> {
         let realm = match &shared.realm {
             Some(realm) => realm,
             None => return,
+        };
+        let permits = match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
+            (Ok(pool), Ok(process)) => Permits {
+                _pool: pool,
+                _process: process,
+            },
+            _ => {
+                bump(&shared.stats.topology_refresh_failures);
+                return;
+            }
         };
         let refresh = tokio::time::timeout(
             shared.config.connect_timeout,
@@ -1193,6 +1204,7 @@ impl<T: PoolTls> Pool<T> {
             }
             Err(_) => bump(&shared.stats.topology_refresh_failures),
         }
+        drop(permits);
     }
 
     /// Checks every idle connection: closes those whose transport ended or

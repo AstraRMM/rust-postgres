@@ -241,7 +241,8 @@ pub struct PoolStats {
     /// Maintenance topology refreshes that returned a usable snapshot
     /// (most reuse a fresh snapshot without discovery).
     pub topology_refreshes: u64,
-    /// Maintenance topology refreshes that failed.
+    /// Maintenance topology refreshes that failed, or were skipped because
+    /// no pool or process-wide permit was free for the control connection.
     pub topology_refresh_failures: u64,
     /// Idle sweeps run after a pooled connection died, the topology or
     /// quarantine set changed, or a deferred rebalance found free permits.
