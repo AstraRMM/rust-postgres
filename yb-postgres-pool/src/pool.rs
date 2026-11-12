@@ -1183,7 +1183,9 @@ impl<T: PoolTls> Pool<T> {
         }
         let session = SWEEPING
             .scope((), async {
-                if self.inner.pool.state().idle_connections == 0 {
+                if self.inner.pool.state().idle_connections < 2
+                    || shared.waiting.load(Ordering::SeqCst) > 0
+                {
                     return None;
                 }
                 match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
@@ -1212,15 +1214,7 @@ impl<T: PoolTls> Pool<T> {
                 None => return,
             }
         }
-        let mut permits = self.discovery_permits();
-        if permits.is_none() && self.close_idle_for_discovery().await {
-            let deadline = Instant::now() + shared.config.connect_timeout;
-            while permits.is_none() && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                permits = self.discovery_permits();
-            }
-        }
-        let permits = match permits {
+        let permits = match self.discovery_permits() {
             Some(permits) => permits,
             None => {
                 bump(&shared.stats.topology_refresh_failures);
@@ -1421,8 +1415,8 @@ impl<T: PoolTls> Pool<T> {
             .pool
             .state()
             .connections
-            .min(physical)
-            .saturating_sub(retiring);
+            .saturating_sub(retiring)
+            .min(physical);
         total
             .saturating_sub(config.warm_floor)
             .min(idle.saturating_sub(config.min_idle.unwrap_or(0)))
@@ -1437,26 +1431,6 @@ impl<T: PoolTls> Pool<T> {
             }),
             _ => None,
         }
-    }
-
-    /// Closes one idle session so a control connection for discovery fits
-    /// within the limits (when the pooled sessions cannot run discovery
-    /// themselves); maintenance refills it.
-    async fn close_idle_for_discovery(&self) -> bool {
-        SWEEPING
-            .scope((), async {
-                if self.inner.pool.state().idle_connections == 0 {
-                    return false;
-                }
-                match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
-                    Ok(Ok(mut conn)) => {
-                        conn.retire = Some(Retire::Explicit);
-                        true
-                    }
-                    _ => false,
-                }
-            })
-            .await
     }
 
     /// Checks out every idle connection without waiting. bb8 discards the

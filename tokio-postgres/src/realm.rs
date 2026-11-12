@@ -826,6 +826,11 @@ impl Realm {
     /// the query's error otherwise; the snapshot is left as it was, so a
     /// caller can fall back to [`refresh`](Self::refresh).
     pub async fn refresh_with(&self, client: &Client, config: &Config) -> Result<TopologyInfo, Error> {
+        if client.realm() != Some(self) {
+            return Err(Error::config(
+                "refresh_with needs a load-balanced session of this realm".into(),
+            ));
+        }
         let snapshot = self.inner.snapshot.read().clone();
         if let Some(topology) = &snapshot {
             if fresh_for(topology, config) {
@@ -1238,6 +1243,7 @@ pub(crate) fn standing_in(
         None => return NodeStanding::Departed,
     };
     let own = match policy.tier(node) {
+        Some(0) => return NodeStanding::Preferred,
         Some(tier) => tier,
         None => return NodeStanding::Ineligible,
     };

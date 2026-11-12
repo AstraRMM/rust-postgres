@@ -275,6 +275,11 @@ impl Client {
     }
 
     #[cfg(feature = "runtime")]
+    pub(crate) fn realm(&self) -> Option<&crate::realm::Realm> {
+        self.placement.as_ref().map(|placement| &placement.realm)
+    }
+
+    #[cfg(feature = "runtime")]
     pub(crate) fn set_placement(&mut self, placement: crate::realm::Placement) {
         self.placement = Some(placement);
     }
