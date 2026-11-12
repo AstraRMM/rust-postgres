@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use yb_tokio_postgres::realm::Realm;
+use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
 
 static NEXT_IP: AtomicU8 = AtomicU8::new(10);
@@ -818,6 +818,75 @@ async fn disabled_load_balancing_does_not_attempt_discovery() {
     tokio::spawn(connection);
     assert_eq!(cluster.discoveries.load(Ordering::SeqCst), 0);
     drop(client);
+}
+
+#[tokio::test]
+async fn standing_follows_quarantine_expiry_removal_and_policy() {
+    let cluster = Cluster::new("st");
+    let (a, b) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&a, "primary", "z1"), (&b, "primary", "z2")]);
+    let realm = Realm::new("standing");
+    let mut conf = config(&b, "load_balance=true topology_keys=qual.st.z1:1,qual.st.z2:2");
+    conf.failed_host_reconnect_delay_secs(Duration::from_millis(300));
+    conf.yb_servers_refresh_interval(Duration::ZERO);
+
+    a.set(Behaviour::Refuse);
+    let fallback = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&fallback).await, b.ip);
+    assert_eq!(fallback.client.node_standing(), NodeStanding::Preferred);
+    let first_epoch = realm.topology_epoch();
+
+    a.set(Behaviour::Accept);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fallback.client.node_standing(), NodeStanding::Fallback);
+    let preferred = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&preferred).await, a.ip);
+    assert_eq!(preferred.client.node_standing(), NodeStanding::Preferred);
+
+    realm.refresh(NoTls, &conf).await.unwrap();
+    assert_eq!(realm.topology_epoch(), first_epoch, "an unchanged snapshot is not a change");
+
+    cluster.publish(&[(&a, "primary", "z1")]);
+    let info = realm.refresh(NoTls, &conf).await.unwrap();
+    assert_eq!(info.nodes().len(), 1);
+    assert_eq!(realm.topology_epoch(), first_epoch + 1);
+    assert_eq!(info.epoch(), realm.topology_epoch());
+    assert_eq!(fallback.client.node_standing(), NodeStanding::Departed);
+    assert_eq!(preferred.client.node_standing(), NodeStanding::Preferred);
+
+    cluster.publish(&[(&a, "read_replica", "z1"), (&b, "primary", "z2")]);
+    let mut primaries = config(&b, "load_balance=only-primary");
+    primaries.yb_servers_refresh_interval(Duration::ZERO);
+    let only_primary = Realm::new("standing-primary");
+    let session = connect(&primaries, &only_primary).await.unwrap();
+    assert_eq!(node_of(&session).await, b.ip);
+    assert_eq!(only_primary.standing(&primaries, &a.ip), NodeStanding::Ineligible);
+    assert_eq!(only_primary.standing(&primaries, &b.ip), NodeStanding::Preferred);
+
+    let direct: Config = format!(
+        "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2",
+        a.ip, a.port
+    )
+    .parse()
+    .unwrap();
+    let (client, connection) = direct.connect(NoTls).await.unwrap();
+    let _task = tokio::spawn(connection);
+    assert_eq!(client.node_standing(), NodeStanding::Unknown);
+    assert!(direct.resolved_realm().is_none());
+}
+
+#[tokio::test]
+async fn an_unlisted_seed_has_no_standing() {
+    let cluster = Cluster::new("px");
+    let (seed, listed) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&listed, "primary", "z1")]);
+    listed.set(Behaviour::Refuse);
+    let realm = Realm::new("unlisted-seed");
+    let mut conf = config(&seed, "load_balance=true");
+    conf.yb_servers_refresh_interval(Duration::ZERO);
+    let session = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&session).await, seed.ip);
+    assert_eq!(session.client.node_standing(), NodeStanding::Unknown);
 }
 
 /// ASTS-83 (RUSTSEC-2026-0178): a DataRow with fewer fields than the row

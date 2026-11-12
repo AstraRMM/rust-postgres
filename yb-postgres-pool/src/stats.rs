@@ -24,6 +24,11 @@ pub(crate) enum Retire {
     Explicit,
     /// The pool is shutting down.
     Shutdown,
+    /// Its node left the realm's topology or no longer matches the role,
+    /// placement or admission policy.
+    Topology,
+    /// Replaced by a connection to a better preference tier.
+    Rebalanced,
 }
 
 #[derive(Default)]
@@ -62,6 +67,12 @@ pub(crate) struct Stats {
     pub warm_connects: AtomicU64,
     pub warm_deficit: AtomicU64,
     pub forced_closes: AtomicU64,
+    pub retired_topology: AtomicU64,
+    pub retired_rebalanced: AtomicU64,
+    pub topology_refreshes: AtomicU64,
+    pub topology_refresh_failures: AtomicU64,
+    pub idle_sweeps: AtomicU64,
+    pub rebalance_deferrals: AtomicU64,
 }
 
 pub(crate) fn bump(counter: &AtomicU64) {
@@ -84,6 +95,8 @@ impl Stats {
             Some(Retire::ProbeFailed) => &self.retired_probe_failed,
             Some(Retire::Explicit) => &self.retired_explicit,
             Some(Retire::Shutdown) => &self.retired_shutdown,
+            Some(Retire::Topology) => &self.retired_topology,
+            Some(Retire::Rebalanced) => &self.retired_rebalanced,
             None => &self.reaped,
         };
         bump(counter);
@@ -126,6 +139,12 @@ impl Stats {
             warm_connects: l(&self.warm_connects),
             warm_deficit: l(&self.warm_deficit),
             forced_closes: l(&self.forced_closes),
+            retired_topology: l(&self.retired_topology),
+            retired_rebalanced: l(&self.retired_rebalanced),
+            topology_refreshes: l(&self.topology_refreshes),
+            topology_refresh_failures: l(&self.topology_refresh_failures),
+            idle_sweeps: l(&self.idle_sweeps),
+            rebalance_deferrals: l(&self.rebalance_deferrals),
         }
     }
 }
@@ -209,10 +228,26 @@ pub struct PoolStats {
     pub statement_invalidations: u64,
     /// Autocommit queries retried once after a stale-statement error.
     pub stale_statement_retries: u64,
-    /// Connections opened by warm-floor maintenance.
+    /// Connections opened by maintenance for `warm_floor` or `min_idle`.
     pub warm_connects: u64,
     /// Gauge: connections short of `warm_floor` after the last maintenance pass.
     pub warm_deficit: u64,
     /// Connections whose task was aborted by a forced shutdown.
     pub forced_closes: u64,
+    /// Retired because the node left the topology or the policy.
+    pub retired_topology: u64,
+    /// Fallback-tier connections replaced by preferred-tier ones.
+    pub retired_rebalanced: u64,
+    /// Maintenance topology refreshes that returned a usable snapshot
+    /// (most reuse a fresh snapshot without discovery).
+    pub topology_refreshes: u64,
+    /// Maintenance topology refreshes that failed, or were skipped because
+    /// no pool or process-wide permit was free for the control connection.
+    pub topology_refresh_failures: u64,
+    /// Idle sweeps run after a pooled connection died, the topology or
+    /// quarantine set changed, or a deferred rebalance found free permits.
+    pub idle_sweeps: u64,
+    /// Fallback-tier connections kept because no replacement could be
+    /// opened within the free permits.
+    pub rebalance_deferrals: u64,
 }

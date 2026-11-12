@@ -17,8 +17,17 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::AbortHandle;
+use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::types::{ToSql, Type};
 use yb_tokio_postgres::{Client, Config, Row, Statement, TransactionStatus};
+
+tokio::task_local! {
+    static SWEEPING: ();
+}
+
+fn sweeping() -> bool {
+    SWEEPING.try_with(|_| ()).is_ok()
+}
 
 /// One physical connection as bb8 stores it.
 pub struct NativeConnection {
@@ -241,6 +250,32 @@ pub(crate) struct Shared<T: PoolTls> {
     last_activity: Mutex<Instant>,
     /// Serializes warm-floor top-ups so concurrent passes cannot overshoot.
     warm_lock: tokio::sync::Mutex<()>,
+    /// The realm of load-balanced connections, if load balancing is on.
+    realm: Option<Realm>,
+    /// Bumped when a connection task ends while its session is still held,
+    /// or a connection arrives on a node that is not preferred. A signal is
+    /// acknowledged only by the sweep after the one that saw it, since bb8
+    /// may not have queued the session yet.
+    signals: Arc<AtomicU64>,
+    signals_acked: AtomicU64,
+    signals_at_sweep: AtomicU64,
+    /// Serializes maintenance passes.
+    maintain_lock: tokio::sync::Mutex<()>,
+    /// Topology epoch and quarantine set at the last idle sweep.
+    swept: Mutex<Option<(u64, Vec<String>)>>,
+    /// Departed or fallback-tier connections await replacement.
+    rebalance_pending: AtomicBool,
+    /// The request count when the previous sweep started.
+    requests_at_sweep: AtomicU64,
+    /// Bumped by every return of a departed or fallback-tier session.
+    rebalance_requests: AtomicU64,
+    /// Serializes sweeps so concurrent passes cannot spend the same surplus.
+    sweep_lock: tokio::sync::Mutex<()>,
+    /// When the oldest idle session a sweep returned reaches `idle_timeout`
+    /// (a sweep restarts bb8's own idle clock).
+    idle_deadline: Mutex<Option<Instant>>,
+    /// Earliest next replacement retry and the current backoff.
+    rebalance_retry: Mutex<(Instant, Duration)>,
 }
 
 impl<T: PoolTls> Shared<T> {
@@ -264,6 +299,20 @@ impl<T: PoolTls> Shared<T> {
     /// a dial in progress, and a dial that completes after shutdown began is
     /// closed instead of being pooled.
     async fn open(self: &Arc<Self>, wait_for_permit: bool) -> Result<NativeConnection, PoolError> {
+        self.open_reporting(wait_for_permit, true).await
+    }
+
+    /// Like [`open`](Self::open) with free permits only; a failure is not
+    /// published to waiting checkouts (the caller keeps working sessions).
+    async fn open_optional(self: &Arc<Self>) -> Result<NativeConnection, PoolError> {
+        self.open_reporting(false, false).await
+    }
+
+    async fn open_reporting(
+        self: &Arc<Self>,
+        wait_for_permit: bool,
+        report: bool,
+    ) -> Result<NativeConnection, PoolError> {
         if self.is_closed() {
             return Err(PoolError::kind_only(ErrorKind::PoolClosed));
         }
@@ -297,6 +346,10 @@ impl<T: PoolTls> Shared<T> {
             Err(e) if e.kind() == ErrorKind::PoolClosed => {}
             Err(e) if !wait_for_permit && e.kind() == ErrorKind::ProcessLimit => {}
             Err(e) if !wait_for_permit && e.kind() == ErrorKind::AcquireTimeout => {}
+            Err(e) if !report => {
+                bump(&self.stats.connect_failures);
+                log::debug!("pool {}: optional connect failed: {}", self.label, e);
+            }
             Err(e) => self.record_connect_failure(e),
         }
         result
@@ -367,6 +420,7 @@ impl<T: PoolTls> Shared<T> {
         let label = self.label.clone();
         let terminal: Arc<Mutex<Option<PoolError>>> = Arc::new(Mutex::new(None));
         let terminal_slot = terminal.clone();
+        let died = self.signals.clone();
         let mut connection = connection;
         let task;
         {
@@ -383,7 +437,11 @@ impl<T: PoolTls> Shared<T> {
                     log::debug!("pool {}: connection {} ended: {}", label, id, e);
                     *terminal_slot.lock() = Some(PoolError::from_driver(e));
                 }
+                let held = Arc::strong_count(&terminal_slot) > 1;
                 drop(connection);
+                if held {
+                    died.fetch_add(1, Ordering::SeqCst);
+                }
             });
             live.insert(id, handle.abort_handle());
             task = handle.abort_handle();
@@ -412,6 +470,12 @@ impl<T: PoolTls> Shared<T> {
             }
         }
         conn.param_baseline = conn.client.parameter_status_changes();
+        if matches!(
+            conn.client.node_standing(),
+            NodeStanding::Fallback | NodeStanding::Departed | NodeStanding::Ineligible
+        ) {
+            self.signals.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(conn)
     }
 
@@ -436,6 +500,8 @@ impl<T: PoolTls> Shared<T> {
             .is_some_and(|it| now.duration_since(conn.idle_since) >= it)
         {
             Some(Retire::Idle)
+        } else if conn.client.node_standing() == NodeStanding::Ineligible {
+            Some(Retire::Topology)
         } else if !reusable(&conn.client)
             // A ParameterStatus that arrived while the connection was idle
             // (for example a server-side setting change) means the session
@@ -448,13 +514,18 @@ impl<T: PoolTls> Shared<T> {
         };
         if let Some(reason) = reason {
             conn.retire = Some(reason);
+            if sweeping() {
+                // Handed to the sweep, which drops it: failing the check
+                // would make bb8 look for (and approve a dial for) another.
+                return Ok(());
+            }
             return Err(PoolError::new(
                 ErrorKind::Transport,
                 format!("connection {} retired at checkout: {:?}", conn.id, reason),
             ));
         }
         if let HealthCheck::AfterIdle(after) = self.config.health_check {
-            if now.duration_since(conn.idle_since) >= after {
+            if !sweeping() && now.duration_since(conn.idle_since) >= after {
                 bump(&self.stats.probes);
                 let started = Instant::now();
                 let probe =
@@ -496,12 +567,22 @@ impl<T: PoolTls> Shared<T> {
         if conn.generation.is_some_and(|g| !self.tls.is_current(g)) {
             return Err(Retire::SupersededTls);
         }
+        match client.node_standing() {
+            NodeStanding::Ineligible => return Err(Retire::Topology),
+            NodeStanding::Departed | NodeStanding::Fallback if !sweeping() => {
+                self.rebalance_requests.fetch_add(1, Ordering::SeqCst);
+                self.rebalance_pending.store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
         Ok(!reusable(client))
     }
 
     /// bb8's return hook (`has_broken`): the final, synchronous gate.
     fn on_return(&self, conn: &mut NativeConnection) -> bool {
-        conn.idle_since = Instant::now();
+        if !sweeping() {
+            conn.idle_since = Instant::now();
+        }
         match self.assess(conn) {
             Ok(false) => false,
             Ok(true) => {
@@ -818,6 +899,7 @@ impl<T: PoolTls> Pool<T> {
         if pg.get_yb_attempt_timeout() > config.connect_timeout {
             pg.yb_attempt_timeout(config.connect_timeout);
         }
+        let realm = pg.resolved_realm();
         let shared = Arc::new(Shared {
             pg,
             tls,
@@ -845,10 +927,22 @@ impl<T: PoolTls> Pool<T> {
             released: Notify::new(),
             last_activity: Mutex::new(Instant::now()),
             warm_lock: tokio::sync::Mutex::new(()),
+            realm,
+            swept: Mutex::new(None),
+            signals: Arc::new(AtomicU64::new(0)),
+            signals_acked: AtomicU64::new(0),
+            signals_at_sweep: AtomicU64::new(0),
+            maintain_lock: tokio::sync::Mutex::new(()),
+            rebalance_pending: AtomicBool::new(false),
+            requests_at_sweep: AtomicU64::new(0),
+            rebalance_requests: AtomicU64::new(0),
+            sweep_lock: tokio::sync::Mutex::new(()),
+            idle_deadline: Mutex::new(None),
+            rebalance_retry: Mutex::new((Instant::now(), REBALANCE_BACKOFF_MIN)),
         });
         let pool = bb8::Pool::builder()
             .max_size(config.max_size)
-            .min_idle(config.min_idle)
+            .min_idle(None)
             .test_on_check_out(true)
             .max_lifetime(config.max_lifetime)
             .idle_timeout(config.idle_timeout)
@@ -867,7 +961,8 @@ impl<T: PoolTls> Pool<T> {
                 shared: shared.clone(),
             });
         let inner = Arc::new(Inner { pool, shared });
-        if config.warm_floor > 0 {
+        if config.warm_floor > 0 || config.min_idle.unwrap_or(0) > 0 || inner.shared.realm.is_some()
+        {
             let weak = Arc::downgrade(&inner);
             let interval = config.maintenance_interval;
             tokio::spawn(async move {
@@ -882,7 +977,7 @@ impl<T: PoolTls> Pool<T> {
                     if inner.shared.is_closed() {
                         break;
                     }
-                    Pool { inner }.top_up().await;
+                    Pool { inner }.maintain().await;
                 }
             });
         }
@@ -1065,19 +1160,371 @@ impl<T: PoolTls> Pool<T> {
         }
     }
 
+    /// One maintenance pass: refresh the realm's topology if it is due,
+    /// sweep idle connections if the topology or quarantine set changed,
+    /// then top up to `warm_floor`. Maintenance calls this every
+    /// `maintenance_interval`.
+    pub async fn maintain(&self) {
+        let shared = &self.inner.shared;
+        let _serial = shared.maintain_lock.lock().await;
+        let unused = shared.config.warm_floor == 0
+            && shared.config.min_idle.unwrap_or(0) == 0
+            && shared.live.lock().is_empty()
+            && self.inner.pool.state().connections == 0;
+        if unused {
+            return;
+        }
+        self.refresh_topology().await;
+        self.sweep().await;
+        self.top_up().await;
+    }
+
+    async fn refresh_topology(&self) {
+        let shared = &self.inner.shared;
+        let realm = match &shared.realm {
+            Some(realm) => realm,
+            None => return,
+        };
+        if !realm.refresh_due(&shared.pg) {
+            return;
+        }
+        let session = SWEEPING
+            .scope((), async {
+                if shared.waiting.load(Ordering::SeqCst) > 0
+                    || self.inner.pool.state().idle_connections < 2
+                {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
+                    Ok(Ok(conn)) if conn.retire.is_none() => Some(conn),
+                    _ => None,
+                }
+            })
+            .await;
+        if let Some(mut session) = session {
+            let refresh = tokio::time::timeout(
+                shared.config.connect_timeout,
+                realm.refresh_with(&session.client, &shared.pg),
+            );
+            let outcome = tokio::select! {
+                biased;
+                _ = shared.until_closed() => None,
+                _ = self.until_starved() => {
+                    // The query may still be in flight: close the session so
+                    // the waiting caller can dial instead of waiting for it.
+                    session.retire = Some(Retire::Explicit);
+                    bump(&shared.stats.topology_refresh_failures);
+                    None
+                }
+                outcome = refresh => Some(outcome),
+            };
+            if let Some(timeout) = shared.config.idle_timeout {
+                let deadline = session.idle_since + timeout;
+                let mut scheduled = shared.idle_deadline.lock();
+                *scheduled = Some(scheduled.map_or(deadline, |d| d.min(deadline)));
+            }
+            SWEEPING.sync_scope((), || drop(session));
+            match outcome {
+                Some(Ok(Ok(_))) => {
+                    bump(&shared.stats.topology_refreshes);
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+        let permits = match self.discovery_permits() {
+            Some(permits) => permits,
+            None => {
+                bump(&shared.stats.topology_refresh_failures);
+                return;
+            }
+        };
+        let dialing = Dialing::start(shared.as_ref());
+        let refresh = tokio::time::timeout(
+            shared.config.connect_timeout,
+            realm.refresh(shared.tls.clone(), &shared.pg),
+        );
+        let outcome = tokio::select! {
+            biased;
+            _ = shared.until_closed() => return,
+            _ = self.until_starved() => {
+                bump(&shared.stats.topology_refresh_failures);
+                return;
+            }
+            outcome = refresh => outcome,
+        };
+        match outcome {
+            Ok(Ok(_)) => bump(&shared.stats.topology_refreshes),
+            Ok(Err(e)) => {
+                bump(&shared.stats.topology_refresh_failures);
+                log::debug!("pool {}: topology refresh failed: {}", shared.label, e);
+            }
+            Err(_) => bump(&shared.stats.topology_refresh_failures),
+        }
+        drop(dialing);
+        drop(permits);
+    }
+
+    /// Checks every idle connection: closes those whose transport ended or
+    /// whose node the policy now excludes. Those on departed or
+    /// fallback-tier nodes are closed outright while the pool holds more
+    /// than `warm_floor`; within the floor they are first replaced by
+    /// preferred-tier connections opened from free permits (an unreachable
+    /// new topology therefore never takes the pool below its floor). Runs only when a pooled connection's task
+    /// has ended, the topology epoch or quarantine set changed, or a
+    /// deferred replacement may now find free permits. Sends no traffic on
+    /// the swept connections and leaves their idle timers untouched.
+    async fn sweep(&self) {
+        let shared = &self.inner.shared;
+        let _serial = shared.sweep_lock.lock().await;
+        let digest = shared
+            .realm
+            .as_ref()
+            .map(|realm| (realm.topology_epoch(), realm.quarantined(&shared.pg)));
+        let signals = shared.signals.load(Ordering::SeqCst);
+        let dead = signals != shared.signals_acked.load(Ordering::SeqCst);
+        let changed = digest.is_some() && *shared.swept.lock() != digest;
+        let state = self.inner.pool.state();
+        let surplus = state
+            .connections
+            .saturating_sub(shared.config.warm_floor)
+            .min(
+                state
+                    .idle_connections
+                    .saturating_sub(shared.config.min_idle.unwrap_or(0)),
+            );
+        let retry = shared.rebalance_pending.load(Ordering::SeqCst)
+            && (surplus > 0
+                || (Instant::now() >= shared.rebalance_retry.lock().0
+                    && shared.capacity.in_use() < shared.capacity.max()
+                    && shared.limiter.in_use() < shared.limiter.max()));
+        let idle_due = shared
+            .idle_deadline
+            .lock()
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !dead && !changed && !retry && !idle_due {
+            return;
+        }
+        bump(&shared.stats.idle_sweeps);
+        let previous = shared.signals_at_sweep.swap(signals, Ordering::SeqCst);
+        shared.signals_acked.store(previous, Ordering::SeqCst);
+        let epoch_changed = match (&digest, &*shared.swept.lock()) {
+            (Some((epoch, _)), Some((swept, _))) => epoch != swept,
+            _ => false,
+        };
+        if epoch_changed {
+            *shared.rebalance_retry.lock() = (Instant::now(), REBALANCE_BACKOFF_MIN);
+        }
+        let requests = shared.rebalance_requests.load(Ordering::SeqCst);
+        let previous = shared.requests_at_sweep.swap(requests, Ordering::SeqCst);
+        let need = SWEEPING
+            .scope((), async {
+                let held = self.take_idle().await;
+                let mut surplus = self.retireable(&held);
+                let mut need = 0u64;
+                let mut stale = std::collections::HashSet::new();
+                let idle_deadline = shared.config.idle_timeout.and_then(|timeout| {
+                    held.iter()
+                        .filter(|conn| conn.retire.is_none())
+                        .map(|conn| conn.idle_since + timeout)
+                        .min()
+                });
+                *shared.idle_deadline.lock() = idle_deadline;
+                for mut conn in held {
+                    if conn.retire.is_some() {
+                        continue;
+                    }
+                    let reason = match conn.client.node_standing() {
+                        NodeStanding::Fallback => Retire::Rebalanced,
+                        NodeStanding::Departed => Retire::Topology,
+                        _ => continue,
+                    };
+                    if surplus > 0 {
+                        surplus -= 1;
+                        conn.retire = Some(reason);
+                    } else {
+                        need += 1;
+                        stale.extend(conn.client.node_identity().map(str::to_string));
+                    }
+                }
+                (need, stale)
+            })
+            .await;
+        let (need, stale) = need;
+        let may_replace = Instant::now() >= shared.rebalance_retry.lock().0;
+        let (mut attempted, mut pending) = (false, false);
+        if need > 0 && !may_replace {
+            pending = true;
+        }
+        if need > 0 && may_replace {
+            attempted = true;
+            let mut opened = 0;
+            while opened < need {
+                let replacement = match self.replacement(&stale).await {
+                    Some(replacement) => replacement,
+                    None => {
+                        bump(&shared.stats.rebalance_deferrals);
+                        pending = true;
+                        break;
+                    }
+                };
+                match self.inner.pool.add(replacement) {
+                    Ok(()) => opened += 1,
+                    Err(bb8::AddError::Broken(mut replacement))
+                    | Err(bb8::AddError::NoCapacity(mut replacement)) => {
+                        replacement.retire = Some(Retire::Explicit);
+                        bump(&shared.stats.rebalance_deferrals);
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            if opened > 0 {
+                let left = SWEEPING
+                    .scope((), async {
+                        let held = self.take_idle().await;
+                        let mut budget = opened.min(self.retireable(&held) as u64);
+                        let mut left = false;
+                        for mut conn in held {
+                            if conn.retire.is_some() {
+                                continue;
+                            }
+                            let reason = match conn.client.node_standing() {
+                                NodeStanding::Fallback => Retire::Rebalanced,
+                                NodeStanding::Departed => Retire::Topology,
+                                _ => continue,
+                            };
+                            if budget == 0 {
+                                left = true;
+                                continue;
+                            }
+                            conn.retire = Some(reason);
+                            budget -= 1;
+                        }
+                        left
+                    })
+                    .await;
+                if left {
+                    pending = true;
+                }
+            }
+        }
+        shared
+            .rebalance_pending
+            .store(pending || requests != previous, Ordering::SeqCst);
+        if shared.rebalance_requests.load(Ordering::SeqCst) != requests {
+            shared.rebalance_pending.store(true, Ordering::SeqCst);
+        }
+        if attempted {
+            let mut retry = shared.rebalance_retry.lock();
+            let backoff = if pending {
+                (retry.1 * 2).min(REBALANCE_BACKOFF_MAX)
+            } else {
+                REBALANCE_BACKOFF_MIN
+            };
+            *retry = (Instant::now() + retry.1, backoff);
+        }
+        if digest.is_some() {
+            *shared.swept.lock() = digest;
+        }
+    }
+
+    /// How many of the held idle sessions can be closed without a
+    /// replacement: what exceeds both the warm floor (all connections) and
+    /// the `min_idle` reserve (idle connections).
+    fn retireable(&self, held: &[bb8::PooledConnection<'_, Manager<T>>]) -> u32 {
+        let config = &self.inner.shared.config;
+        let retiring = held.iter().filter(|conn| conn.retire.is_some()).count() as u32;
+        let idle = held.len() as u32 - retiring;
+        let physical = self.inner.shared.live.lock().len() as u32;
+        let total = self
+            .inner
+            .pool
+            .state()
+            .connections
+            .saturating_sub(retiring)
+            .min(physical);
+        total
+            .saturating_sub(config.warm_floor)
+            .min(idle.saturating_sub(config.min_idle.unwrap_or(0)))
+    }
+
+    fn discovery_permits(&self) -> Option<Permits> {
+        let shared = &self.inner.shared;
+        match (shared.capacity.try_acquire(), shared.limiter.try_acquire()) {
+            (Ok(pool), Ok(process)) => Some(Permits {
+                _pool: pool,
+                _process: process,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Resolves once a checkout is waiting with no idle session left, so
+    /// background discovery yields the session or permit it holds.
+    async fn until_starved(&self) {
+        while self.inner.shared.waiting.load(Ordering::SeqCst) == 0
+            || self.inner.pool.state().idle_connections > 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Checks out every idle connection without waiting. bb8 discards the
+    /// ones that fail the checkout checks on the way. bb8 has no idle-only
+    /// checkout, so a checkout racing this one can still make bb8 approve a
+    /// dial; it stays within `max_size` and the limiter.
+    async fn take_idle(&self) -> Vec<bb8::PooledConnection<'_, Manager<T>>> {
+        let idle = self.inner.pool.state().idle_connections;
+        let mut held = Vec::new();
+        for _ in 0..idle {
+            if self.inner.pool.state().idle_connections == 0 {
+                break;
+            }
+            match tokio::time::timeout(Duration::ZERO, self.inner.pool.get()).await {
+                Ok(Ok(conn)) => held.push(conn),
+                _ => break,
+            }
+        }
+        held
+    }
+
+    /// A connection to a preferred-tier node other than the `stale` ones,
+    /// opened from free permits, or `None` when no permit is free or the
+    /// driver could only reach a stale, fallback, departed or seed node. A failure is not published to
+    /// waiting checkouts.
+    async fn replacement(
+        &self,
+        stale: &std::collections::HashSet<String>,
+    ) -> Option<NativeConnection> {
+        let mut conn = self.inner.shared.open_optional().await.ok()?;
+        let identity = conn.client.node_identity().unwrap_or_default();
+        if conn.client.node_standing() == NodeStanding::Preferred && !stale.contains(identity) {
+            Some(conn)
+        } else {
+            conn.retire = Some(Retire::Explicit);
+            None
+        }
+    }
+
     /// Opens connections until the pool holds `warm_floor` physical
     /// connections, using only free process-wide permits. Returns how many
     /// were opened. Maintenance calls this every `maintenance_interval`.
     pub async fn top_up(&self) -> u32 {
         let shared = &self.inner.shared;
         let floor = shared.config.warm_floor;
+        let min_idle = shared.config.min_idle.unwrap_or(0);
         let mut opened = 0;
         let _serial = shared.warm_lock.lock().await;
         while !shared.is_closed() {
             // Dials already in flight (bb8's or ours) count toward the floor.
-            let have =
-                self.inner.pool.state().connections + shared.opening.load(Ordering::SeqCst) as u32;
-            if have >= floor {
+            let state = self.inner.pool.state();
+            let opening = shared.opening.load(Ordering::SeqCst) as u32;
+            let have = state.connections + opening;
+            let idle = state.idle_connections;
+            let short_of_idle = idle < min_idle && have < shared.config.max_size;
+            if have >= floor && !short_of_idle {
                 shared.stats.warm_deficit.store(0, Ordering::Relaxed);
                 break;
             }
@@ -1224,6 +1671,8 @@ impl<T: PoolTls> Pool<T> {
 }
 
 pub(crate) const PROBE_QUERY_FLOOR: Duration = Duration::from_millis(5);
+const REBALANCE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const REBALANCE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 pub(crate) fn probe_query_budget(budget: Duration, elapsed: Duration) -> Option<Duration> {
     Some(budget.saturating_sub(elapsed)).filter(|left| *left >= PROBE_QUERY_FLOOR)

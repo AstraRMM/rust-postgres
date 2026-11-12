@@ -109,6 +109,8 @@ fn families(state: &PoolState) -> Vec<Family> {
                 ("probe_failed", Value::Count(s.retired_probe_failed)),
                 ("explicit", Value::Count(s.retired_explicit)),
                 ("shutdown", Value::Count(s.retired_shutdown)),
+                ("topology", Value::Count(s.retired_topology)),
+                ("rebalanced", Value::Count(s.retired_rebalanced)),
                 ("reaped", Value::Count(s.reaped)),
             ],
         ),
@@ -125,6 +127,13 @@ fn families(state: &PoolState) -> Vec<Family> {
         counter("stale_statement_retries_total", s.stale_statement_retries),
         counter("warm_connects_total", s.warm_connects),
         counter("forced_closes_total", s.forced_closes),
+        counter("topology_refreshes_total", s.topology_refreshes),
+        counter(
+            "topology_refresh_failures_total",
+            s.topology_refresh_failures,
+        ),
+        counter("idle_sweeps_total", s.idle_sweeps),
+        counter("rebalance_deferrals_total", s.rebalance_deferrals),
     ]
 }
 

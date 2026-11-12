@@ -120,3 +120,25 @@ async fn stalled_tls_handshake_is_bounded() {
         println!("{extra}: stalled TLS handshake abandoned after {elapsed:?}");
     }
 }
+
+#[tokio::test]
+async fn established_sessions_refresh_the_topology_and_report_standing() {
+    use yb_tokio_postgres::realm::NodeStanding;
+    let tls = connector();
+    let realm = Realm::new("yb-a-session-refresh");
+    let conf = yb("yb-a.test", "127.0.0.2", "yb_servers_refresh_interval=0");
+    let client = open(&conf, &realm, &tls).await;
+    let discoveries = realm.discovery_count();
+    let info = realm.refresh_with(&client, &conf).await.unwrap();
+    assert_eq!(realm.discovery_count(), discoveries + 1);
+    assert_eq!(info.nodes().len(), 1);
+    assert_eq!(info.nodes()[0].identity(), "127.0.0.2");
+    assert_eq!(client.node_standing(), NodeStanding::Preferred);
+    client
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS shadow; CREATE OR REPLACE FUNCTION shadow.yb_servers() RETURNS TABLE(host text) LANGUAGE sql AS $$ SELECT 'forged'::text $$; SET search_path = shadow, pg_catalog")
+        .await
+        .unwrap();
+    let info = realm.refresh_with(&client, &conf).await.unwrap();
+    assert_eq!(info.nodes()[0].identity(), "127.0.0.2", "an unqualified lookup would reach shadow.yb_servers()");
+    client.batch_execute("DROP SCHEMA shadow CASCADE").await.unwrap();
+}

@@ -222,6 +222,8 @@ pub struct Client {
     /// Releases this connection's node accounting when the client is dropped.
     #[cfg(feature = "runtime")]
     lease: Option<Box<dyn std::any::Any + Send + Sync>>,
+    #[cfg(feature = "runtime")]
+    placement: Option<crate::realm::Placement>,
     ssl_mode: SslMode,
     process_id: i32,
     secret_key: i32,
@@ -246,6 +248,8 @@ impl Client {
             socket_config: None,
             #[cfg(feature = "runtime")]
             lease: None,
+            #[cfg(feature = "runtime")]
+            placement: None,
             ssl_mode,
             process_id,
             secret_key,
@@ -268,6 +272,27 @@ impl Client {
     #[cfg(feature = "runtime")]
     pub(crate) fn set_lease(&mut self, lease: Box<dyn std::any::Any + Send + Sync>) {
         self.lease = Some(lease);
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn realm(&self) -> Option<&crate::realm::Realm> {
+        self.placement.as_ref().map(|placement| &placement.realm)
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn set_placement(&mut self, placement: crate::realm::Placement) {
+        self.placement = Some(placement);
+    }
+
+    /// Where this client's node stands in its realm's current topology
+    /// under the selection policy it was connected with. Reads local state
+    /// only; [`Realm::refresh`](crate::realm::Realm::refresh) updates it.
+    #[cfg(feature = "runtime")]
+    pub fn node_standing(&self) -> crate::realm::NodeStanding {
+        match &self.placement {
+            Some(placement) => placement.standing(),
+            None => crate::realm::NodeStanding::Unknown,
+        }
     }
 
     /// The canonical identity of the node this client is connected to, as

@@ -481,8 +481,10 @@ pub enum QueueStrategy {
 ///   being cleaned up and being opened. The process-wide
 ///   [`ConnectionLimiter`](crate::ConnectionLimiter) bounds the sum over
 ///   every pool sharing it.
-/// * `min_idle` is bb8's minimum number of **idle** connections: under load
-///   the pool opens more so that `min_idle` stay idle (up to `max_size`).
+/// * `min_idle` is a minimum number of **idle** connections: under load
+///   maintenance opens more so that `min_idle` stay idle (up to `max_size`),
+///   every `maintenance_interval` and from free permits only, like the warm
+///   floor.
 /// * `warm_floor` is a minimum **total** number of physical connections
 ///   (idle plus borrowed). Maintenance tops the pool up to the floor, but
 ///   only with permits the limiter has free right now; it never waits for or
@@ -497,7 +499,7 @@ pub enum QueueStrategy {
 pub struct PoolConfig {
     /// Per-pool physical connection cap.
     pub max_size: u32,
-    /// Minimum idle connections (bb8 `min_idle`).
+    /// Minimum idle connections, kept by maintenance.
     pub min_idle: Option<u32>,
     /// Minimum total physical connections kept warm.
     pub warm_floor: u32,
