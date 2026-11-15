@@ -158,6 +158,20 @@ fn main() {
             rsa_key(),
         ),
     );
+    // A second YugabyteDB tserver of universe C, found only through discovery.
+    write_pair(
+        &dir,
+        "yb-c2-rsa",
+        &leaf_with_key(
+            &ca_rsa,
+            "yb-c2.test",
+            &[San::Dns("yb-c2.test"), San::Ip("127.0.0.5")],
+            5003,
+            false,
+            current,
+            rsa_key(),
+        ),
+    );
 
     write_pair(&dir, "client-postgres", &leaf(&ca_a, "postgres", &[], 4001, true, current));
     write_pair(&dir, "client-wrong-ca", &leaf(&ca_b, "postgres", &[], 4002, true, current));

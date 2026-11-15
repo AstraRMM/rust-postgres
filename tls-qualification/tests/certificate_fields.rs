@@ -9,7 +9,8 @@
 //! * The RFC 5929 `tls-server-end-point` channel-binding hash is seen in the
 //!   SCRAM client-final message received by a loopback TLS server, for RSA
 //!   and ECDSA issuers with SHA-256/384/512 signatures, and the fail-closed
-//!   path for an Ed25519 issuer (no defined hash).
+//!   paths for an Ed25519 issuer (no defined hash) and for a server that does
+//!   not offer SCRAM-SHA-256-PLUS.
 //!
 //! Every certificate is generated in-process; nothing here needs the rig.
 
@@ -348,9 +349,16 @@ async fn read_message(stream: &mut (impl AsyncReadExt + Unpin)) -> io::Result<(u
     Ok((tag, body))
 }
 
-/// One TLS session that offers SCRAM-SHA-256-PLUS and SCRAM-SHA-256,
-/// records the client's messages, and then fails authentication.
-async fn scram_server(listener: TcpListener, tls: Arc<ServerConfig>) -> io::Result<Seen> {
+const PLUS_AND_PLAIN: &[u8] = b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0";
+const PLAIN_ONLY: &[u8] = b"SCRAM-SHA-256\0\0";
+
+/// One TLS session that offers the SASL mechanisms `offer`, records the
+/// client's messages, and then fails authentication.
+async fn scram_server(
+    listener: TcpListener,
+    tls: Arc<ServerConfig>,
+    offer: &'static [u8],
+) -> io::Result<Seen> {
     let mut seen = Seen::default();
     let (mut socket, _) = listener.accept().await?;
     let mut request = [0u8; 8];
@@ -362,7 +370,7 @@ async fn scram_server(listener: TcpListener, tls: Arc<ServerConfig>) -> io::Resu
     stream.read_exact(&mut startup).await?;
 
     let mut sasl = 10u32.to_be_bytes().to_vec();
-    sasl.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
+    sasl.extend_from_slice(offer);
     message(&mut stream, b'R', &sasl).await?;
 
     let (tag, body) = match read_message(&mut stream).await {
@@ -430,10 +438,18 @@ async fn bind(
     alg: &'static SignatureAlgorithm,
     channel_binding: &str,
 ) -> (Result<(), yb_tokio_postgres::Error>, Seen, Vec<u8>) {
+    bind_offering(alg, channel_binding, PLUS_AND_PLAIN).await
+}
+
+async fn bind_offering(
+    alg: &'static SignatureAlgorithm,
+    channel_binding: &str,
+    offer: &'static [u8],
+) -> (Result<(), yb_tokio_postgres::Error>, Seen, Vec<u8>) {
     let (roots, leaf, server) = issued_by(alg);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let peer = tokio::spawn(scram_server(listener, server));
+    let peer = tokio::spawn(scram_server(listener, server, offer));
     let tls = load(&roots).unwrap();
     let config: Config = format!(
         "host=127.0.0.1 port={port} user=test password=fixture-only dbname=test channel_binding={channel_binding}"
@@ -511,4 +527,24 @@ async fn channel_binding_without_a_defined_hash_fails_closed() {
         "{seen:?}"
     );
     assert_eq!(seen.binding.as_deref(), Some(&b"n,,"[..]));
+}
+
+#[tokio::test]
+async fn required_channel_binding_without_a_plus_offer_fails_closed() {
+    // The certificate supports a binding, but the server offers only
+    // SCRAM-SHA-256 (YugabyteDB without ysql_enable_scram_channel_binding).
+    let (result, seen, _) = bind_offering(&PKCS_ECDSA_P256_SHA256, "require", PLAIN_ONLY).await;
+    let e = result.expect_err("channel binding is required but not offered");
+    assert!(e.code().is_none(), "{e}");
+    assert!(
+        e.to_string().contains("server did not use channel binding"),
+        "{e}"
+    );
+    assert_eq!(seen.mechanism, None, "a SCRAM message was sent: {seen:?}");
+
+    // `prefer` continues without binding and says it could have bound.
+    let (result, seen, _) = bind_offering(&PKCS_ECDSA_P256_SHA256, "prefer", PLAIN_ONLY).await;
+    assert_eq!(result.unwrap_err().code().map(|c| c.code()), Some("28P01"));
+    assert_eq!(seen.mechanism.as_deref(), Some("SCRAM-SHA-256"));
+    assert_eq!(seen.binding.as_deref(), Some(&b"y,,"[..]));
 }

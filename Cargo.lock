@@ -1899,11 +1899,13 @@ name = "tls-qualification"
 version = "0.0.0"
 dependencies = [
  "futures-util",
+ "postgres-protocol",
  "rcgen",
  "sha2",
  "time 0.3.55",
  "tokio",
  "tokio-rustls",
+ "yb-postgres-pool",
  "yb-tokio-postgres",
 ]
 

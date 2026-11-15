@@ -16,6 +16,8 @@ futures-util = "0.3"
 # Server side of the loopback TLS fixtures (tests/admission.rs, tests/certificate_fields.rs).
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["aws_lc_rs"] }
 sha2 = "0.10"
+postgres-protocol = { path = "../postgres-protocol" }
+yb-postgres-pool = { path = "../yb-postgres-pool", features = ["rustls"] }
 
 [features]
 # Run the same suite with another provider: TLS_QUAL_PROVIDER=ring|fips.
