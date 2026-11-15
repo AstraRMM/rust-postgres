@@ -45,7 +45,7 @@ tls() {
   chmod 755 "$fix"/*.sh
 
   step "containers"
-  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa yb-a yb-b yb-c >/dev/null 2>&1
+  docker rm -f pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa yb-a yb-b yb-c yb-c2 >/dev/null 2>&1
   pg() { local name=$1; shift; docker run -d --name "$name" --network host -e POSTGRES_PASSWORD=qualification-only \
     -v "$fix:/fixtures:ro" --entrypoint /fixtures/pg-entry.sh "$pg_image" "$@" >/dev/null; }
   pg pg-valid 55432 server-valid scram
@@ -56,30 +56,48 @@ tls() {
   pg pg-rotated 55437 server-rotated scram
   pg pg-chained 55438 server-chained scram
   pg pg-rsa 55439 server-rsa scram
-  yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" --entrypoint /fixtures/yb-entry.sh "$yb_image" "${@:2}" >/dev/null; }
+  yb() { docker run -d --name "$1" --network host -v "$fix:/fixtures:ro" "${yb_env[@]}" --entrypoint /fixtures/yb-entry.sh "$yb_image" "${@:2}" >/dev/null; }
   # PostgreSQL listens on 554xx, inside the ephemeral port range: let every
   # fixture bind before the YugabyteDB universes open outbound connections.
   for name in pg-valid pg-mtls pg-expired pg-nossl pg-tls12 pg-rotated pg-chained pg-rsa; do
     wait_for "$name" 120 docker exec "$name" pg_isready -h 127.0.0.1 -p "$(docker inspect -f '{{index .Args 0}}' "$name")" || return 1
   done
-  yb yb-a 127.0.0.2 yb-a 0
-  yb yb-b 127.0.0.3 yb-b 1
-  yb yb-c 127.0.0.4 yb-c-rsa 2 ca-rsa
-  wait_for yb-a 420 docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select 1' || return 1
-  wait_for yb-b 420 docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select 1' || return 1
-  wait_for yb-c 420 docker exec -e PGSSLMODE=require yb-c /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select 1' || return 1
-  # SCRAM-only role on the ECDSA (yb-a) and RSA (yb-c) universes.
-  for node in yb-a:127.0.0.2 yb-c:127.0.0.4; do
+  # SCRAM channel binding is on for yb-a (ECDSA) and universe C (RSA: yb-c
+  # and yb-c2, which joins yb-c's master); yb-b keeps the server default (off).
+  yb_env=(); yb yb-a 127.0.0.2 yb-a 0
+  yb_env=(-e YB_CHANNEL_BINDING=false); yb yb-b 127.0.0.3 yb-b 1
+  yb_env=(); yb yb-c 127.0.0.4 yb-c-rsa 2 ca-rsa
+  yb_env=(-e YB_JOIN_MASTER=127.0.0.4 -e YB_REGION=realm2); yb yb-c2 127.0.0.5 yb-c2-rsa 3 ca-rsa
+  for node in yb-a:127.0.0.2 yb-b:127.0.0.3 yb-c:127.0.0.4 yb-c2:127.0.0.5; do
+    wait_for "${node%%:*}" 420 docker exec -e PGSSLMODE=require "${node%%:*}" /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U yugabyte -c 'select 1' || return 1
+  done
+  local joined=$((SECONDS + 300))
+  until [[ $(docker exec -e PGSSLMODE=require yb-c /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -Atc 'select count(*) from yb_servers()' 2>/dev/null) == 2 ]]; do
+    ((SECONDS < joined)) || { echo "yb-c2 did not join universe C"; return 1; }
+    sleep 2
+  done
+  for node in yb-a:127.0.0.2:9000 yb-b:127.0.0.3:9001 yb-c:127.0.0.4:9002 yb-c2:127.0.0.5:9003; do
+    IFS=: read -r name host port <<<"$node"
+    python3 -I -c 'import sys, urllib.request
+body = urllib.request.urlopen(sys.argv[1], timeout=10).read().decode()
+print(sys.argv[2], *sorted(l.strip() for l in body.splitlines() if "ysql_enable_scram_channel_binding=" in l or "enable_ysql_conn_mgr=" in l))' \
+      "http://$host:$port/varz?raw" "$name"
+  done
+  # SCRAM-only role on yb-a (ECDSA), yb-b (ECDSA, binding off) and universe C (RSA).
+  for node in yb-a:127.0.0.2 yb-b:127.0.0.3 yb-c:127.0.0.4; do
     docker exec -e PGSSLMODE=require "${node%%:*}" /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U yugabyte -v ON_ERROR_STOP=1 \
       -c "set password_encryption = 'scram-sha-256'" -c "create role qual_scram login password 'qualification-only'" \
       -c "select rolname, left(rolpassword, 14) as verifier from pg_authid where rolname = 'qual_scram'" || return 1
-    # Independent view from the server's own libpq client (ysqlsh).
+  done
+  # Independent view from the server's own libpq client (ysqlsh).
+  for node in yb-a:127.0.0.2 yb-b:127.0.0.3 yb-c:127.0.0.4 yb-c2:127.0.0.5; do
     docker exec -e PGSSLMODE=require -e PGCHANNELBINDING=require -e PGPASSWORD=qualification-only "${node%%:*}" \
       /home/yugabyte/bin/ysqlsh -h "${node#*:}" -U qual_scram -d yugabyte -c 'select current_user'
     echo "PROBE ysqlsh-channel-binding-require ${node%%:*} rc=$?"
   done
   # Which SASL mechanisms each engine offers over TLS (no credential sent).
-  for target in 127.0.0.2:5433:qual_scram:yugabyte 127.0.0.4:5433:qual_scram:yugabyte \
+  for target in 127.0.0.2:5433:qual_scram:yugabyte 127.0.0.3:5433:qual_scram:yugabyte \
+    127.0.0.4:5433:qual_scram:yugabyte 127.0.0.5:5433:qual_scram:yugabyte \
     127.0.0.1:55432:postgres:postgres 127.0.0.1:55439:postgres:postgres; do
     IFS=: read -r host port user db <<<"$target"
     python3 -I tls-qualification/rig/sasl-mechanisms.py "$host" "$port" "$user" "$db"
@@ -89,6 +107,7 @@ tls() {
     -c "select name, setting from pg_settings where name in ('ssl', 'ssl_library', 'password_encryption', 'ssl_min_protocol_version') order by name"
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-b /home/yugabyte/bin/ysqlsh -h 127.0.0.3 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
+  docker exec -e PGSSLMODE=require yb-c /home/yugabyte/bin/ysqlsh -h 127.0.0.4 -U yugabyte -c 'select host, port, node_type, cloud, region, zone, public_ip from yb_servers()'
   docker exec -e PGSSLMODE=require yb-a /home/yugabyte/bin/ysqlsh -h 127.0.0.2 -U yugabyte -c 'select version()'
   docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' "$pg_image" "$yb_image"
 
