@@ -1010,10 +1010,11 @@ where
             let connector =
                 tokio_rustls::TlsConnector::from(self.generation.client_config.clone());
             let label = self.label;
+            let client_identity = self.generation.info.client_identity;
             let tls = connector
                 .connect(self.name, stream)
                 .await
-                .map_err(|e| classify_io_error(&e).with_endpoint(label))?;
+                .map_err(|e| classify_io_error(&e, client_identity).with_endpoint(label))?;
             if self.generation.revocation.is_revoked() {
                 return Err(TlsFailure::new(
                     TlsFailureKind::GenerationRevoked,
@@ -1155,17 +1156,22 @@ where
     }
 }
 
-fn classify_io_error(e: &io::Error) -> TlsFailure {
+fn classify_io_error(e: &io::Error, client_identity: bool) -> TlsFailure {
     if let Some(inner) = e.get_ref() {
         if let Some(failure) = inner.downcast_ref::<TlsFailure>() {
             return failure.clone();
         }
         if let Some(rustls_error) = inner.downcast_ref::<::rustls::Error>() {
             let (kind, detail) = classify_rustls_error(rustls_error);
-            return TlsFailure::new(kind, detail);
+            let failure = TlsFailure::new(kind, detail);
+            return if rustls_peer_fault(rustls_error) {
+                failure.with_peer_fault()
+            } else {
+                failure
+            };
         }
     }
-    TlsFailure::new(
+    let failure = TlsFailure::new(
         TlsFailureKind::HandshakeFailure,
         match e.kind() {
             io::ErrorKind::UnexpectedEof => {
@@ -1174,6 +1180,36 @@ fn classify_io_error(e: &io::Error) -> TlsFailure {
             io::ErrorKind::TimedOut => "the TLS handshake timed out",
             _ => "I/O error during the TLS handshake",
         },
+    );
+    // A server may reject a client certificate by dropping the connection
+    // instead of sending an alert, so a disconnect is attributed to the
+    // endpoint only when no client certificate was presented.
+    match e.kind() {
+        io::ErrorKind::TimedOut => failure.with_peer_fault(),
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+            if !client_identity =>
+        {
+            failure.with_peer_fault()
+        }
+        _ => failure,
+    }
+}
+
+/// Whether a rustls error shows the server's endpoint misbehaving (invalid or
+/// unexpected messages), as opposed to a local error or an alert the server
+/// sent, which may be a rejection of the client's own certificate.
+pub(crate) fn rustls_peer_fault(e: &::rustls::Error) -> bool {
+    use ::rustls::Error as E;
+    matches!(
+        e,
+        E::InvalidMessage(_)
+            | E::PeerMisbehaved(_)
+            | E::InappropriateMessage { .. }
+            | E::InappropriateHandshakeMessage { .. }
+            | E::DecryptError
     )
 }
 

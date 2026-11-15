@@ -450,6 +450,12 @@ impl Error {
         self.0.kind == Kind::Closed
     }
 
+    /// Whether this is a client-side configuration error, such as a password
+    /// the server asked for but the configuration does not have.
+    pub(crate) fn is_client_config(&self) -> bool {
+        self.0.kind == Kind::Config
+    }
+
     /// Returns the SQLSTATE error code associated with the error.
     ///
     /// This is a convenience method that downcasts the cause to a `DbError` and returns its code.
@@ -487,6 +493,33 @@ impl Error {
         None
     }
 
+    /// Whether the TLS failure behind this error is attributable to the
+    /// server's endpoint (see `TlsFailure::with_peer_fault`).
+    pub(crate) fn tls_peer_fault(&self) -> bool {
+        let mut source: Option<&(dyn error::Error + 'static)> = self.source();
+        while let Some(err) = source {
+            let inner = match err.downcast_ref::<io::Error>() {
+                Some(io) => io
+                    .get_ref()
+                    .map(|inner| inner as &(dyn error::Error + 'static)),
+                None => Some(err),
+            };
+            if let Some(inner) = inner {
+                if let Some(failure) = inner.downcast_ref::<crate::tls::TlsFailure>() {
+                    return failure.peer_fault();
+                }
+                #[cfg(feature = "rustls")]
+                {
+                    if let Some(e) = inner.downcast_ref::<::rustls::Error>() {
+                        return crate::rustls::rustls_peer_fault(e);
+                    }
+                }
+            }
+            source = err.source();
+        }
+        false
+    }
+
     /// Determines if the error means the connection itself failed: I/O,
     /// an unexpected or unparseable protocol message, a closed connection,
     /// a connect failure or a timeout.
@@ -509,8 +542,10 @@ impl Error {
     /// failure (SQLSTATE class 28).
     ///
     /// The driver never answers these failures by trying a weaker transport,
-    /// quarantining the node as if it were down, or falling back to another
-    /// endpoint.
+    /// quarantining the node as if it were down, or falling back to an
+    /// endpoint that is not admitted. A TLS failure of one node's endpoint
+    /// moves on to another admitted node under the same verification;
+    /// credential failures end the attempt.
     pub fn is_security_failure(&self) -> bool {
         self.0.kind == Kind::Tls
             || self.0.kind == Kind::Authentication

@@ -236,6 +236,7 @@ pub struct TlsFailure {
     kind: TlsFailureKind,
     detail: Cow<'static, str>,
     endpoint: Option<EndpointLabel>,
+    peer_fault: bool,
 }
 
 impl TlsFailure {
@@ -244,7 +245,22 @@ impl TlsFailure {
             kind,
             detail: detail.into(),
             endpoint: None,
+            peer_fault: false,
         }
+    }
+
+    /// Marks a generic handshake failure as caused by the server's endpoint
+    /// (the connection dropped, or the server sent something invalid), as
+    /// opposed to a local error or an ambiguous alert from the server.
+    #[cfg_attr(not(feature = "rustls"), allow(dead_code))]
+    pub(crate) fn with_peer_fault(mut self) -> TlsFailure {
+        self.peer_fault = true;
+        self
+    }
+
+    /// Whether [`with_peer_fault`](Self::with_peer_fault) applies.
+    pub(crate) fn peer_fault(&self) -> bool {
+        self.peer_fault
     }
 
     #[cfg_attr(not(feature = "rustls"), allow(dead_code))]
