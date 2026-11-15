@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use yb_tokio_postgres::endpoint::EndpointPolicy;
+use yb_tokio_postgres::endpoint::{EndpointPolicy, NodeEndpoint};
 use yb_tokio_postgres::realm::{NodeStanding, Realm};
 use yb_tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsFailureKind, TlsStream};
 use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
@@ -1534,6 +1534,174 @@ async fn seed_tls_failure_moves_to_the_next_seed_but_credentials_do_not() {
     let e = connect_tls(&seeds(&[&good, &bad]), None).await.err().expect("authentication fails");
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"));
     assert_eq!(good.logins() + bad.logins() - before, 1, "no second seed may be tried");
+}
+
+/// ASTS-86: a seed whose own endpoint fails does not hide a known node
+/// that an endpoint policy dials at another address, even when the topology
+/// lists that node under the seed's identity and port.
+#[tokio::test]
+async fn a_known_node_dialled_elsewhere_by_policy_is_not_covered_by_its_seed() {
+    let cluster = Cluster::new("policy-dial");
+    let seed = Node::start(&cluster).await;
+    let dialled = Node::start_at(&cluster, &next_ip(), seed.port).await;
+    publish_rows(&cluster, &[(&seed.ip, seed.port)]);
+    let policy = EndpointPolicy::new()
+        .admit_node(&seed.ip, NodeEndpoint::new().dial(&dialled.ip))
+        .unwrap();
+    let conf = admitting(
+        format!(
+            "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2 \
+             load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=60",
+            seed.ip, seed.port
+        ),
+        policy,
+    );
+    let realm = Realm::new("policy-dial");
+    let s = connect(&conf, &realm).await.unwrap();
+    assert_eq!(node_of(&s).await, dialled.ip);
+    seed.set(Behaviour::DiscoveryShutdown);
+    let before = dialled.logins();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let info = realm.refresh(NoTls, &conf).await.expect("the policy endpoint serves the refresh");
+    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
+    assert_eq!(dialled.logins() - before, 1);
+}
+
+/// ASTS-86: a resolved seed address is covered by its own seed's port only:
+/// a known node at that address on another seed's port is still tried.
+#[tokio::test]
+async fn a_resolved_seed_address_on_another_seeds_port_is_still_tried() {
+    let cluster = Cluster::new("resolved-port");
+    let named = Node::start_at(&cluster, "127.0.0.1", 0).await;
+    let mut other = Node::start(&cluster).await;
+    while other.port == named.port || std::net::TcpListener::bind(("127.0.0.1", other.port)).is_err() {
+        other = Node::start(&cluster).await;
+    }
+    let known = Node::start_at(&cluster, "127.0.0.1", other.port).await;
+    cluster.publish(&[(&known, "primary", "z1")]);
+    let conf: Config = format!(
+        "host=localhost,{} port={},{} user=test dbname=test sslmode=require connect_timeout=2 \
+         load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=60",
+        other.ip, named.port, other.port
+    )
+    .parse()
+    .unwrap();
+    let realm = Realm::new("resolved-port");
+    let _first = connect_tls(&conf, Some(&realm)).await.unwrap();
+    named.set(Behaviour::RefuseTls);
+    other.set(Behaviour::Refuse);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let info = realm.refresh(Passthrough, &conf).await.expect("the known node serves the refresh");
+    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
+    assert!(realm.penalized_nodes().contains(&"127.0.0.1".to_string()), "{:?}", realm.penalized_nodes());
+}
+
+/// ASTS-86: a penalty belongs to one endpoint: another port of the same
+/// address keeps its place in selection.
+#[tokio::test]
+async fn a_penalty_does_not_reach_another_port_of_the_address() {
+    let cluster = Cluster::new("penalty-port");
+    let (seed, busy) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    let other = Node::start_at(&cluster, &seed.ip, 0).await;
+    cluster.publish(&[(&busy, "primary", "z1")]);
+    let realm = Realm::new("penalty-port");
+    let conf = tls_config(
+        &seed,
+        "load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=60",
+    );
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(connect_tls(&conf, Some(&realm)).await.unwrap());
+    }
+    cluster.publish(&[(&other, "primary", "z1"), (&busy, "primary", "z1")]);
+    seed.set(Behaviour::RefuseTls);
+    let s = connect_tls(&conf, Some(&realm)).await.expect("a known node serves");
+    assert_eq!(realm.penalized_nodes(), vec![seed.ip.clone()]);
+    assert_eq!(node_of_client(&s.client).await, other.ip, "the least-loaded node is not penalised");
+    assert_eq!(other.logins(), 1);
+}
+
+/// ASTS-86: a topology query that stalls past the acquisition budget does
+/// not replace an earlier seed's TLS error with a timeout.
+#[tokio::test]
+async fn tls_error_survives_a_later_seeds_stalled_topology_query() {
+    for load_balance in ["only-primary", "true"] {
+        let cluster = Cluster::new("query-stall");
+        let (bad, stalls) = (Node::start(&cluster).await, Node::start(&cluster).await);
+        cluster.publish(&[(&stalls, "primary", "z1")]);
+        cluster.set_discovery(Discovery::Stall);
+        bad.set(Behaviour::RefuseTls);
+        let conf: Config = format!(
+            "host={},{} port={},{} user=test dbname=test sslmode=require load_balance={} yb_acquire_timeout=1",
+            bad.ip, stalls.ip, bad.port, stalls.port, load_balance
+        )
+        .parse()
+        .unwrap();
+        let started = Instant::now();
+        let e = connect_tls(&conf, Some(&Realm::new("query-stall"))).await.err().expect("discovery fails");
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}: {}", load_balance, e);
+        assert_eq!(stalls.logins(), 1, "{}: the stalled seed was reached", load_balance);
+    }
+}
+
+/// A name that resolves to two loopback addresses; `*.localhost` names
+/// resolve to 127.0.0.1 and ::1 under systemd-resolved and nss-myhostname.
+const TWO_ADDRESSES: &str = "yb-multi.localhost";
+
+/// Starts a node on the first address [`TWO_ADDRESSES`] resolves to, on a
+/// port where nothing listens at the second address.
+async fn first_of_two_addresses(cluster: &Cluster) -> Node {
+    let mut addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((TWO_ADDRESSES, 0))
+        .await
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default();
+    addrs.dedup();
+    assert!(
+        addrs.len() >= 2,
+        "{} must resolve to two loopback addresses for this test, got {:?}",
+        TWO_ADDRESSES,
+        addrs
+    );
+    for _ in 0..10 {
+        let node = Node::start_at(cluster, &addrs[0].to_string(), 0).await;
+        if std::net::TcpListener::bind((addrs[1], node.port)).is_ok() {
+            return node;
+        }
+    }
+    panic!("no port is free on both addresses of {}", TWO_ADDRESSES);
+}
+
+/// ASTS-86: when a name resolves to several addresses, a node-scoped failure
+/// of one address is not replaced by a later address's transport error: the
+/// caller sees it, and the node is penalised rather than quarantined.
+#[tokio::test]
+async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
+    let cluster = Cluster::new("two-addresses");
+    let node = first_of_two_addresses(&cluster).await;
+    let conninfo = |parameters: &str| -> Config {
+        format!(
+            "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2 {}",
+            TWO_ADDRESSES, node.port, parameters
+        )
+        .parse()
+        .unwrap()
+    };
+
+    node.set(Behaviour::Shutdown);
+    let e = conninfo("load_balance=false").connect(NoTls).await.err().expect("no address serves");
+    assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
+
+    node.set(Behaviour::Accept);
+    publish_rows(&cluster, &[(TWO_ADDRESSES, node.port)]);
+    let realm = Realm::new("two-addresses");
+    let conf = conninfo("load_balance=only-primary yb_servers_refresh_interval=60 failed_host_reconnect_delay_secs=60");
+    connect(&conf, &realm).await.unwrap();
+    node.set(Behaviour::Shutdown);
+    let e = connect(&conf, &realm).await.err().expect("no address serves");
+    assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
+    assert!(realm.failed_nodes().is_empty(), "{:?}", realm.failed_nodes());
+    assert_eq!(realm.penalized_nodes(), vec![TWO_ADDRESSES.to_string()]);
 }
 
 #[tokio::test]

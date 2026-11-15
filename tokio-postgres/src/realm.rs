@@ -26,9 +26,9 @@
 use crate::client::Client;
 use crate::config::{Config, Host};
 use crate::connect::{
-    all_seed_aliases, allows_unbalanced_fallback, connect_host, connect_with_tls_ref,
-    control_connection_config, error_chain, public_ip_mode_allowed, record_failure, resolve_node,
-    seed_aliases, seed_port, seeds_label, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
+    allows_unbalanced_fallback, connect_host, connect_with_tls_ref, control_connection_config,
+    endpoint_key, error_chain, public_ip_mode_allowed, record_failure, resolve_node, seed_aliases,
+    seed_dial, seed_port, seeds_label, EndpointKey, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
 };
 use crate::endpoint;
 use crate::tls::MakeTlsConnect;
@@ -42,6 +42,7 @@ use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
@@ -232,9 +233,9 @@ struct RealmInner {
     last_failure: Mutex<Option<String>>,
     discoveries: AtomicU64,
     failures: Mutex<HashMap<String, Instant>>,
-    /// Lower-case identity -> (when, penalty event); the identities of one
-    /// endpoint share the event number.
-    penalties: Mutex<HashMap<String, (Instant, u64)>>,
+    /// Endpoint ([`endpoint_key`]) -> (when, penalty event); the identities
+    /// of one endpoint share the event number.
+    penalties: Mutex<HashMap<EndpointKey, (Instant, u64)>>,
     penalty_events: AtomicU64,
     counts: Mutex<HashMap<String, usize>>,
     public_mode: AtomicBool,
@@ -492,15 +493,24 @@ impl Realm {
         self.inner.discoveries.load(Ordering::SeqCst)
     }
 
-    /// Identities (in lower case) penalised after a node-scoped TLS or
-    /// server failure, with the most recent penalty of each.
+    /// Identities (in lower case) penalised on some port after a
+    /// node-scoped TLS or server failure.
     ///
     /// A penalised node is not quarantined: it stays eligible, but is tried
     /// only after every other candidate until the penalty expires under the
     /// `failed_host_reconnect_delay_secs` of the configuration connecting.
+    /// Penalties are kept per identity and port, so another endpoint on the
+    /// same address is not affected.
     pub fn penalized_nodes(&self) -> Vec<String> {
-        let mut nodes: Vec<String> = self.inner.penalties.lock().keys().cloned().collect();
+        let mut nodes: Vec<String> = self
+            .inner
+            .penalties
+            .lock()
+            .keys()
+            .map(|(identity, _)| identity.clone())
+            .collect();
         nodes.sort();
+        nodes.dedup();
         nodes
     }
 
@@ -509,48 +519,59 @@ impl Realm {
         self.inner.penalty_events.load(Ordering::SeqCst)
     }
 
-    fn penalize(&self, identity: &str) {
-        self.penalize_aliases(&[identity.to_string()]);
+    fn penalize(&self, identity: &str, port: u16) {
+        self.penalize_aliases(&[endpoint_key(identity, port)]);
     }
 
     /// Penalises one failed endpoint under every identity it may be listed
     /// under, counting one event. Identities are kept in lower case, as
     /// host names match case-insensitively (`resolve_node`).
-    fn penalize_aliases(&self, aliases: &[String]) {
+    fn penalize_aliases(&self, aliases: &[EndpointKey]) {
         if aliases.is_empty() {
             return;
         }
         let event = self.inner.penalty_events.fetch_add(1, Ordering::SeqCst) + 1;
         let now = Instant::now();
         let mut penalties = self.inner.penalties.lock();
-        for alias in aliases {
-            penalties.insert(alias.to_ascii_lowercase(), (now, event));
+        for (identity, port) in aliases {
+            penalties.insert(endpoint_key(identity, *port), (now, event));
         }
     }
 
-    /// Lower-case identities penalised within `delay` together with one of
-    /// `config`'s seeds, such as the address a seed name resolved to.
-    fn seed_endpoints(&self, config: &Config, delay: Duration) -> HashSet<String> {
+    /// Endpoints penalised within `delay` together with one of the
+    /// configured hosts `seeds` on its port, such as an address a seed name
+    /// resolved to.
+    fn seed_endpoints(
+        &self,
+        config: &Config,
+        delay: Duration,
+        seeds: &[usize],
+    ) -> HashSet<EndpointKey> {
         let penalties = self.inner.penalties.lock();
-        let events: HashSet<u64> = all_seed_aliases(config)
+        let events: HashSet<u64> = seeds
             .iter()
-            .flatten()
-            .filter_map(|alias| penalties.get(&alias.to_ascii_lowercase()))
+            .flat_map(|&i| {
+                let port = seed_port(config, i);
+                seed_aliases(config, i)
+                    .into_iter()
+                    .map(move |alias| endpoint_key(&alias, port))
+            })
+            .filter_map(|key| penalties.get(&key))
             .filter(|(at, _)| at.elapsed() <= delay)
             .map(|(_, event)| *event)
             .collect();
         penalties
             .iter()
             .filter(|(_, (at, event))| at.elapsed() <= delay && events.contains(event))
-            .map(|(identity, _)| identity.clone())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
-    /// Penalties within `delay`, keyed by lower-case identity
-    /// ([`is_penalized`]). The shared map is not pruned by one caller's
-    /// delay (other configurations of the realm may use a longer one); a
-    /// penalty older than every delay is replaced on the next failure.
-    fn penalties(&self, delay: Duration) -> HashMap<String, Instant> {
+    /// Penalties within `delay`, keyed by endpoint ([`is_penalized`]). The
+    /// shared map is not pruned by one caller's delay (other configurations
+    /// of the realm may use a longer one); a penalty older than every delay
+    /// is replaced on the next failure.
+    fn penalties(&self, delay: Duration) -> HashMap<EndpointKey, Instant> {
         self.inner
             .penalties
             .lock()
@@ -651,7 +672,9 @@ impl Realm {
                 Ok(mut candidates) => {
                     // Penalised nodes stay eligible but go last (stable sort).
                     let penalties = self.penalties(config.failed_host_reconnect_delay_secs);
-                    candidates.sort_by_key(|identity| is_penalized(&penalties, identity));
+                    candidates.sort_by_key(|identity| {
+                        is_penalized(&penalties, identity, topology.nodes[identity].port)
+                    });
                     for identity in candidates.into_iter().take(config.yb_max_attempts) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
@@ -719,7 +742,7 @@ impl Realm {
                                             label,
                                             error_chain(&e)
                                         );
-                                        self.penalize(&identity);
+                                        self.penalize(&identity, node.port);
                                         if e.is_security_failure() {
                                             security_error.get_or_insert(e);
                                             continue;
@@ -807,7 +830,7 @@ impl Realm {
     /// Penalises the seeds whose own endpoint failed in `pass`.
     fn penalize_seeds(&self, pass: &SeedPass) {
         for aliases in &pass.node_failures {
-            if let Some(seed) = aliases.first() {
+            if let Some((seed, _)) = aliases.first() {
                 warn!(
                     "Penalising configured host {} after a node-scoped failure",
                     endpoint::label(seed)
@@ -1066,20 +1089,24 @@ impl Realm {
         // (penalised ones last), then the penalised seeds. Without a previous
         // snapshot there are no known nodes: one pass over the seeds,
         // penalised ones last.
-        let deferred: Vec<String> = self.penalties(delay).into_keys().collect();
-        let seeds = all_seed_aliases(config);
-        let penalised_seed = |aliases: &Vec<String>| {
-            aliases
+        let deferred: Vec<EndpointKey> = self.penalties(delay).into_keys().collect();
+        let seeds = 0..cmp::max(config.host.len(), config.hostaddr.len());
+        let penalised_seed = |i: &usize| {
+            let port = seed_port(config, *i);
+            seed_aliases(config, *i)
                 .iter()
-                .any(|alias| deferred.contains(&alias.to_ascii_lowercase()))
+                .any(|alias| deferred.contains(&endpoint_key(alias, port)))
         };
         let (first, last_pass) = match previous {
             Some(_) => (
                 seeds
-                    .iter()
-                    .any(|aliases| !penalised_seed(aliases))
+                    .clone()
+                    .any(|i| !penalised_seed(&i))
                     .then(|| Seeds::Undeferred),
-                seeds.iter().any(penalised_seed).then(|| Seeds::Deferred),
+                seeds
+                    .clone()
+                    .any(|i| penalised_seed(&i))
+                    .then(|| Seeds::Deferred),
             ),
             None => (Some(Seeds::All), None),
         };
@@ -1108,32 +1135,16 @@ impl Realm {
         if let Some(previous) = previous {
             // Including any penalty the seed pass just recorded.
             let penalties = self.penalties(delay);
-            let seed_endpoints = self.seed_endpoints(config, delay);
             if last_pass.is_some() {
-                let pending =
-                    (0..cmp::max(config.host.len(), config.hostaddr.len())).filter(|&i| {
-                        seed_aliases(config, i)
-                            .iter()
-                            .any(|alias| deferred.contains(&alias.to_ascii_lowercase()))
-                    });
-                seed_tried.extend(pending);
+                seed_tried.extend(seeds.clone().filter(|i| penalised_seed(i)));
             }
+            let seed_endpoints = self.seed_endpoints(config, delay, &seed_tried);
             // Penalised nodes failed recently: try every other known node
             // first (stable sort).
             let mut known: Vec<&NodeInfo> = previous.nodes.values().collect();
-            known.sort_by_key(|node| is_penalized(&penalties, &node.identity));
+            known.sort_by_key(|node| is_penalized(&penalties, &node.identity, node.port));
             for node in known {
                 if failures.contains_key(&node.identity) {
-                    continue;
-                }
-                // The seed passes cover the seeds, under any identity.
-                if covered_by_seeds(
-                    config,
-                    &node.identity,
-                    node.port,
-                    &seed_endpoints,
-                    &seed_tried,
-                ) {
                     continue;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1153,6 +1164,16 @@ impl Realm {
                         None => continue,
                     }
                 }
+                // The seed passes already dial this endpoint.
+                if covered_by_seeds(
+                    config,
+                    &target.dial,
+                    target.port,
+                    &seed_endpoints,
+                    &seed_tried,
+                ) {
+                    continue;
+                }
                 let label = endpoint::label(&node.identity);
                 let attempt = connect_host(
                     Host::Tcp(target.dial.clone()),
@@ -1167,7 +1188,10 @@ impl Realm {
                 match attempt {
                     Ok((client, connection)) => {
                         info!("Control connection created to {}", label);
-                        match self.query_topology(client, connection, config).await {
+                        match self
+                            .query_topology(client, connection, config, deadline)
+                            .await
+                        {
                             Ok(topology) => return Ok(topology),
                             Err(e) if is_node_scoped_failure(&e) => {
                                 warn!(
@@ -1175,7 +1199,7 @@ impl Realm {
                                     label,
                                     error_chain(&e)
                                 );
-                                self.penalize(&node.identity);
+                                self.penalize(&node.identity, node.port);
                                 record_failure(&mut last, e);
                             }
                             Err(e) if e.is_security_failure() => return Err(e),
@@ -1188,7 +1212,7 @@ impl Realm {
                             label,
                             error_chain(&e)
                         );
-                        self.penalize(&node.identity);
+                        self.penalize(&node.identity, node.port);
                         record_failure(&mut last, e);
                     }
                     Err(e) if e.is_security_failure() => return Err(e),
@@ -1241,7 +1265,7 @@ impl Realm {
         config: &Config,
         attempt_bound: Duration,
         deadline: Instant,
-        deferred: &[String],
+        deferred: &[EndpointKey],
         select: Seeds,
         tried: &mut Vec<usize>,
     ) -> Result<Result<Topology, Error>, Error>
@@ -1264,12 +1288,20 @@ impl Realm {
                 // The identities the seed that served may be listed under.
                 let mut aliases = Vec::new();
                 if let Some(socket) = client.get_socket_config() {
-                    aliases.extend(socket.node.clone());
+                    aliases.extend(
+                        socket
+                            .node
+                            .as_deref()
+                            .map(|node| endpoint_key(node, socket.port)),
+                    );
                     if let crate::client::Addr::Tcp(ip) = &socket.addr {
-                        aliases.push(ip.to_string());
+                        aliases.push(endpoint_key(&ip.to_string(), socket.port));
                     }
                 }
-                match self.query_topology(client, connection, config).await {
+                match self
+                    .query_topology(client, connection, config, deadline)
+                    .await
+                {
                     Ok(topology) => return Ok(Ok(topology)),
                     // A credential failure ends discovery, whatever an
                     // earlier seed reported.
@@ -1312,6 +1344,7 @@ impl Realm {
         client: Client,
         mut connection: Connection<Socket, S>,
         config: &Config,
+        deadline: Instant,
     ) -> Result<Topology, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1321,11 +1354,15 @@ impl Realm {
             .and_then(|c| c.hostname)
             .unwrap_or_default();
         self.inner.discoveries.fetch_add(1, Ordering::SeqCst);
+        let bound = cmp::min(
+            QUERY_TIMEOUT,
+            deadline.saturating_duration_since(Instant::now()),
+        );
         let rows = {
             let query = discovery_rows(&client);
             pin_mut!(query);
             time::timeout(
-                QUERY_TIMEOUT,
+                bound,
                 future::poll_fn(|cx| {
                     if connection.poll_unpin(cx)?.is_ready() {
                         return Poll::Ready(Err(Error::closed()));
@@ -1337,7 +1374,7 @@ impl Realm {
             .map_err(|_| {
                 Error::connect(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("`select * from yb_servers()` did not complete within {:?}", QUERY_TIMEOUT),
+                    format!("`select * from yb_servers()` did not complete within {:?}", bound),
                 ))
             })??
         };
@@ -1420,9 +1457,9 @@ impl Realm {
     }
 }
 
-/// Whether `identity` is penalised; `penalties` is keyed by lower case.
-fn is_penalized(penalties: &HashMap<String, Instant>, identity: &str) -> bool {
-    penalties.contains_key(&identity.to_ascii_lowercase())
+/// Whether `identity` is penalised on `port` ([`endpoint_key`]).
+fn is_penalized(penalties: &HashMap<EndpointKey, Instant>, identity: &str, port: u16) -> bool {
+    penalties.contains_key(&endpoint_key(identity, port))
 }
 
 fn fresh_for(topology: &Topology, config: &Config) -> bool {
@@ -1442,25 +1479,24 @@ pub(crate) fn deadline_after(budget: Duration) -> Instant {
 /// About 30 years, as Tokio uses for an unbounded timer.
 const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
-/// Whether a seed pass of this refresh dials `identity` on `port`: one of
-/// the configured hosts in `seeds` (tried, or left for the last pass) with
-/// that name or `hostaddr` on that port, or an address a seed resolved to
-/// (`seed_endpoints`, lower case) on one of their ports.
+/// Whether a seed pass of this refresh dials `dial` on `port`: one of the
+/// configured hosts in `seeds` (tried, or left for the last pass) is dialled
+/// at that address on that port, or resolved to that address on its port
+/// (`seed_endpoints`).
 fn covered_by_seeds(
     config: &Config,
-    identity: &str,
+    dial: &str,
     port: u16,
-    seed_endpoints: &HashSet<String>,
+    seed_endpoints: &HashSet<EndpointKey>,
     seeds: &[usize],
 ) -> bool {
-    let resolved = seed_endpoints.contains(&identity.to_ascii_lowercase());
-    seeds.iter().any(|&i| {
-        seed_port(config, i) == port
-            && (resolved
-                || seed_aliases(config, i)
-                    .iter()
-                    .any(|alias| alias.eq_ignore_ascii_case(identity)))
-    })
+    let resolved =
+        dial.parse::<IpAddr>().is_ok() && seed_endpoints.contains(&endpoint_key(dial, port));
+    resolved
+        || seeds.iter().any(|&i| {
+            seed_port(config, i) == port
+                && seed_dial(config, i).map_or(false, |seed| seed.eq_ignore_ascii_case(dial))
+        })
 }
 
 fn invalid_topology(reason: &str) -> Error {

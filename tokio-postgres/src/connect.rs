@@ -114,13 +114,16 @@ pub(crate) struct SeedPass {
     attempt_timeout: Option<Duration>,
     /// No attempt runs past this instant.
     deadline: Option<Instant>,
-    /// Lower-case seed identities to try after every other seed.
-    deferred: Vec<String>,
+    /// Penalised endpoints ([`endpoint_key`]): seeds listed here are tried
+    /// after every other seed.
+    deferred: Vec<EndpointKey>,
     /// What the caller sees if no host succeeds ([`record_failure`]).
     pub(crate) failure: Option<Error>,
-    /// The aliases ([`seed_aliases`]) of each seed whose own endpoint
-    /// failed ([`is_node_scoped_failure`]), one entry per failure.
-    pub(crate) node_failures: Vec<Vec<String>>,
+    /// The endpoints of each seed whose own endpoint failed
+    /// ([`is_node_scoped_failure`]): its aliases ([`seed_aliases`]) and the
+    /// resolved addresses that failed, on the seed's port, one entry per
+    /// failure.
+    pub(crate) node_failures: Vec<Vec<EndpointKey>>,
     /// Indices of the configured hosts this pass attempted.
     pub(crate) tried: Vec<usize>,
 }
@@ -143,7 +146,7 @@ impl SeedPass {
         self
     }
 
-    pub(crate) fn deferring(mut self, deferred: Vec<String>) -> SeedPass {
+    pub(crate) fn deferring(mut self, deferred: Vec<EndpointKey>) -> SeedPass {
         self.deferred = deferred;
         self
     }
@@ -175,7 +178,7 @@ impl SeedPass {
 /// short: that error is more useful than the timeout.
 pub(crate) fn take_reportable(slot: &mut Option<Error>) -> Option<Error> {
     match slot {
-        Some(e) if failure_rank(e) > 0 => slot.take(),
+        Some(e) if failure_rank(e) > 1 => slot.take(),
         _ => None,
     }
 }
@@ -188,6 +191,25 @@ pub(crate) fn seed_identity(config: &Config, i: usize) -> Option<String> {
         _ => None,
     }
     .or_else(|| config.hostaddr.get(i).map(|addr| addr.to_string()))
+}
+
+/// An endpoint as penalties are keyed: lower-case identity and port.
+pub(crate) type EndpointKey = (String, u16);
+
+pub(crate) fn endpoint_key(identity: &str, port: u16) -> EndpointKey {
+    (identity.to_ascii_lowercase(), port)
+}
+
+/// The address configured host `i` is dialled at: its `hostaddr`, or its
+/// TCP name.
+pub(crate) fn seed_dial(config: &Config, i: usize) -> Option<String> {
+    match config.hostaddr.get(i) {
+        Some(addr) => Some(addr.to_string()),
+        None => match config.host.get(i) {
+            Some(Host::Tcp(name)) => Some(name.clone()),
+            _ => None,
+        },
+    }
 }
 
 /// The identities configured host `i` may be listed under in a topology:
@@ -203,30 +225,27 @@ pub(crate) fn seed_aliases(config: &Config, i: usize) -> Vec<String> {
     aliases
 }
 
-/// [`seed_aliases`] of every configured host, in order. A host without
-/// aliases (a Unix socket) has an empty list and is never deferred.
-pub(crate) fn all_seed_aliases(config: &Config) -> Vec<Vec<String>> {
-    (0..cmp::max(config.host.len(), config.hostaddr.len()))
-        .map(|i| seed_aliases(config, i))
-        .collect()
-}
-
 /// Precedence of the errors of a pass over several endpoints when none
 /// succeeds. Credential failures, client certificate and client TLS errors
 /// never get here: they end the pass at once.
 ///
-/// 2. A client-side configuration error (for example a password the server
+/// 3. A client-side configuration error (for example a password the server
 ///    asked for but the configuration lacks). It would repeat on every
 ///    endpoint that asks for it and only the caller can fix it, so it wins
 ///    over an earlier node-scoped TLS error. The pass still tries the
 ///    remaining endpoints, as one of them may not need it.
-/// 1. The first node-scoped TLS failure: verification failed on a reachable
+/// 2. The first node-scoped TLS failure: verification failed on a reachable
 ///    endpoint, and a later transport error or timeout must not hide it.
+/// 1. The first other node-scoped failure (a node reporting itself
+///    unhealthy): a later transport error must not turn the node's penalty
+///    into a quarantine.
 /// 0. Otherwise the last other error (transport, timeout, server).
 fn failure_rank(e: &Error) -> u8 {
     if e.is_client_config() {
-        2
+        3
     } else if e.is_security_failure() {
+        2
+    } else if is_node_scoped_failure(e) {
         1
     } else {
         0
@@ -234,8 +253,8 @@ fn failure_rank(e: &Error) -> u8 {
 }
 
 /// Records `next` in `slot` according to [`failure_rank`]: a higher rank
-/// replaces a lower one, the first error of rank 1 or 2 is kept, and a later
-/// error of rank 0 replaces an earlier one.
+/// replaces a lower one, the first error of rank 1 or more is kept, and a
+/// later error of rank 0 replaces an earlier one.
 pub(crate) fn record_failure(slot: &mut Option<Error>, next: Error) {
     let keep = match slot {
         Some(current) => {
@@ -294,9 +313,10 @@ where
         indices.shuffle(&mut rand::thread_rng());
     }
     let deferred = |i: usize| {
-        seed_aliases(config, i)
-            .iter()
-            .any(|alias| pass.deferred.contains(&alias.to_ascii_lowercase()))
+        seed_aliases(config, i).iter().any(|alias| {
+            pass.deferred
+                .contains(&endpoint_key(alias, seed_port(config, i)))
+        })
     };
     match pass.select {
         Seeds::All => {}
@@ -324,12 +344,7 @@ where
         };
         let host = config.host.get(i);
         let hostaddr = config.hostaddr.get(i);
-        let port = config
-            .port
-            .get(i)
-            .or_else(|| config.port.first())
-            .copied()
-            .unwrap_or(5433);
+        let port = seed_port(config, i);
 
         // The value of host is used as the hostname for TLS validation,
         let hostname = match host {
@@ -373,15 +388,18 @@ where
             // (which error the caller sees: `record_failure`).
             Err(e) if e.is_security_failure() && !is_node_scoped_failure(&e) => return Err(e),
             Err(e) => {
-                if is_node_scoped_failure(&e) {
+                if is_node_scoped_failure(&e) || !host.failed_addrs.is_empty() {
                     warn!(
                         "Connection to {} failed: {}; trying the next configured host",
                         label,
                         error_chain(&e)
                     );
-                    let mut aliases = seed_aliases(config, i);
-                    aliases.extend(host.failed_addrs);
-                    pass.node_failures.push(aliases);
+                    let endpoints = seed_aliases(config, i)
+                        .iter()
+                        .chain(&host.failed_addrs)
+                        .map(|identity| endpoint_key(identity, port))
+                        .collect();
+                    pass.node_failures.push(endpoints);
                 }
                 record_failure(&mut pass.failure, e);
             }
