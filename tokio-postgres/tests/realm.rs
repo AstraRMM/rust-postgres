@@ -1621,6 +1621,27 @@ async fn a_penalty_does_not_reach_another_port_of_the_address() {
     assert_eq!(other.logins(), 1);
 }
 
+/// ASTS-86: when no discovered node serves, a node's node-scoped failure is
+/// what the caller sees, not a later candidate's transport error.
+#[tokio::test]
+async fn a_node_scoped_failure_survives_a_later_candidates_refusal() {
+    let cluster = Cluster::new("candidate-rank");
+    let (n1, n2) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&n1, "primary", "z1"), (&n2, "primary", "z1")]);
+    let realm = Realm::new("candidate-rank");
+    let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=60 failed_host_reconnect_delay_secs=60");
+    let held = connect(&conf, &realm).await.unwrap();
+    // The idle node is tried first.
+    let (loaded, idle) = if node_of(&held).await == n1.ip { (&n1, &n2) } else { (&n2, &n1) };
+    idle.set(Behaviour::Shutdown);
+    loaded.set(Behaviour::Refuse);
+    let before = idle.logins();
+    let e = connect(&conf, &realm).await.err().expect("no candidate serves");
+    assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
+    assert_eq!(idle.logins() - before, 1, "the idle node was tried");
+    assert_eq!(realm.penalized_nodes(), vec![idle.ip.clone()]);
+}
+
 /// ASTS-86: a topology query that stalls past the acquisition budget does
 /// not replace an earlier seed's TLS error with a timeout.
 #[tokio::test]

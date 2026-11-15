@@ -760,7 +760,7 @@ impl Realm {
                                         self.mark_failed(&identity);
                                     }
                                 }
-                                last_error = Some(e);
+                                record_failure(&mut last_error, e);
                             }
                         }
                     }
