@@ -1669,6 +1669,25 @@ async fn a_node_scoped_failure_survives_a_later_candidates_refusal() {
     assert_eq!(realm.penalized_nodes(), vec![idle.ip.clone()]);
 }
 
+/// ASTS-86: penalties older than every reconnect delay the realm has used
+/// expire, so a long-lived realm does not keep reporting or accumulating them.
+#[tokio::test]
+async fn expired_penalties_are_dropped() {
+    let cluster = Cluster::new("prune");
+    let (seed, n2) = (Node::start(&cluster).await, Node::start(&cluster).await);
+    cluster.publish(&[(&seed, "primary", "z1"), (&n2, "primary", "z1")]);
+    let realm = Realm::new("prune");
+    let mut conf = config(&seed, "load_balance=only-primary yb_servers_refresh_interval=0");
+    conf.failed_host_reconnect_delay_secs(Duration::from_millis(200));
+    connect(&conf, &realm).await.unwrap();
+    seed.set(Behaviour::DiscoveryShutdown);
+    connect(&conf, &realm).await.expect("the known node serves");
+    assert_eq!(realm.penalized_nodes(), vec![seed.ip.clone()]);
+    seed.set(Behaviour::Accept);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(realm.penalized_nodes().is_empty(), "{:?}", realm.penalized_nodes());
+}
+
 /// ASTS-86: a topology query that stalls past the acquisition budget does
 /// not replace an earlier seed's TLS error with a timeout.
 #[tokio::test]
@@ -1693,31 +1712,33 @@ async fn tls_error_survives_a_later_seeds_stalled_topology_query() {
     }
 }
 
-/// A name that resolves to two loopback addresses; `*.localhost` names
-/// resolve to 127.0.0.1 and ::1 under systemd-resolved and nss-myhostname.
-const TWO_ADDRESSES: &str = "yb-multi.localhost";
+/// Names of which the first that resolves to two loopback addresses is
+/// used: `*.localhost` under systemd-resolved or nss-myhostname, and
+/// `localhost` where the hosts file maps it to both 127.0.0.1 and ::1 (as in
+/// Docker containers).
+const TWO_ADDRESS_NAMES: [&str; 2] = ["yb-multi.localhost", "localhost"];
 
-/// Starts a node on the first address [`TWO_ADDRESSES`] resolves to, on a
-/// port where nothing listens at the second address.
-async fn first_of_two_addresses(cluster: &Cluster) -> Node {
-    let mut addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((TWO_ADDRESSES, 0))
-        .await
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .unwrap_or_default();
-    addrs.dedup();
-    assert!(
-        addrs.len() >= 2,
-        "{} must resolve to two loopback addresses for this test, got {:?}",
-        TWO_ADDRESSES,
-        addrs
-    );
-    for _ in 0..10 {
-        let node = Node::start_at(cluster, &addrs[0].to_string(), 0).await;
-        if std::net::TcpListener::bind((addrs[1], node.port)).is_ok() {
-            return node;
+/// A name resolving to two addresses, and a node on the first of them, on a
+/// port where nothing listens at the second. Fails rather than skips when no
+/// such name resolves, so the multi-address path is never silently untested.
+async fn first_of_two_addresses(cluster: &Cluster) -> (&'static str, Node) {
+    for name in TWO_ADDRESS_NAMES {
+        let mut addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((name, 0))
+            .await
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+            .unwrap_or_default();
+        addrs.dedup();
+        if addrs.len() < 2 {
+            continue;
+        }
+        for _ in 0..10 {
+            let node = Node::start_at(cluster, &addrs[0].to_string(), 0).await;
+            if std::net::TcpListener::bind((addrs[1], node.port)).is_ok() {
+                return (name, node);
+            }
         }
     }
-    panic!("no port is free on both addresses of {}", TWO_ADDRESSES);
+    panic!("none of {:?} resolves to two loopback addresses with a common free port", TWO_ADDRESS_NAMES);
 }
 
 /// ASTS-86: when a name resolves to several addresses, a node-scoped failure
@@ -1726,11 +1747,11 @@ async fn first_of_two_addresses(cluster: &Cluster) -> Node {
 #[tokio::test]
 async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
     let cluster = Cluster::new("two-addresses");
-    let node = first_of_two_addresses(&cluster).await;
+    let (name, node) = first_of_two_addresses(&cluster).await;
     let conninfo = |parameters: &str| -> Config {
         format!(
             "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2 {}",
-            TWO_ADDRESSES, node.port, parameters
+            name, node.port, parameters
         )
         .parse()
         .unwrap()
@@ -1741,7 +1762,7 @@ async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
     assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
 
     node.set(Behaviour::Accept);
-    publish_rows(&cluster, &[(TWO_ADDRESSES, node.port)]);
+    publish_rows(&cluster, &[(name, node.port)]);
     let realm = Realm::new("two-addresses");
     let conf = conninfo("load_balance=only-primary yb_servers_refresh_interval=60 failed_host_reconnect_delay_secs=60");
     connect(&conf, &realm).await.unwrap();
@@ -1749,7 +1770,7 @@ async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
     let e = connect(&conf, &realm).await.err().expect("no address serves");
     assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
     assert!(realm.failed_nodes().is_empty(), "{:?}", realm.failed_nodes());
-    assert_eq!(realm.penalized_nodes(), vec![TWO_ADDRESSES.to_string()]);
+    assert_eq!(realm.penalized_nodes(), vec![name.to_string()]);
 }
 
 #[tokio::test]

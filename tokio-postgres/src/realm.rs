@@ -238,6 +238,10 @@ struct RealmInner {
     /// of one endpoint share the event number.
     penalties: Mutex<HashMap<EndpointKey, (Instant, u64)>>,
     penalty_events: AtomicU64,
+    /// The longest `failed_host_reconnect_delay_secs` a configuration of
+    /// this realm has consulted the penalties with; older penalties are
+    /// pruned.
+    penalty_horizon: Mutex<Duration>,
     counts: Mutex<HashMap<String, usize>>,
     public_mode: AtomicBool,
     shutdown: AtomicBool,
@@ -307,6 +311,7 @@ impl Realm {
                 failures: Mutex::new(HashMap::new()),
                 penalties: Mutex::new(HashMap::new()),
                 penalty_events: AtomicU64::new(0),
+                penalty_horizon: Mutex::new(Duration::ZERO),
                 counts: Mutex::new(HashMap::new()),
                 public_mode: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
@@ -503,12 +508,14 @@ impl Realm {
     /// Penalties are kept per identity and port, so another endpoint on the
     /// same address is not affected.
     pub fn penalized_nodes(&self) -> Vec<String> {
+        let horizon = *self.inner.penalty_horizon.lock();
         let mut nodes: Vec<String> = self
             .inner
             .penalties
             .lock()
-            .keys()
-            .map(|(identity, _)| identity.clone())
+            .iter()
+            .filter(|(_, (at, _))| at.elapsed() <= horizon)
+            .map(|((identity, _), _)| identity.clone())
             .collect();
         nodes.sort();
         nodes.dedup();
@@ -533,7 +540,9 @@ impl Realm {
         }
         let event = self.inner.penalty_events.fetch_add(1, Ordering::SeqCst) + 1;
         let now = Instant::now();
+        let horizon = *self.inner.penalty_horizon.lock();
         let mut penalties = self.inner.penalties.lock();
+        penalties.retain(|_, (at, _)| at.elapsed() <= horizon);
         for (identity, port) in aliases {
             penalties.insert(endpoint_key(identity, *port), (now, event));
         }
@@ -574,9 +583,13 @@ impl Realm {
 
     /// Penalties within `delay`, keyed by endpoint ([`is_penalized`]). The
     /// shared map is not pruned by one caller's delay (other configurations
-    /// of the realm may use a longer one); a penalty older than every delay
-    /// is replaced on the next failure.
+    /// of the realm may use a longer one); the next failure prunes penalties
+    /// older than the longest delay consulted.
     fn penalties(&self, delay: Duration) -> HashMap<EndpointKey, Instant> {
+        {
+            let mut horizon = self.inner.penalty_horizon.lock();
+            *horizon = cmp::max(*horizon, delay);
+        }
         self.inner
             .penalties
             .lock()
