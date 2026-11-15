@@ -1222,12 +1222,13 @@ async fn a_failing_dns_seed_is_penalised_under_its_resolved_address() {
     assert!(penalized.contains(&"localhost".to_string()), "{:?}", penalized);
     assert!(penalized.contains(&"127.0.0.1".to_string()), "{:?}", penalized);
 
-    // With no other node serving, the penalised seed is retried once, by
-    // the last seed pass, not also under its address as a known node.
+    // With no other node serving, the address is tried once more as a known
+    // node (it is verified under another name than the seed) and the seed
+    // once more by the last seed pass.
     n2.set(Behaviour::Refuse);
     let e = connect_tls(&conf, Some(&realm)).await.err().expect("no node serves");
     assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
-    assert_eq!(seed.tls_requests() - before, 2);
+    assert_eq!(seed.tls_requests() - before, 3);
 }
 
 /// ASTS-86: a known node at a seed's address but on another port is not a
@@ -1565,6 +1566,32 @@ async fn a_known_node_dialled_elsewhere_by_policy_is_not_covered_by_its_seed() {
     let info = realm.refresh(NoTls, &conf).await.expect("the policy endpoint serves the refresh");
     assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
     assert_eq!(dialled.logins() - before, 1);
+}
+
+/// ASTS-86: a known node dialled at a seed's address and port but verified
+/// under another TLS name is a different attempt, so refresh still tries it.
+#[tokio::test]
+async fn a_known_node_verified_under_another_name_is_not_covered_by_its_seed() {
+    let cluster = Cluster::new("policy-name");
+    let seed = Node::start(&cluster).await;
+    publish_rows(&cluster, &[("node.example", seed.port)]);
+    let policy = EndpointPolicy::new()
+        .admit_node("node.example", NodeEndpoint::new().dial(&seed.ip))
+        .unwrap();
+    let conf = admitting(
+        format!(
+            "host=seed.example hostaddr={} port={} user=test dbname=test sslmode=disable connect_timeout=2 \
+             load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=60",
+            seed.ip, seed.port
+        ),
+        policy,
+    );
+    let realm = Realm::new("policy-name");
+    let _first = connect(&conf, &realm).await.unwrap();
+    seed.set(Behaviour::DiscoveryShutdown);
+    let before = seed.logins();
+    let _ = realm.refresh(NoTls, &conf).await;
+    assert_eq!(seed.logins() - before, 2, "the seed and the differently verified known node");
 }
 
 /// ASTS-86: a resolved seed address is covered by its own seed's port only:

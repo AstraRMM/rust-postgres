@@ -28,9 +28,10 @@ use crate::config::{Config, Host};
 use crate::connect::{
     allows_unbalanced_fallback, connect_host, connect_with_tls_ref, control_connection_config,
     endpoint_key, error_chain, public_ip_mode_allowed, record_failure, resolve_node, seed_aliases,
-    seed_dial, seed_port, seeds_label, EndpointKey, HostAttempt, SeedPass, Seeds, BACKSTOP_GRACE,
+    seed_dial, seed_port, seed_tls_name, seeds_label, EndpointKey, HostAttempt, SeedPass, Seeds,
+    BACKSTOP_GRACE,
 };
-use crate::endpoint;
+use crate::endpoint::{self, ResolvedEndpoint};
 use crate::tls::MakeTlsConnect;
 use crate::{Connection, Error, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt};
@@ -540,31 +541,35 @@ impl Realm {
 
     /// Endpoints penalised within `delay` together with one of the
     /// configured hosts `seeds` on its port, such as an address a seed name
-    /// resolved to.
+    /// resolved to, each with that seed's lower-case TLS name.
     fn seed_endpoints(
         &self,
         config: &Config,
         delay: Duration,
         seeds: &[usize],
-    ) -> HashSet<EndpointKey> {
+    ) -> HashSet<(EndpointKey, String)> {
         let penalties = self.inner.penalties.lock();
-        let events: HashSet<u64> = seeds
-            .iter()
-            .flat_map(|&i| {
-                let port = seed_port(config, i);
-                seed_aliases(config, i)
-                    .into_iter()
-                    .map(move |alias| endpoint_key(&alias, port))
-            })
-            .filter_map(|key| penalties.get(&key))
-            .filter(|(at, _)| at.elapsed() <= delay)
-            .map(|(_, event)| *event)
-            .collect();
-        penalties
-            .iter()
-            .filter(|(_, (at, event))| at.elapsed() <= delay && events.contains(event))
-            .map(|(key, _)| key.clone())
-            .collect()
+        let mut endpoints = HashSet::new();
+        for &i in seeds {
+            let tls_name = match seed_tls_name(config, i) {
+                Some(name) => name.to_ascii_lowercase(),
+                None => continue,
+            };
+            let port = seed_port(config, i);
+            let events: HashSet<u64> = seed_aliases(config, i)
+                .iter()
+                .filter_map(|alias| penalties.get(&endpoint_key(alias, port)))
+                .filter(|(at, _)| at.elapsed() <= delay)
+                .map(|(_, event)| *event)
+                .collect();
+            endpoints.extend(
+                penalties
+                    .iter()
+                    .filter(|(_, (at, event))| at.elapsed() <= delay && events.contains(event))
+                    .map(|(key, _)| (key.clone(), tls_name.clone())),
+            );
+        }
+        endpoints
     }
 
     /// Penalties within `delay`, keyed by endpoint ([`is_penalized`]). The
@@ -1102,11 +1107,11 @@ impl Realm {
                 seeds
                     .clone()
                     .any(|i| !penalised_seed(&i))
-                    .then(|| Seeds::Undeferred),
+                    .then_some(Seeds::Undeferred),
                 seeds
                     .clone()
                     .any(|i| penalised_seed(&i))
-                    .then(|| Seeds::Deferred),
+                    .then_some(Seeds::Deferred),
             ),
             None => (Some(Seeds::All), None),
         };
@@ -1165,13 +1170,7 @@ impl Realm {
                     }
                 }
                 // The seed passes already dial this endpoint.
-                if covered_by_seeds(
-                    config,
-                    &target.dial,
-                    target.port,
-                    &seed_endpoints,
-                    &seed_tried,
-                ) {
+                if covered_by_seeds(config, &target, &seed_endpoints, &seed_tried) {
                     continue;
                 }
                 let label = endpoint::label(&node.identity);
@@ -1479,23 +1478,24 @@ pub(crate) fn deadline_after(budget: Duration) -> Instant {
 /// About 30 years, as Tokio uses for an unbounded timer.
 const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
-/// Whether a seed pass of this refresh dials `dial` on `port`: one of the
-/// configured hosts in `seeds` (tried, or left for the last pass) is dialled
-/// at that address on that port, or resolved to that address on its port
-/// (`seed_endpoints`).
+/// Whether a seed pass of this refresh makes the same attempt as `target`:
+/// one of the configured hosts in `seeds` (tried, or left for the last pass)
+/// is dialled at that address on that port and verified under that TLS name,
+/// or resolved to that address on its port (`seed_endpoints`).
 fn covered_by_seeds(
     config: &Config,
-    dial: &str,
-    port: u16,
-    seed_endpoints: &HashSet<EndpointKey>,
+    target: &ResolvedEndpoint,
+    seed_endpoints: &HashSet<(EndpointKey, String)>,
     seeds: &[usize],
 ) -> bool {
-    let resolved =
-        dial.parse::<IpAddr>().is_ok() && seed_endpoints.contains(&endpoint_key(dial, port));
+    let tls_name = target.tls_name.to_ascii_lowercase();
+    let resolved = target.dial.parse::<IpAddr>().is_ok()
+        && seed_endpoints.contains(&(endpoint_key(&target.dial, target.port), tls_name.clone()));
     resolved
         || seeds.iter().any(|&i| {
-            seed_port(config, i) == port
-                && seed_dial(config, i).map_or(false, |seed| seed.eq_ignore_ascii_case(dial))
+            seed_port(config, i) == target.port
+                && seed_dial(config, i).is_some_and(|seed| seed.eq_ignore_ascii_case(&target.dial))
+                && seed_tls_name(config, i).is_some_and(|name| name.eq_ignore_ascii_case(&tls_name))
         })
 }
 

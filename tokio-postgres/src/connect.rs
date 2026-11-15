@@ -80,7 +80,7 @@ impl HostAttempt {
     /// Whether the bound has passed.
     fn expired(&self) -> bool {
         self.limit
-            .map_or(false, |(_, deadline)| Instant::now() >= deadline)
+            .is_some_and(|(_, deadline)| Instant::now() >= deadline)
     }
 
     /// Runs `step` within what is left of the bound.
@@ -209,6 +209,15 @@ pub(crate) fn seed_dial(config: &Config, i: usize) -> Option<String> {
             Some(Host::Tcp(name)) => Some(name.clone()),
             _ => None,
         },
+    }
+}
+
+/// The name the server certificate of configured host `i` is verified
+/// against: its TCP name.
+pub(crate) fn seed_tls_name(config: &Config, i: usize) -> Option<String> {
+    match config.host.get(i) {
+        Some(Host::Tcp(name)) => Some(name.clone()),
+        _ => None,
     }
 }
 
