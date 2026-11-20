@@ -112,14 +112,50 @@ impl Drop for Opening<'_> {
 struct Dialing<'a, T: PoolTls> {
     shared: &'a Shared<T>,
     id: u64,
+    started: Instant,
 }
 
 impl<'a, T: PoolTls> Dialing<'a, T> {
     fn start(shared: &'a Shared<T>) -> Dialing<'a, T> {
         let id = shared.next_dial.fetch_add(1, Ordering::SeqCst);
-        shared.dials.lock().insert(id, Instant::now());
+        let started = Instant::now();
+        shared.dials.lock().insert(id, started);
         shared.limiter.dial_started();
-        Dialing { shared, id }
+        Dialing {
+            shared,
+            id,
+            started,
+        }
+    }
+
+    fn succeeded(self) {
+        self.shared.recent_dial.record(self.started.elapsed());
+    }
+}
+
+const DIAL_WEIGHT: u128 = 4;
+
+#[derive(Default)]
+pub(crate) struct DialEstimate(AtomicU64);
+
+impl DialEstimate {
+    pub(crate) fn record(&self, sample: Duration) {
+        let sample = sample.as_nanos().clamp(1, u128::from(u64::MAX));
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(match old {
+                    0 => sample as u64,
+                    old => ((u128::from(old) * (DIAL_WEIGHT - 1) + sample) / DIAL_WEIGHT) as u64,
+                })
+            });
+    }
+
+    pub(crate) fn get(&self) -> Option<Duration> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
     }
 }
 
@@ -138,7 +174,7 @@ pub(crate) struct Occupancy {
     pub(crate) permits_dialing: u32,
     pub(crate) permits_max: u32,
     pub(crate) oldest_dial: Option<Duration>,
-    pub(crate) mean_connect: Option<Duration>,
+    pub(crate) recent_dial: Option<Duration>,
     pub(crate) connect_errors: u64,
 }
 
@@ -164,8 +200,8 @@ impl fmt::Display for Occupancy {
             Some(age) => write!(f, "oldest own dial in flight for {:?}", age)?,
             None => f.write_str("no own dial in flight")?,
         }
-        if let Some(mean) = self.mean_connect {
-            write!(f, ", mean connect {:?}", mean)?;
+        if let Some(recent) = self.recent_dial {
+            write!(f, ", recent dial {:?}", recent)?;
         }
         Ok(())
     }
@@ -177,8 +213,8 @@ pub(crate) fn probe_timeout_kind(
     waited: Duration,
 ) -> ErrorKind {
     let threshold = end
-        .mean_connect
-        .map_or(waited / 2, |mean| (waited / 2).max(mean * 2));
+        .recent_dial
+        .map_or(waited / 2, |recent| (waited / 2).max(recent * 2));
     let stalled_dial = end.oldest_dial.is_some_and(|age| age >= threshold);
     let failed_dial = end.connect_errors > start.connect_errors;
     if stalled_dial || failed_dial || !(start.saturated() || end.saturated()) {
@@ -237,6 +273,7 @@ pub(crate) struct Shared<T: PoolTls> {
     opening: AtomicU64,
     dials: Mutex<HashMap<u64, Instant>>,
     next_dial: AtomicU64,
+    recent_dial: DialEstimate,
     /// Checkouts in progress.
     waiting: AtomicU64,
     /// Connect failures and shutdown wake waiters: a failed connect is
@@ -386,9 +423,13 @@ impl<T: PoolTls> Shared<T> {
             _process: process,
         };
         let remaining = budget.saturating_sub(started.elapsed());
-        let _dialing = Dialing::start(self.as_ref());
+        let dialing = Dialing::start(self.as_ref());
         match tokio::time::timeout(remaining, self.dial(permits)).await {
-            Ok(result) => result,
+            Ok(Ok(conn)) => {
+                dialing.succeeded();
+                Ok(conn)
+            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(PoolError::new(
                 ErrorKind::Transport,
                 format!("connect did not complete within {:?}", budget),
@@ -779,13 +820,7 @@ impl<T: PoolTls> Shared<T> {
                 .values()
                 .map(|started| now.duration_since(*started))
                 .max(),
-            mean_connect: match self.stats.connects.load(Ordering::Relaxed) {
-                0 => None,
-                connects => Some(
-                    Duration::from_nanos(self.stats.connect_nanos.load(Ordering::Relaxed))
-                        / u32::try_from(connects).unwrap_or(u32::MAX),
-                ),
-            },
+            recent_dial: self.recent_dial.get(),
             connect_errors: self.connect_error_seq.load(Ordering::SeqCst),
         }
     }
@@ -999,6 +1034,7 @@ impl<T: PoolTls> Pool<T> {
             opening: AtomicU64::new(0),
             dials: Mutex::new(HashMap::new()),
             next_dial: AtomicU64::new(0),
+            recent_dial: DialEstimate::default(),
             waiting: AtomicU64::new(0),
             fatal: Notify::new(),
             fatal_seq: AtomicU64::new(0),
@@ -1148,9 +1184,11 @@ impl<T: PoolTls> Pool<T> {
     /// case it reports [`ErrorKind::Transport`]. The evidence is:
     ///
     /// * one of this pool's dials was still in flight at the deadline after
-    ///   running for at least half the wait, or for twice the pool's mean
-    ///   successful connect time if that is longer (half the wait alone
-    ///   until the pool has connected once);
+    ///   running for at least half the wait, or for twice the pool's recent
+    ///   dial time if that is longer (half the wait alone until the pool has
+    ///   dialed once). The recent dial time is a moving average of this
+    ///   pool's successful dials, each timed from when it held its permits,
+    ///   so waits for permits do not count;
     /// * one of this pool's dials failed during the wait;
     /// * the pool had room both when the wait began and at the deadline:
     ///   fewer than `max_size` clients borrowed, and process-wide permits
@@ -2132,7 +2170,7 @@ mod tests {
             permits_dialing: 0,
             permits_max: 4,
             oldest_dial: None,
-            mean_connect: None,
+            recent_dial: None,
             connect_errors: 7,
         };
         let full = Occupancy {
@@ -2167,7 +2205,7 @@ mod tests {
         };
         assert_eq!(kind(&full, &stalled), ErrorKind::Transport);
         let slow_endpoint = Occupancy {
-            mean_connect: Some(Duration::from_millis(300)),
+            recent_dial: Some(Duration::from_millis(300)),
             ..replacing
         };
         let replacing_slowly = Occupancy {
@@ -2211,6 +2249,82 @@ mod tests {
             ..idle
         };
         assert_eq!(kind(&shared_full, &shared_full), ErrorKind::AcquireTimeout);
+    }
+
+    #[test]
+    fn recent_dial_tracks_recent_dials() {
+        use crate::pool::DialEstimate;
+        let ms = Duration::from_millis;
+        let estimate = DialEstimate::default();
+        assert_eq!(estimate.get(), None);
+        estimate.record(Duration::ZERO);
+        assert_eq!(estimate.get(), Some(Duration::from_nanos(1)));
+
+        let estimate = DialEstimate::default();
+        estimate.record(ms(2000));
+        assert_eq!(estimate.get(), Some(ms(2000)), "the first dial seeds it");
+        estimate.record(ms(400));
+        assert_eq!(estimate.get(), Some(ms(1600)));
+        for _ in 0..20 {
+            estimate.record(ms(10));
+        }
+        let settled = estimate.get().unwrap();
+        assert!(
+            (ms(10)..ms(20)).contains(&settled),
+            "slow early dials decay: {settled:?}"
+        );
+        estimate.record(ms(1010));
+        assert_eq!(
+            estimate.get(),
+            Some((settled * 3 + ms(1010)) / 4),
+            "one outlier moves it a quarter of the way"
+        );
+
+        let estimate = DialEstimate::default();
+        estimate.record(Duration::MAX);
+        assert_eq!(estimate.get(), Some(Duration::from_nanos(u64::MAX)));
+        estimate.record(Duration::MAX);
+        assert_eq!(estimate.get(), Some(Duration::from_nanos(u64::MAX)));
+    }
+
+    #[test]
+    fn stalled_dials_are_blamed_once_slow_early_dials_decay() {
+        use crate::error::ErrorKind;
+        use crate::pool::{probe_timeout_kind, DialEstimate, Occupancy};
+        let ms = Duration::from_millis;
+        let full = Occupancy {
+            borrowed: 2,
+            max_size: 2,
+            permits_in_use: 3,
+            permits_dialing: 1,
+            permits_max: 4,
+            oldest_dial: Some(ms(250)),
+            recent_dial: None,
+            connect_errors: 0,
+        };
+        let estimate = DialEstimate::default();
+        estimate.record(ms(3000));
+        let after_slow_dial = Occupancy {
+            recent_dial: estimate.get(),
+            ..full
+        };
+        assert_eq!(
+            probe_timeout_kind(&full, &after_slow_dial, ms(400)),
+            ErrorKind::AcquireTimeout,
+            "a 250ms dial is not stalled for an endpoint that just took 3s"
+        );
+        for _ in 0..16 {
+            estimate.record(ms(20));
+        }
+        let after_fast_dials = Occupancy {
+            recent_dial: estimate.get(),
+            ..full
+        };
+        assert_eq!(
+            probe_timeout_kind(&full, &after_fast_dials, ms(400)),
+            ErrorKind::Transport,
+            "{after_fast_dials}"
+        );
     }
 
     #[test]
