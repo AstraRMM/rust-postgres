@@ -557,6 +557,77 @@ async fn probe_blames_a_limiter_full_of_stalled_dials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_threshold_excludes_permit_waits() {
+    for e in engines() {
+        let app = format!("pt_probe_permit_wait_{}", e.name);
+        let limiter = ConnectionLimiter::new(2);
+        let mut sibling_config = pool_config(&format!("{app}_sibling"));
+        sibling_config.max_size = 2;
+        let sibling = Pool::with_limiter(
+            e.config(),
+            NoTls,
+            sibling_config,
+            limiter.clone(),
+            "sibling",
+        )
+        .unwrap();
+        let mut first = sibling.get().await.unwrap();
+        let mut second = sibling.get().await.unwrap();
+        assert_eq!(limiter.in_use(), 2);
+
+        let (addr, wire) = proxy(e.addr).await;
+        let mut config = pool_config(&app);
+        config.max_size = 2;
+        let pool = Pool::with_limiter(e.config_at(addr), NoTls, config, limiter.clone(), "probed")
+            .unwrap();
+        let checkout = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.get_within(Duration::from_secs(10)).await })
+        };
+        assert!(
+            eventually(Duration::from_secs(5), || {
+                let state = pool.state();
+                state.waiting == 1 && state.opening == 1
+            })
+            .await
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        second.mark_session_dirty();
+        drop(second);
+        let held = checkout.await.unwrap().unwrap();
+        let stats = pool.state().stats;
+        assert_eq!(stats.connects, 1);
+        assert!(
+            stats.connect_time >= Duration::from_secs(3),
+            "connect_time still counts the permit wait: {stats:?}"
+        );
+        assert_eq!(limiter.in_use(), 2);
+
+        wire.freeze.store(true, Ordering::SeqCst);
+        let probe = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.probe(Duration::from_millis(2500)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first.mark_session_dirty();
+        drop(first);
+        let err = probe.await.unwrap().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Transport,
+            "saturated when the wait began, then the pool's own dial stalled: {err}"
+        );
+        assert!(err.to_string().contains("recent dial"), "{err}");
+        println!("[{}] permit-wait probe: {err}", e.name);
+
+        wire.freeze.store(false, Ordering::SeqCst);
+        drop(held);
+        pool.shutdown(Duration::from_secs(1)).await;
+        sibling.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prometheus_export_is_grouped_and_bounded() {
     let addr = stall_listener().await;
     let a = Pool::new(unused_config(addr), NoTls, PoolConfig::default()).unwrap();
