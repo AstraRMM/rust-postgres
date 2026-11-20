@@ -1185,10 +1185,10 @@ impl<T: PoolTls> Pool<T> {
     ///
     /// * one of this pool's dials was still in flight at the deadline after
     ///   running for at least half the wait, or for twice the pool's recent
-    ///   dial time if that is longer (half the wait alone until the pool has
-    ///   dialed once). The recent dial time is a moving average of this
-    ///   pool's successful dials, each timed from when it held its permits,
-    ///   so waits for permits do not count;
+    ///   dial time if that is longer (half the wait alone until one of the
+    ///   pool's dials has succeeded). The recent dial time is a moving
+    ///   average of this pool's successful dials, each timed from when it
+    ///   held its permits, so waits for permits do not count;
     /// * one of this pool's dials failed during the wait;
     /// * the pool had room both when the wait began and at the deadline:
     ///   fewer than `max_size` clients borrowed, and process-wide permits

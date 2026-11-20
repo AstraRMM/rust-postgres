@@ -584,6 +584,13 @@ async fn probe_threshold_excludes_permit_waits() {
             let pool = pool.clone();
             tokio::spawn(async move { pool.get_within(Duration::from_secs(10)).await })
         };
+        assert!(
+            eventually(Duration::from_secs(5), || {
+                let state = pool.state();
+                state.waiting == 1 && state.opening == 1
+            })
+            .await
+        );
         tokio::time::sleep(Duration::from_secs(3)).await;
         second.mark_session_dirty();
         drop(second);
