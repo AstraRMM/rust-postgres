@@ -165,11 +165,13 @@ impl EndpointPolicy {
         identity: &str,
         endpoint: NodeEndpoint,
     ) -> Result<EndpointPolicy, EndpointPolicyError> {
-        let identity = normalize_identity(identity)
-            .ok_or(EndpointPolicyError("node identity must be a hostname or IP address"))?;
+        let identity = normalize_identity(identity).ok_or(EndpointPolicyError(
+            "node identity must be a hostname or IP address",
+        ))?;
         if let Some(dial) = &endpoint.dial {
-            normalize_identity(dial)
-                .ok_or(EndpointPolicyError("dial address must be a hostname or IP address"))?;
+            normalize_identity(dial).ok_or(EndpointPolicyError(
+                "dial address must be a hostname or IP address",
+            ))?;
         }
         if let Some(name) = &endpoint.tls_name {
             if !is_valid_tls_name(name) {
@@ -275,7 +277,10 @@ impl ResolvedEndpoint {
         }
         Some(ResolvedEndpoint {
             identity: identity.to_string(),
-            dial: endpoint.dial.clone().unwrap_or_else(|| identity.to_string()),
+            dial: endpoint
+                .dial
+                .clone()
+                .unwrap_or_else(|| identity.to_string()),
             tls_name: endpoint
                 .tls_name
                 .clone()

@@ -54,7 +54,15 @@ fn leaf(
     client: bool,
     validity: (OffsetDateTime, OffsetDateTime),
 ) -> (Certificate, KeyPair) {
-    leaf_with_key(issuer, cn, sans, serial, client, validity, KeyPair::generate().unwrap())
+    leaf_with_key(
+        issuer,
+        cn,
+        sans,
+        serial,
+        client,
+        validity,
+        KeyPair::generate().unwrap(),
+    )
 }
 
 fn leaf_with_key(
@@ -118,22 +126,52 @@ fn main() {
         &format!("{}{}", ca_a.cert.pem(), ca_a2.cert.pem()),
     );
 
-    let pg_sans = [San::Dns("localhost"), San::Dns("pg.test"), San::Ip("127.0.0.1")];
-    write_pair(&dir, "server-valid", &leaf(&ca_a, "pg.test", &pg_sans, 1001, false, current));
-    write_pair(&dir, "server-expired", &leaf(&ca_a, "pg.test", &pg_sans, 1002, false, expired));
-    write_pair(&dir, "server-rotated", &leaf(&ca_a2, "pg.test", &pg_sans, 2001, false, current));
+    let pg_sans = [
+        San::Dns("localhost"),
+        San::Dns("pg.test"),
+        San::Ip("127.0.0.1"),
+    ];
+    write_pair(
+        &dir,
+        "server-valid",
+        &leaf(&ca_a, "pg.test", &pg_sans, 1001, false, current),
+    );
+    write_pair(
+        &dir,
+        "server-expired",
+        &leaf(&ca_a, "pg.test", &pg_sans, 1002, false, expired),
+    );
+    write_pair(
+        &dir,
+        "server-rotated",
+        &leaf(&ca_a2, "pg.test", &pg_sans, 2001, false, current),
+    );
 
     // YugabyteDB realm A advertises 127.0.0.2 and has an IP SAN for it.
     write_pair(
         &dir,
         "yb-a",
-        &leaf(&ca_a, "yb-a.test", &[San::Dns("yb-a.test"), San::Ip("127.0.0.2")], 3001, false, current),
+        &leaf(
+            &ca_a,
+            "yb-a.test",
+            &[San::Dns("yb-a.test"), San::Ip("127.0.0.2")],
+            3001,
+            false,
+            current,
+        ),
     );
     // Realm B advertises 127.0.0.3 but its certificate only names yb-b.test.
     write_pair(
         &dir,
         "yb-b",
-        &leaf(&ca_a, "yb-b.test", &[San::Dns("yb-b.test")], 3002, false, current),
+        &leaf(
+            &ca_a,
+            "yb-b.test",
+            &[San::Dns("yb-b.test")],
+            3002,
+            false,
+            current,
+        ),
     );
 
     // An all-RSA chain: RSA CA, RSA leaves signed with sha256WithRSAEncryption.
@@ -142,7 +180,15 @@ fn main() {
     write_pair(
         &dir,
         "server-rsa",
-        &leaf_with_key(&ca_rsa, "pg.test", &pg_sans, 5001, false, current, rsa_key()),
+        &leaf_with_key(
+            &ca_rsa,
+            "pg.test",
+            &pg_sans,
+            5001,
+            false,
+            current,
+            rsa_key(),
+        ),
     );
     // YugabyteDB universe C advertises 127.0.0.4 and serves an RSA certificate.
     write_pair(
@@ -173,26 +219,69 @@ fn main() {
         ),
     );
 
-    write_pair(&dir, "client-postgres", &leaf(&ca_a, "postgres", &[], 4001, true, current));
-    write_pair(&dir, "client-wrong-ca", &leaf(&ca_b, "postgres", &[], 4002, true, current));
-    write_pair(&dir, "client-expired", &leaf(&ca_a, "postgres", &[], 4003, true, expired));
+    write_pair(
+        &dir,
+        "client-postgres",
+        &leaf(&ca_a, "postgres", &[], 4001, true, current),
+    );
+    write_pair(
+        &dir,
+        "client-wrong-ca",
+        &leaf(&ca_b, "postgres", &[], 4002, true, current),
+    );
+    write_pair(
+        &dir,
+        "client-expired",
+        &leaf(&ca_a, "postgres", &[], 4003, true, expired),
+    );
     // A key that matches no certificate.
-    write(&dir, "unrelated.key", &KeyPair::generate().unwrap().serialize_pem());
+    write(
+        &dir,
+        "unrelated.key",
+        &KeyPair::generate().unwrap().serialize_pem(),
+    );
 
     let (this_update, next_update) = (date_time_ymd(2025, 1, 1), date_time_ymd(2035, 1, 1));
     let crl_pem = |issuer: &Ca, number: u64, next_update: OffsetDateTime, revoked: &[u64]| {
         // thisUpdate must precede nextUpdate; the stale CRL is issued earlier.
-        let this_update = if next_update > this_update { this_update } else { date_time_ymd(2024, 1, 1) };
-        crl(&issuer.cert, &issuer.key, number, this_update, next_update, revoked)
-            .pem()
-            .unwrap()
+        let this_update = if next_update > this_update {
+            this_update
+        } else {
+            date_time_ymd(2024, 1, 1)
+        };
+        crl(
+            &issuer.cert,
+            &issuer.key,
+            number,
+            this_update,
+            next_update,
+            revoked,
+        )
+        .pem()
+        .unwrap()
     };
-    write(&dir, "crl-a-revokes-server-valid.pem", &crl_pem(&ca_a, 1, next_update, &[1001]));
-    write(&dir, "crl-a-empty.pem", &crl_pem(&ca_a, 2, next_update, &[]));
+    write(
+        &dir,
+        "crl-a-revokes-server-valid.pem",
+        &crl_pem(&ca_a, 1, next_update, &[1001]),
+    );
+    write(
+        &dir,
+        "crl-a-empty.pem",
+        &crl_pem(&ca_a, 2, next_update, &[]),
+    );
     // Past its nextUpdate, revoking nothing.
-    write(&dir, "crl-a-expired.pem", &crl_pem(&ca_a, 3, date_time_ymd(2024, 6, 1), &[]));
+    write(
+        &dir,
+        "crl-a-expired.pem",
+        &crl_pem(&ca_a, 3, date_time_ymd(2024, 6, 1), &[]),
+    );
     // nextUpdate from 2050 on is encoded as GeneralizedTime rather than UTCTime.
-    write(&dir, "crl-a-empty-2051.pem", &crl_pem(&ca_a, 4, date_time_ymd(2051, 3, 1), &[]));
+    write(
+        &dir,
+        "crl-a-empty-2051.pem",
+        &crl_pem(&ca_a, 4, date_time_ymd(2051, 3, 1), &[]),
+    );
 
     // A three-level chain: root CA C -> intermediate CA C1 (serial 6001) ->
     // server leaf. The server presents the leaf and the intermediate.
@@ -206,9 +295,21 @@ fn main() {
         &format!("{}{}", chained.0.pem(), int_c1.cert.pem()),
     );
     write(&dir, "server-chained.key", &chained.1.serialize_pem());
-    write(&dir, "crl-c-revokes-int-c1.pem", &crl_pem(&ca_c, 1, next_update, &[6001]));
-    write(&dir, "crl-c-empty.pem", &crl_pem(&ca_c, 2, next_update, &[]));
-    write(&dir, "crl-c1-empty.pem", &crl_pem(&int_c1, 1, next_update, &[]));
+    write(
+        &dir,
+        "crl-c-revokes-int-c1.pem",
+        &crl_pem(&ca_c, 1, next_update, &[6001]),
+    );
+    write(
+        &dir,
+        "crl-c-empty.pem",
+        &crl_pem(&ca_c, 2, next_update, &[]),
+    );
+    write(
+        &dir,
+        "crl-c1-empty.pem",
+        &crl_pem(&int_c1, 1, next_update, &[]),
+    );
 
     println!("fixtures written to {}", dir.display());
 }

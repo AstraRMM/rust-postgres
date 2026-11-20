@@ -20,7 +20,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use yb_tokio_postgres::endpoint::{EndpointPolicy, NodeEndpoint};
 use yb_tokio_postgres::realm::{NodeStanding, Realm};
-use yb_tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsFailureKind, TlsStream};
+use yb_tokio_postgres::tls::{
+    ChannelBinding, MakeTlsConnect, TlsConnect, TlsFailureKind, TlsStream,
+};
 use yb_tokio_postgres::{Client, Config, Error, NoTls, SimpleQueryMessage};
 
 static NEXT_IP: AtomicU8 = AtomicU8::new(10);
@@ -172,10 +174,16 @@ impl Node {
                         Err(_) => return,
                     };
                     let mode = *behaviour.lock().unwrap();
-                    let (cluster, logins, tls_requests, open, ip) =
-                        (cluster.clone(), logins.clone(), tls_requests.clone(), open.clone(), ip.clone());
+                    let (cluster, logins, tls_requests, open, ip) = (
+                        cluster.clone(),
+                        logins.clone(),
+                        tls_requests.clone(),
+                        open.clone(),
+                        ip.clone(),
+                    );
                     tokio::spawn(async move {
-                        let _ = session(socket, mode, &ip, &cluster, &logins, &tls_requests, &open).await;
+                        let _ = session(socket, mode, &ip, &cluster, &logins, &tls_requests, &open)
+                            .await;
                     });
                 }
             })
@@ -267,7 +275,10 @@ fn typeinfo_description() -> Vec<u8> {
 
 /// Splits a NUL-terminated string off the front of a frontend message body.
 fn cstr(body: &[u8]) -> (&[u8], &[u8]) {
-    let end = body.iter().position(|b| *b == 0).expect("NUL-terminated string");
+    let end = body
+        .iter()
+        .position(|b| *b == 0)
+        .expect("NUL-terminated string");
     (&body[..end], &body[end + 1..])
 }
 
@@ -330,10 +341,17 @@ async fn session(
             tokio::time::sleep(Duration::from_secs(3600)).await;
             return Ok(());
         }
-        Behaviour::AuthFail => return error(&mut socket, "28P01", "password authentication failed").await,
+        Behaviour::AuthFail => {
+            return error(&mut socket, "28P01", "password authentication failed").await
+        }
         Behaviour::Busy => return error(&mut socket, "53300", "too many connections").await,
         Behaviour::Shutdown => {
-            return error(&mut socket, "57P01", "terminating connection due to administrator command").await
+            return error(
+                &mut socket,
+                "57P01",
+                "terminating connection due to administrator command",
+            )
+            .await
         }
         Behaviour::AskPassword => {
             message(&mut socket, b'R', &3u32.to_be_bytes()).await?;
@@ -392,7 +410,9 @@ async fn session(
             b'Q' => {
                 let mut row_description = 1u16.to_be_bytes().to_vec();
                 row_description.extend_from_slice(b"node\0");
-                row_description.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255, 0, 0]);
+                row_description.extend_from_slice(&[
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255, 0, 0,
+                ]);
                 message(&mut socket, b'T', &row_description).await?;
                 let discovery = *cluster.discovery.lock().unwrap();
                 if discovery == Discovery::ShortRows {
@@ -420,7 +440,12 @@ async fn session(
                 cluster.discoveries.fetch_add(1, Ordering::SeqCst);
                 let discovery = *cluster.discovery.lock().unwrap();
                 if mode == Behaviour::DiscoveryShutdown {
-                    error(&mut socket, "57P01", "terminating connection due to administrator command").await?;
+                    error(
+                        &mut socket,
+                        "57P01",
+                        "terminating connection due to administrator command",
+                    )
+                    .await?;
                     discard_until_sync = true;
                     continue;
                 }
@@ -447,7 +472,10 @@ async fn session(
                     _ => message(&mut socket, b'1', &[]).await?,
                 }
             }
-            b'D' if typeinfo_statements.iter().any(|name| name[..] == body[1..body.len() - 1]) => {
+            b'D' if typeinfo_statements
+                .iter()
+                .any(|name| name[..] == body[1..body.len() - 1]) =>
+            {
                 let mut parameters = 1u16.to_be_bytes().to_vec();
                 parameters.extend_from_slice(&26u32.to_be_bytes());
                 message(&mut socket, b't', &parameters).await?;
@@ -464,7 +492,11 @@ async fn session(
             b'B' => {
                 let (statement, parameter) = bind_parameter(&body);
                 typeinfo_oid = match parameter {
-                    Some(oid) if typeinfo_statements.iter().any(|name| name[..] == *statement) => {
+                    Some(oid)
+                        if typeinfo_statements
+                            .iter()
+                            .any(|name| name[..] == *statement) =>
+                    {
                         Some(u32::from_be_bytes([oid[0], oid[1], oid[2], oid[3]]))
                     }
                     _ => None,
@@ -510,11 +542,16 @@ async fn session(
                             ..rows[0].clone()
                         };
                         let padding = n - rows.len();
-                        rows.into_iter().chain(std::iter::repeat(pad).take(padding)).collect()
+                        rows.into_iter()
+                            .chain(std::iter::repeat(pad).take(padding))
+                            .collect()
                     }
                     Discovery::LongZone(n) => rows
                         .into_iter()
-                        .map(|row| NodeRow { zone: "z".repeat(n), ..row })
+                        .map(|row| NodeRow {
+                            zone: "z".repeat(n),
+                            ..row
+                        })
                         .collect(),
                     _ => rows,
                 };
@@ -540,7 +577,12 @@ async fn session(
                     )
                     .await?;
                 }
-                message(&mut socket, b'C', format!("SELECT {}\0", rows.len()).as_bytes()).await?;
+                message(
+                    &mut socket,
+                    b'C',
+                    format!("SELECT {}\0", rows.len()).as_bytes(),
+                )
+                .await?;
             }
             b'S' => {
                 discard_until_sync = false;
@@ -569,13 +611,21 @@ struct Passthrough;
 struct PlainStream<S>(S);
 
 impl<S: AsyncRead + Unpin> AsyncRead for PlainStream<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for PlainStream<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
@@ -682,7 +732,10 @@ async fn two_realms_share_no_hosts_counts_failures_or_fallback() {
     ca.publish(&[(&a1, "primary", "z1"), (&a2, "primary", "z1")]);
     cb.publish(&[(&b1, "primary", "z1"), (&b2, "primary", "z1")]);
     let (ra, rb) = (Realm::new("a"), Realm::new("b"));
-    let (conf_a, conf_b) = (config(&a1, "load_balance=true"), config(&b1, "load_balance=true"));
+    let (conf_a, conf_b) = (
+        config(&a1, "load_balance=true"),
+        config(&b1, "load_balance=true"),
+    );
 
     let mut sessions = Vec::new();
     for _ in 0..4 {
@@ -695,7 +748,10 @@ async fn two_realms_share_no_hosts_counts_failures_or_fallback() {
     assert!(rb.connection_counts().keys().all(|k| b_ids.contains(k)));
     assert_eq!((total(&ra), total(&rb)), (4, 4));
     // Balanced within each realm.
-    assert_eq!(ra.connection_counts().values().copied().collect::<Vec<_>>(), vec![2, 2]);
+    assert_eq!(
+        ra.connection_counts().values().copied().collect::<Vec<_>>(),
+        vec![2, 2]
+    );
     for s in &sessions {
         let node = node_of(s).await;
         assert!(a_ids.contains(&node) || b_ids.contains(&node));
@@ -710,10 +766,17 @@ async fn two_realms_share_no_hosts_counts_failures_or_fallback() {
     let e = connect(&conf_a, &ra).await.err().expect("realm A is down");
     assert!(!e.is_security_failure(), "{}", e);
     assert!(e.is_transport(), "{}", e);
-    assert_eq!(b1.logins() + b2.logins(), b_logins, "realm A touched realm B");
+    assert_eq!(
+        b1.logins() + b2.logins(),
+        b_logins,
+        "realm A touched realm B"
+    );
     assert!(rb.failed_nodes().is_empty());
     assert_eq!(total(&ra), 4, "failed attempts must not leak counts");
-    assert_eq!(node_of(&connect(&conf_b, &rb).await.unwrap()).await.len() > 0, true);
+    assert_eq!(
+        node_of(&connect(&conf_b, &rb).await.unwrap()).await.len() > 0,
+        true
+    );
 
     drop(sessions);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -727,10 +790,16 @@ async fn implicit_realms_are_keyed_by_the_whole_trusted_configuration() {
     ca.publish(&[(&a1, "primary", "z1")]);
     cb.publish(&[(&b1, "primary", "z1")]);
     for _ in 0..3 {
-        let (client, connection) = config(&a1, "load_balance=true").connect(NoTls).await.unwrap();
+        let (client, connection) = config(&a1, "load_balance=true")
+            .connect(NoTls)
+            .await
+            .unwrap();
         tokio::spawn(connection);
         assert_eq!(client.node_identity(), Some(a1.ip.as_str()));
-        let (client, connection) = config(&b1, "load_balance=true").connect(NoTls).await.unwrap();
+        let (client, connection) = config(&b1, "load_balance=true")
+            .connect(NoTls)
+            .await
+            .unwrap();
         tokio::spawn(connection);
         assert_eq!(client.node_identity(), Some(b1.ip.as_str()));
     }
@@ -745,26 +814,45 @@ async fn strict_roles_fail_closed_when_exhausted() {
     cluster.publish(&[(&p1, "primary", "z1"), (&p2, "primary", "z1")]);
     let realm = Realm::new("roles");
     let before = p1.logins() + p2.logins();
-    let e = connect(&config(&p1, "load_balance=only-rr"), &realm).await.err().expect("no read replicas");
+    let e = connect(&config(&p1, "load_balance=only-rr"), &realm)
+        .await
+        .err()
+        .expect("no read replicas");
     assert!(e.to_string().contains("eligible"), "{}", e);
     // Only the control connection logged in; no data session reached a primary.
     assert_eq!(p1.logins() + p2.logins() - before, 1);
-    let s = connect(&config(&p1, "load_balance=prefer-rr"), &realm).await.unwrap();
+    let s = connect(&config(&p1, "load_balance=prefer-rr"), &realm)
+        .await
+        .unwrap();
     assert!([p1.ip.clone(), p2.ip.clone()].contains(&node_of(&s).await));
 
     let replicas = Cluster::new("rr");
     let r1 = Node::start(&replicas).await;
     replicas.publish(&[(&r1, "read_replica", "z1")]);
-    connect(&config(&r1, "load_balance=only-primary"), &Realm::new("rr")).await.err().expect("no primaries");
+    connect(&config(&r1, "load_balance=only-primary"), &Realm::new("rr"))
+        .await
+        .err()
+        .expect("no primaries");
 }
 
 #[tokio::test]
 async fn preference_never_escapes_strict_placement() {
     let cluster = Cluster::new("p");
-    let (z1, z2p, z2r) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&z1, "primary", "z1"), (&z2p, "primary", "z2"), (&z2r, "read_replica", "z2")]);
+    let (z1, z2p, z2r) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&z1, "primary", "z1"),
+        (&z2p, "primary", "z2"),
+        (&z2r, "read_replica", "z2"),
+    ]);
     let realm = Realm::new("placement");
-    let strict = config(&z1, "load_balance=prefer-primary topology_keys=qual.p.z2 fallback_to_topology_keys_only=true");
+    let strict = config(
+        &z1,
+        "load_balance=prefer-primary topology_keys=qual.p.z2 fallback_to_topology_keys_only=true",
+    );
     for _ in 0..4 {
         let s = connect(&strict, &realm).await.unwrap();
         assert_eq!(node_of(&s).await, z2p.ip);
@@ -779,7 +867,10 @@ async fn preference_never_escapes_strict_placement() {
     z2r.set(Behaviour::Refuse);
     let z1_logins = z1.logins();
     realm.invalidate_topology();
-    connect(&strict, &realm).await.err().expect("strict placement exhausted");
+    connect(&strict, &realm)
+        .await
+        .err()
+        .expect("strict placement exhausted");
     // z1 served discovery (it is the seed) but never a data session.
     assert!(z1.logins() - z1_logins <= 1);
 }
@@ -816,7 +907,15 @@ async fn node_removal_and_metadata_changes_reconcile_atomically() {
     drop(n2);
     cluster.publish(&[(&n1, "primary", "z1"), (&n2_new, "primary", "z1")]);
     n1.set(Behaviour::Refuse);
-    let s = connect(&config(&n2_new, "load_balance=true yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=0"), &realm).await.unwrap();
+    let s = connect(
+        &config(
+            &n2_new,
+            "load_balance=true yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=0",
+        ),
+        &realm,
+    )
+    .await
+    .unwrap();
     assert_eq!(node_of(&s).await, n2_new.ip);
     // The refused attempt may have quarantined n1; that is correct
     // behaviour, so clear it rather than wait out the reconnect delay.
@@ -827,7 +926,10 @@ async fn node_removal_and_metadata_changes_reconcile_atomically() {
     cluster.publish(&[(&n1, "primary", "z1"), (&n2_new, "read_replica", "z1")]);
     let only_primary = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0 failed_host_reconnect_delay_secs=0");
     for _ in 0..4 {
-        assert_eq!(node_of(&connect(&only_primary, &realm).await.unwrap()).await, n1.ip);
+        assert_eq!(
+            node_of(&connect(&only_primary, &realm).await.unwrap()).await,
+            n1.ip
+        );
     }
 }
 
@@ -841,22 +943,33 @@ async fn empty_and_failed_discovery_use_bounded_staleness() {
     // restricted fails closed.
     cluster.set_discovery(Discovery::Empty);
     let realm = Realm::new("bootstrap");
-    let s = connect(&config(&n1, "load_balance=true"), &realm).await.unwrap();
+    let s = connect(&config(&n1, "load_balance=true"), &realm)
+        .await
+        .unwrap();
     assert_eq!(node_of(&s).await, n1.ip);
-    connect(&config(&n1, "load_balance=only-primary"), &realm).await.err().expect("restricted");
+    connect(&config(&n1, "load_balance=only-primary"), &realm)
+        .await
+        .err()
+        .expect("restricted");
     assert!(realm.topology().is_none());
 
     // A good snapshot, then refresh errors: used while within max staleness.
     cluster.set_discovery(Discovery::Rows);
     let realm = Realm::new("stale");
-    let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0 yb_topology_max_staleness=2");
+    let conf = config(
+        &n1,
+        "load_balance=only-primary yb_servers_refresh_interval=0 yb_topology_max_staleness=2",
+    );
     connect(&conf, &realm).await.unwrap();
     cluster.set_discovery(Discovery::Error);
     n1.set(Behaviour::Refuse);
     let s = connect(&conf, &realm).await.unwrap();
     assert_eq!(node_of(&s).await, n2.ip);
     tokio::time::sleep(Duration::from_millis(2200)).await;
-    connect(&conf, &realm).await.err().expect("snapshot beyond max staleness must not be used");
+    connect(&conf, &realm)
+        .await
+        .err()
+        .expect("snapshot beyond max staleness must not be used");
     assert!(realm.topology().is_none());
 }
 
@@ -887,7 +1000,10 @@ async fn failed_refreshes_coalesce_and_serve_the_stale_snapshot() {
     let n1 = Node::start(&cluster).await;
     cluster.publish(&[(&n1, "primary", "z1")]);
     let realm = Realm::new("coalesce-failure");
-    let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=1");
+    let conf = config(
+        &n1,
+        "load_balance=only-primary yb_servers_refresh_interval=1",
+    );
     let _held = connect(&conf, &realm).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     cluster.set_discovery(Discovery::SlowError(300));
@@ -921,7 +1037,11 @@ async fn discovery_seeds_are_bounded_by_the_attempt_timeout() {
     let started = Instant::now();
     let s = connect(&conf, &Realm::new("seed-bound")).await.unwrap();
     assert_eq!(node_of(&s).await, healthy.ip);
-    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 // ------------------------------------------------ deadlines and cancellation
@@ -929,18 +1049,37 @@ async fn discovery_seeds_are_bounded_by_the_attempt_timeout() {
 #[tokio::test]
 async fn stalled_endpoints_are_bounded_by_attempt_and_acquisition_budgets() {
     let cluster = Cluster::new("t");
-    let (s1, s2, s3) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&s1, "primary", "z1"), (&s2, "primary", "z1"), (&s3, "primary", "z1")]);
+    let (s1, s2, s3) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&s1, "primary", "z1"),
+        (&s2, "primary", "z1"),
+        (&s3, "primary", "z1"),
+    ]);
     let realm = Realm::new("stall");
-    let conf = config(&s1, "load_balance=only-primary yb_attempt_timeout=1 yb_acquire_timeout=4 yb_max_attempts=3");
+    let conf = config(
+        &s1,
+        "load_balance=only-primary yb_attempt_timeout=1 yb_acquire_timeout=4 yb_max_attempts=3",
+    );
     let _first = connect(&conf, &realm).await.unwrap(); // snapshot, held
     for node in [&s1, &s2, &s3] {
         node.set(Behaviour::Stall);
     }
     let started = Instant::now();
-    let e = connect(&conf, &realm).await.err().expect("every node stalls");
+    let e = connect(&conf, &realm)
+        .await
+        .err()
+        .expect("every node stalls");
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_millis(4500), "{:?}: {}", elapsed, e);
+    assert!(
+        elapsed < Duration::from_millis(4500),
+        "{:?}: {}",
+        elapsed,
+        e
+    );
     assert_eq!(total(&realm), 1, "only the first session remains counted");
 
     // A stalled discovery query is bounded by the acquisition budget.
@@ -950,11 +1089,18 @@ async fn stalled_endpoints_are_bounded_by_attempt_and_acquisition_budgets() {
     }
     let stalled = Realm::new("stalled-discovery");
     let started = Instant::now();
-    connect(&config(&s1, "load_balance=only-primary yb_acquire_timeout=2"), &stalled)
-        .await
-        .err()
-        .expect("discovery stalls");
-    assert!(started.elapsed() < Duration::from_millis(2600), "{:?}", started.elapsed());
+    connect(
+        &config(&s1, "load_balance=only-primary yb_acquire_timeout=2"),
+        &stalled,
+    )
+    .await
+    .err()
+    .expect("discovery stalls");
+    assert!(
+        started.elapsed() < Duration::from_millis(2600),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// ASTS-97: an unbounded budget set through the builder is honoured instead
@@ -978,12 +1124,18 @@ async fn unbounded_budgets_do_not_overflow_and_parsed_budgets_are_bounded() {
     tokio::spawn(connection);
     drop(client);
 
-    for key in ["yb_acquire_timeout", "yb_attempt_timeout", "yb_topology_max_staleness"] {
+    for key in [
+        "yb_acquire_timeout",
+        "yb_attempt_timeout",
+        "yb_topology_max_staleness",
+    ] {
         let base = "host=localhost user=test sslmode=disable";
         format!("{} {}=86400", base, key).parse::<Config>().unwrap();
         for bad in ["0", "86401", "18446744073709551615"] {
             assert!(
-                format!("{} {}={}", base, key, bad).parse::<Config>().is_err(),
+                format!("{} {}={}", base, key, bad)
+                    .parse::<Config>()
+                    .is_err(),
                 "{}={} must be rejected",
                 key,
                 bad
@@ -998,21 +1150,35 @@ async fn cancellation_at_every_stage_releases_state() {
     let (n1, n2) = (Node::start(&cluster).await, Node::start(&cluster).await);
     cluster.publish(&[(&n1, "primary", "z1"), (&n2, "primary", "z1")]);
     let realm = Realm::new("cancel");
-    let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0");
+    let conf = config(
+        &n1,
+        "load_balance=only-primary yb_servers_refresh_interval=0",
+    );
 
     // During discovery.
     cluster.set_discovery(Discovery::Stall);
-    assert!(timeout(Duration::from_millis(300), connect(&conf, &realm)).await.is_err());
+    assert!(timeout(Duration::from_millis(300), connect(&conf, &realm))
+        .await
+        .is_err());
     cluster.set_discovery(Discovery::Rows);
     // The refresh gate was released by the cancelled caller.
-    let s = timeout(Duration::from_secs(5), connect(&conf, &realm)).await.unwrap().unwrap();
+    let s = timeout(Duration::from_secs(5), connect(&conf, &realm))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(total(&realm), 1);
 
     // During a data connection.
     n1.set(Behaviour::Stall);
     n2.set(Behaviour::Stall);
-    assert!(timeout(Duration::from_millis(500), connect(&conf, &realm)).await.is_err());
-    assert_eq!(total(&realm), 1, "a cancelled attempt must release its reservation");
+    assert!(timeout(Duration::from_millis(500), connect(&conf, &realm))
+        .await
+        .is_err());
+    assert_eq!(
+        total(&realm),
+        1,
+        "a cancelled attempt must release its reservation"
+    );
     drop(s);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(total(&realm), 0);
@@ -1021,10 +1187,21 @@ async fn cancellation_at_every_stage_releases_state() {
 #[tokio::test]
 async fn all_candidates_failing_quarantines_and_keeps_counts_exact() {
     let cluster = Cluster::new("f");
-    let (n1, n2, n3) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&n1, "primary", "z1"), (&n2, "primary", "z1"), (&n3, "primary", "z1")]);
+    let (n1, n2, n3) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&n1, "primary", "z1"),
+        (&n2, "primary", "z1"),
+        (&n3, "primary", "z1"),
+    ]);
     let realm = Realm::new("failing");
-    let conf = config(&n1, "load_balance=only-primary failed_host_reconnect_delay_secs=60");
+    let conf = config(
+        &n1,
+        "load_balance=only-primary failed_host_reconnect_delay_secs=60",
+    );
     let mut held = Vec::new();
     for _ in 0..3 {
         held.push(connect(&conf, &realm).await.unwrap());
@@ -1050,7 +1227,10 @@ async fn all_candidates_failing_quarantines_and_keeps_counts_exact() {
     expected.sort();
     assert_eq!(failed, expected);
     n1.set(Behaviour::Refuse);
-    connect(&conf, &realm).await.err().expect("all candidates fail");
+    connect(&conf, &realm)
+        .await
+        .err()
+        .expect("all candidates fail");
     assert_eq!(total(&realm), 3);
     held.truncate(1);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1083,13 +1263,23 @@ async fn authentication_failure_is_terminal_and_not_a_quarantine() {
     n1.set(Behaviour::AuthFail);
     n2.set(Behaviour::AuthFail);
     let before = n1.logins() + n2.logins();
-    let e = connect(&conf, &realm).await.err().expect("authentication fails");
+    let e = connect(&conf, &realm)
+        .await
+        .err()
+        .expect("authentication fails");
     assert!(e.is_security_failure(), "{}", e);
     assert!(!e.is_transport(), "{}", e);
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"));
-    assert_eq!(n1.logins() + n2.logins() - before, 1, "no second endpoint may be tried");
+    assert_eq!(
+        n1.logins() + n2.logins() - before,
+        1,
+        "no second endpoint may be tried"
+    );
     assert!(realm.failed_nodes().is_empty());
-    assert!(realm.penalized_nodes().is_empty(), "a credential failure is not the node's fault");
+    assert!(
+        realm.penalized_nodes().is_empty(),
+        "a credential failure is not the node's fault"
+    );
 }
 
 /// ASTS-86: one node whose TLS endpoint fails (here: it refuses TLS) is
@@ -1098,35 +1288,67 @@ async fn authentication_failure_is_terminal_and_not_a_quarantine() {
 #[tokio::test]
 async fn one_node_failing_tls_is_penalised_and_the_next_node_serves() {
     let cluster = Cluster::new("tls");
-    let (n1, bad, n3) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&n1, "primary", "z1"), (&bad, "primary", "z1"), (&n3, "primary", "z1")]);
+    let (n1, bad, n3) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&n1, "primary", "z1"),
+        (&bad, "primary", "z1"),
+        (&n3, "primary", "z1"),
+    ]);
     bad.set(Behaviour::RefuseTls);
     let realm = Realm::new("tls-one-bad");
-    let conf = tls_config(&n1, "load_balance=only-primary failed_host_reconnect_delay_secs=60");
+    let conf = tls_config(
+        &n1,
+        "load_balance=only-primary failed_host_reconnect_delay_secs=60",
+    );
 
     // Held sessions raise the healthy nodes' load, so the bad node (always
     // at zero) is first in line until it is penalised.
     let mut held = Vec::new();
     for _ in 0..6 {
-        let s = connect_tls(&conf, Some(&realm)).await.expect("a healthy node serves");
+        let s = connect_tls(&conf, Some(&realm))
+            .await
+            .expect("a healthy node serves");
         let node = node_of_client(&s.client).await;
         assert!(node == n1.ip || node == n3.ip, "{}", node);
         held.push(s);
     }
-    assert_eq!(bad.logins(), 0, "no credentials reach a node that failed TLS");
-    assert_eq!(bad.tls_requests(), 1, "the penalty keeps the bad node out of the way");
+    assert_eq!(
+        bad.logins(),
+        0,
+        "no credentials reach a node that failed TLS"
+    );
+    assert_eq!(
+        bad.tls_requests(),
+        1,
+        "the penalty keeps the bad node out of the way"
+    );
     assert_eq!(realm.penalized_nodes(), vec![bad.ip.clone()]);
     assert_eq!(realm.penalty_count(), 1);
-    assert!(realm.failed_nodes().is_empty(), "a TLS failure is not a transport quarantine");
+    assert!(
+        realm.failed_nodes().is_empty(),
+        "a TLS failure is not a transport quarantine"
+    );
     assert_eq!(total(&realm), 6);
 
     // Every candidate fails: the healthy ones by transport, the bad one by
     // TLS. The penalised node is still tried, and its TLS error is returned.
     n1.set(Behaviour::Refuse);
     n3.set(Behaviour::Refuse);
-    let e = connect_tls(&conf, Some(&realm)).await.err().expect("every node fails");
+    let e = connect_tls(&conf, Some(&realm))
+        .await
+        .err()
+        .expect("every node fails");
     assert!(e.is_security_failure(), "{}", e);
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(bad.tls_requests(), 2);
     assert_eq!(bad.logins(), 0);
     assert_eq!(total(&realm), 6, "failed attempts must not leak counts");
@@ -1148,21 +1370,43 @@ async fn seed_tls_failure_refreshes_through_known_nodes() {
     n1.set(Behaviour::RefuseTls);
     let (before, n1_logins, n1_tls) = (realm.discovery_count(), n1.logins(), n1.tls_requests());
     for _ in 0..4 {
-        let s = connect_tls(&conf, Some(&realm)).await.expect("n2 serves discovery and the session");
+        let s = connect_tls(&conf, Some(&realm))
+            .await
+            .expect("n2 serves discovery and the session");
         assert_eq!(node_of_client(&s.client).await, n2.ip);
     }
-    assert_eq!(realm.discovery_count() - before, 4, "every acquisition refreshed through n2");
-    assert_eq!(n1.logins(), n1_logins, "no credentials reach a node that failed TLS");
+    assert_eq!(
+        realm.discovery_count() - before,
+        4,
+        "every acquisition refreshed through n2"
+    );
+    assert_eq!(
+        n1.logins(),
+        n1_logins,
+        "no credentials reach a node that failed TLS"
+    );
     // The first refresh penalises the seed; later refreshes defer it behind
     // the known nodes instead of repeating its handshake every time.
-    assert_eq!(n1.tls_requests() - n1_tls, 1, "the penalised seed is not re-handshaked");
+    assert_eq!(
+        n1.tls_requests() - n1_tls,
+        1,
+        "the penalised seed is not re-handshaked"
+    );
     assert_eq!(realm.penalized_nodes(), vec![n1.ip.clone()]);
     assert!(realm.failed_nodes().is_empty());
 
     // A deferred seed is still tried, last, when no known node serves.
     n2.set(Behaviour::Refuse);
-    let e = connect_tls(&conf, Some(&realm)).await.err().expect("no node serves");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&conf, Some(&realm))
+        .await
+        .err()
+        .expect("no node serves");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(n1.tls_requests() - n1_tls, 2);
 }
 
@@ -1188,10 +1432,27 @@ async fn a_failing_seed_is_penalised_under_its_listed_address() {
         let s = connect_tls(&conf, Some(&realm)).await.expect("n2 serves");
         assert_eq!(node_of_client(&s.client).await, n2.ip);
     }
-    assert_eq!(n1.tls_requests() - n1_tls, 1, "neither discovery nor selection retries the seed");
-    assert!(realm.penalized_nodes().contains(&n1.ip), "{:?}", realm.penalized_nodes());
-    assert!(realm.penalized_nodes().contains(&"seed.example".to_string()), "names match in any case");
-    assert_eq!(realm.penalty_count(), 1, "one failure, counted once for both identities");
+    assert_eq!(
+        n1.tls_requests() - n1_tls,
+        1,
+        "neither discovery nor selection retries the seed"
+    );
+    assert!(
+        realm.penalized_nodes().contains(&n1.ip),
+        "{:?}",
+        realm.penalized_nodes()
+    );
+    assert!(
+        realm
+            .penalized_nodes()
+            .contains(&"seed.example".to_string()),
+        "names match in any case"
+    );
+    assert_eq!(
+        realm.penalty_count(),
+        1,
+        "one failure, counted once for both identities"
+    );
 }
 
 /// ASTS-86: a seed configured by name only is also penalised under the
@@ -1217,17 +1478,37 @@ async fn a_failing_dns_seed_is_penalised_under_its_resolved_address() {
         let s = connect_tls(&conf, Some(&realm)).await.expect("n2 serves");
         assert_eq!(node_of_client(&s.client).await, n2.ip);
     }
-    assert_eq!(seed.tls_requests() - before, 1, "the seed is not retried under its address");
+    assert_eq!(
+        seed.tls_requests() - before,
+        1,
+        "the seed is not retried under its address"
+    );
     let penalized = realm.penalized_nodes();
-    assert!(penalized.contains(&"localhost".to_string()), "{:?}", penalized);
-    assert!(penalized.contains(&"127.0.0.1".to_string()), "{:?}", penalized);
+    assert!(
+        penalized.contains(&"localhost".to_string()),
+        "{:?}",
+        penalized
+    );
+    assert!(
+        penalized.contains(&"127.0.0.1".to_string()),
+        "{:?}",
+        penalized
+    );
 
     // With no other node serving, the address is tried once more as a known
     // node (it is verified under another name than the seed) and the seed
     // once more by the last seed pass.
     n2.set(Behaviour::Refuse);
-    let e = connect_tls(&conf, Some(&realm)).await.err().expect("no node serves");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&conf, Some(&realm))
+        .await
+        .err()
+        .expect("no node serves");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(seed.tls_requests() - before, 3);
 }
 
@@ -1247,8 +1528,13 @@ async fn a_known_node_on_another_port_than_its_seed_is_still_tried() {
     let _first = connect_tls(&conf, Some(&realm)).await.unwrap();
     seed.set(Behaviour::RefuseTls);
     let before = other.logins();
-    connect_tls(&conf, Some(&realm)).await.expect("the known node on the other port serves");
-    assert!(other.logins() - before >= 2, "discovery and the session reached it");
+    connect_tls(&conf, Some(&realm))
+        .await
+        .expect("the known node on the other port serves");
+    assert!(
+        other.logins() - before >= 2,
+        "discovery and the session reached it"
+    );
 }
 
 /// ASTS-86: when the first seed connects but its topology query fails, a
@@ -1269,8 +1555,15 @@ async fn an_untried_seed_still_serves_refresh_as_a_known_node() {
     let _first = connect(&conf, &realm).await.unwrap();
     s1.set(Behaviour::DiscoveryShutdown);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let info = realm.refresh(NoTls, &conf).await.expect("s2 serves the refresh");
-    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
+    let info = realm
+        .refresh(NoTls, &conf)
+        .await
+        .expect("s2 serves the refresh");
+    assert!(
+        info.age() < Duration::from_millis(250),
+        "a fresh snapshot, not the stale one: {:?}",
+        info.age()
+    );
 }
 
 /// ASTS-86: with one seed penalised and the other down, refresh tries the
@@ -1278,8 +1571,16 @@ async fn an_untried_seed_still_serves_refresh_as_a_known_node() {
 #[tokio::test]
 async fn a_penalised_seed_waits_for_the_known_nodes() {
     let cluster = Cluster::new("partial");
-    let (s1, s2, n3) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&s1, "primary", "z1"), (&s2, "primary", "z1"), (&n3, "primary", "z1")]);
+    let (s1, s2, n3) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&s1, "primary", "z1"),
+        (&s2, "primary", "z1"),
+        (&n3, "primary", "z1"),
+    ]);
     let realm = Realm::new("partial");
     let conf: Config = format!(
         "host={},{} port={},{} user=test dbname=test sslmode=require connect_timeout=2 \
@@ -1296,7 +1597,11 @@ async fn a_penalised_seed_waits_for_the_known_nodes() {
         let s = connect_tls(&conf, Some(&realm)).await.expect("n3 serves");
         assert_eq!(node_of_client(&s.client).await, n3.ip);
     }
-    assert_eq!(s1.tls_requests() - before, 1, "the penalised seed is not retried before n3");
+    assert_eq!(
+        s1.tls_requests() - before,
+        1,
+        "the penalised seed is not retried before n3"
+    );
 }
 
 /// ASTS-86: an earlier seed's TLS error outranks a later seed's failed
@@ -1314,14 +1619,25 @@ async fn a_seed_tls_error_outranks_a_later_seeds_query_failure() {
     )
     .parse()
     .unwrap();
-    let e = connect_tls(&conf, Some(&Realm::new("query-rank"))).await.err().expect("discovery fails");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&conf, Some(&Realm::new("query-rank")))
+        .await
+        .err()
+        .expect("discovery fails");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(query.logins(), 1, "the later seed was reached");
 
     // A credential failure of the later seed's query is not hidden by the
     // earlier seed's TLS error.
     query.set(Behaviour::DiscoveryDenied);
-    let e = connect_tls(&conf, Some(&Realm::new("query-denied"))).await.err().expect("discovery fails");
+    let e = connect_tls(&conf, Some(&Realm::new("query-denied")))
+        .await
+        .err()
+        .expect("discovery fails");
     assert_eq!(e.code().map(|c| c.code()), Some("28000"), "{}", e);
 }
 
@@ -1334,8 +1650,14 @@ async fn a_short_delay_does_not_clear_another_configurations_penalty() {
     cluster.publish(&[(&n1, "primary", "z1"), (&bad, "primary", "z1")]);
     bad.set(Behaviour::RefuseTls);
     let realm = Realm::new("delays");
-    let long = tls_config(&n1, "load_balance=only-primary failed_host_reconnect_delay_secs=60");
-    let mut short = tls_config(&n1, "load_balance=only-primary yb_servers_refresh_interval=0");
+    let long = tls_config(
+        &n1,
+        "load_balance=only-primary failed_host_reconnect_delay_secs=60",
+    );
+    let mut short = tls_config(
+        &n1,
+        "load_balance=only-primary yb_servers_refresh_interval=0",
+    );
     short.failed_host_reconnect_delay_secs(Duration::from_millis(100));
 
     // Held sessions keep the healthy node busier, so only the penalty keeps
@@ -1346,11 +1668,18 @@ async fn a_short_delay_does_not_clear_another_configurations_penalty() {
     }
     assert_eq!(bad.tls_requests(), 1);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    realm.refresh(Passthrough, &short).await.expect("the seed serves a refresh");
+    realm
+        .refresh(Passthrough, &short)
+        .await
+        .expect("the seed serves a refresh");
     for _ in 0..2 {
         held.push(connect_tls(&long, Some(&realm)).await.expect("n1 serves"));
     }
-    assert_eq!(bad.tls_requests(), 1, "the 60 s penalty survives the short configuration");
+    assert_eq!(
+        bad.tls_requests(),
+        1,
+        "the 60 s penalty survives the short configuration"
+    );
 }
 
 /// ASTS-86: the unrestricted seed fallback penalises a seed whose TLS
@@ -1358,7 +1687,11 @@ async fn a_short_delay_does_not_clear_another_configurations_penalty() {
 #[tokio::test]
 async fn seed_fallback_penalises_and_defers_a_failing_seed() {
     let cluster = Cluster::new("fallback-tls");
-    let (s1, s2, n3) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
+    let (s1, s2, n3) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
     cluster.publish(&[(&n3, "primary", "z1")]);
     let realm = Realm::new("fallback-tls");
     let conf: Config = format!(
@@ -1374,12 +1707,26 @@ async fn seed_fallback_penalises_and_defers_a_failing_seed() {
     s1.set(Behaviour::RefuseTls);
     let s1_tls = s1.tls_requests();
     for _ in 0..3 {
-        let s = connect_tls(&conf, Some(&realm)).await.expect("the second seed serves");
+        let s = connect_tls(&conf, Some(&realm))
+            .await
+            .expect("the second seed serves");
         assert_eq!(node_of_client(&s.client).await, s2.ip);
     }
-    assert_eq!(s1.tls_requests() - s1_tls, 1, "the penalised seed goes after the other seed");
-    assert!(realm.penalized_nodes().contains(&s1.ip), "{:?}", realm.penalized_nodes());
-    assert_eq!(s1.logins(), 1, "only the initial discovery logged in to the seed");
+    assert_eq!(
+        s1.tls_requests() - s1_tls,
+        1,
+        "the penalised seed goes after the other seed"
+    );
+    assert!(
+        realm.penalized_nodes().contains(&s1.ip),
+        "{:?}",
+        realm.penalized_nodes()
+    );
+    assert_eq!(
+        s1.logins(),
+        1,
+        "only the initial discovery logged in to the seed"
+    );
 }
 
 /// ASTS-86: a node whose topology query fails with a node-health SQLSTATE
@@ -1388,8 +1735,16 @@ async fn seed_fallback_penalises_and_defers_a_failing_seed() {
 #[tokio::test]
 async fn node_scoped_topology_query_failures_penalise_the_node() {
     let cluster = Cluster::new("query");
-    let (n1, a, b) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
-    cluster.publish(&[(&n1, "primary", "z1"), (&a, "primary", "z1"), (&b, "primary", "z1")]);
+    let (n1, a, b) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
+    cluster.publish(&[
+        (&n1, "primary", "z1"),
+        (&a, "primary", "z1"),
+        (&b, "primary", "z1"),
+    ]);
     let realm = Realm::new("query");
     let conf = config(
         &n1,
@@ -1403,7 +1758,11 @@ async fn node_scoped_topology_query_failures_penalise_the_node() {
     for _ in 0..3 {
         connect(&conf, &realm).await.expect("a known node serves");
     }
-    assert_eq!(n1.logins() - n1_logins, 1, "the seed's failing query is not repeated");
+    assert_eq!(
+        n1.logins() - n1_logins,
+        1,
+        "the seed's failing query is not repeated"
+    );
     assert!(realm.penalized_nodes().contains(&n1.ip));
 
     // A known node: the one tried first is penalised and then ordered last.
@@ -1411,10 +1770,16 @@ async fn node_scoped_topology_query_failures_penalise_the_node() {
     bad.set(Behaviour::DiscoveryShutdown);
     let bad_logins = bad.logins();
     for _ in 0..3 {
-        let s = connect(&conf, &realm).await.expect("the other known node serves");
+        let s = connect(&conf, &realm)
+            .await
+            .expect("the other known node serves");
         assert_eq!(node_of(&s).await, good.ip);
     }
-    assert_eq!(bad.logins() - bad_logins, 1, "the failing node's query is not repeated first");
+    assert_eq!(
+        bad.logins() - bad_logins,
+        1,
+        "the failing node's query is not repeated first"
+    );
     assert!(realm.penalized_nodes().contains(&bad.ip));
 }
 
@@ -1438,17 +1803,41 @@ async fn tls_error_survives_a_later_seed_that_exhausts_the_budget() {
 
     // Direct connection (`load_balance=false`).
     let started = Instant::now();
-    let e = connect_tls(&seeds("false"), None).await.err().expect("no seed serves");
-    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&seeds("false"), None)
+        .await
+        .err()
+        .expect("no seed serves");
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(stall.logins(), 1, "the stalled seed was reached");
 
     // Topology discovery through the same seeds.
     let realm = Realm::new("seed-stall");
     let started = Instant::now();
-    let e = connect_tls(&seeds("true"), Some(&realm)).await.err().expect("discovery fails");
-    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&seeds("true"), Some(&realm))
+        .await
+        .err()
+        .expect("discovery fails");
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
     assert_eq!(stall.logins(), 2);
     assert_eq!(realm.penalized_nodes(), vec![bad.ip.clone()]);
 }
@@ -1466,14 +1855,25 @@ async fn client_configuration_error_outranks_a_seed_tls_error() {
     let seeds = |nodes: &[&Node]| -> Config {
         format!(
             "host={} port={} user=test dbname=test sslmode=require load_balance=false",
-            nodes.iter().map(|n| n.ip.clone()).collect::<Vec<_>>().join(","),
-            nodes.iter().map(|n| n.port.to_string()).collect::<Vec<_>>().join(",")
+            nodes
+                .iter()
+                .map(|n| n.ip.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            nodes
+                .iter()
+                .map(|n| n.port.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         )
         .parse()
         .unwrap()
     };
     for order in [[&bad, &asks], [&asks, &bad]] {
-        let e = connect_tls(&seeds(&order), None).await.err().expect("no seed serves");
+        let e = connect_tls(&seeds(&order), None)
+            .await
+            .err()
+            .expect("no seed serves");
         assert!(!e.is_security_failure(), "{}", e);
         assert!(e.tls_failure().is_none(), "{}", e);
         assert!(e.to_string().contains("password missing"), "{}", e);
@@ -1490,8 +1890,14 @@ async fn node_health_errors_penalise_and_move_on() {
     let (n1, n2) = (Node::start(&cluster).await, Node::start(&cluster).await);
     cluster.publish(&[(&n1, "primary", "z1"), (&n2, "primary", "z1")]);
     let realm = Realm::new("health");
-    let conf = config(&n1, "load_balance=only-primary failed_host_reconnect_delay_secs=60");
-    let mut held = vec![connect(&conf, &realm).await.unwrap(), connect(&conf, &realm).await.unwrap()];
+    let conf = config(
+        &n1,
+        "load_balance=only-primary failed_host_reconnect_delay_secs=60",
+    );
+    let mut held = vec![
+        connect(&conf, &realm).await.unwrap(),
+        connect(&conf, &realm).await.unwrap(),
+    ];
     n2.set(Behaviour::Shutdown);
     for _ in 0..4 {
         let s = connect(&conf, &realm).await.unwrap();
@@ -1508,33 +1914,62 @@ async fn node_health_errors_penalise_and_move_on() {
 #[tokio::test]
 async fn seed_tls_failure_moves_to_the_next_seed_but_credentials_do_not() {
     let cluster = Cluster::new("seed-tls");
-    let (bad, good, down) = (Node::start(&cluster).await, Node::start(&cluster).await, Node::start(&cluster).await);
+    let (bad, good, down) = (
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+        Node::start(&cluster).await,
+    );
     cluster.publish(&[(&good, "primary", "z1")]);
     bad.set(Behaviour::RefuseTls);
     down.set(Behaviour::Refuse);
     let seeds = |nodes: &[&Node]| -> Config {
         format!(
             "host={} port={} user=test dbname=test sslmode=require load_balance=false",
-            nodes.iter().map(|n| n.ip.clone()).collect::<Vec<_>>().join(","),
-            nodes.iter().map(|n| n.port.to_string()).collect::<Vec<_>>().join(",")
+            nodes
+                .iter()
+                .map(|n| n.ip.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            nodes
+                .iter()
+                .map(|n| n.port.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         )
         .parse()
         .unwrap()
     };
 
-    let s = connect_tls(&seeds(&[&bad, &good]), None).await.expect("the second seed serves");
+    let s = connect_tls(&seeds(&[&bad, &good]), None)
+        .await
+        .expect("the second seed serves");
     assert_eq!(node_of_client(&s.client).await, good.ip);
     assert_eq!(bad.logins(), 0);
 
-    let e = connect_tls(&seeds(&[&bad, &down]), None).await.err().expect("no seed serves");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}", e);
+    let e = connect_tls(&seeds(&[&bad, &down]), None)
+        .await
+        .err()
+        .expect("no seed serves");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::ServerRefusedTls),
+        "{}",
+        e
+    );
 
     good.set(Behaviour::AuthFail);
     bad.set(Behaviour::AuthFail);
     let before = good.logins() + bad.logins();
-    let e = connect_tls(&seeds(&[&good, &bad]), None).await.err().expect("authentication fails");
+    let e = connect_tls(&seeds(&[&good, &bad]), None)
+        .await
+        .err()
+        .expect("authentication fails");
     assert_eq!(e.code().map(|c| c.code()), Some("28P01"));
-    assert_eq!(good.logins() + bad.logins() - before, 1, "no second seed may be tried");
+    assert_eq!(
+        good.logins() + bad.logins() - before,
+        1,
+        "no second seed may be tried"
+    );
 }
 
 /// ASTS-86: a seed whose own endpoint fails does not hide a known node
@@ -1563,8 +1998,15 @@ async fn a_known_node_dialled_elsewhere_by_policy_is_not_covered_by_its_seed() {
     seed.set(Behaviour::DiscoveryShutdown);
     let before = dialled.logins();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let info = realm.refresh(NoTls, &conf).await.expect("the policy endpoint serves the refresh");
-    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
+    let info = realm
+        .refresh(NoTls, &conf)
+        .await
+        .expect("the policy endpoint serves the refresh");
+    assert!(
+        info.age() < Duration::from_millis(250),
+        "a fresh snapshot, not the stale one: {:?}",
+        info.age()
+    );
     assert_eq!(dialled.logins() - before, 1);
 }
 
@@ -1591,7 +2033,11 @@ async fn a_known_node_verified_under_another_name_is_not_covered_by_its_seed() {
     seed.set(Behaviour::DiscoveryShutdown);
     let before = seed.logins();
     let _ = realm.refresh(NoTls, &conf).await;
-    assert_eq!(seed.logins() - before, 2, "the seed and the differently verified known node");
+    assert_eq!(
+        seed.logins() - before,
+        2,
+        "the seed and the differently verified known node"
+    );
 }
 
 /// ASTS-86: a resolved seed address is covered by its own seed's port only:
@@ -1601,7 +2047,9 @@ async fn a_resolved_seed_address_on_another_seeds_port_is_still_tried() {
     let cluster = Cluster::new("resolved-port");
     let named = Node::start_at(&cluster, "127.0.0.1", 0).await;
     let mut other = Node::start(&cluster).await;
-    while other.port == named.port || std::net::TcpListener::bind(("127.0.0.1", other.port)).is_err() {
+    while other.port == named.port
+        || std::net::TcpListener::bind(("127.0.0.1", other.port)).is_err()
+    {
         other = Node::start(&cluster).await;
     }
     let known = Node::start_at(&cluster, "127.0.0.1", other.port).await;
@@ -1618,9 +2066,20 @@ async fn a_resolved_seed_address_on_another_seeds_port_is_still_tried() {
     named.set(Behaviour::RefuseTls);
     other.set(Behaviour::Refuse);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let info = realm.refresh(Passthrough, &conf).await.expect("the known node serves the refresh");
-    assert!(info.age() < Duration::from_millis(250), "a fresh snapshot, not the stale one: {:?}", info.age());
-    assert!(realm.penalized_nodes().contains(&"127.0.0.1".to_string()), "{:?}", realm.penalized_nodes());
+    let info = realm
+        .refresh(Passthrough, &conf)
+        .await
+        .expect("the known node serves the refresh");
+    assert!(
+        info.age() < Duration::from_millis(250),
+        "a fresh snapshot, not the stale one: {:?}",
+        info.age()
+    );
+    assert!(
+        realm.penalized_nodes().contains(&"127.0.0.1".to_string()),
+        "{:?}",
+        realm.penalized_nodes()
+    );
 }
 
 /// ASTS-86: a penalty belongs to one endpoint: another port of the same
@@ -1642,9 +2101,15 @@ async fn a_penalty_does_not_reach_another_port_of_the_address() {
     }
     cluster.publish(&[(&other, "primary", "z1"), (&busy, "primary", "z1")]);
     seed.set(Behaviour::RefuseTls);
-    let s = connect_tls(&conf, Some(&realm)).await.expect("a known node serves");
+    let s = connect_tls(&conf, Some(&realm))
+        .await
+        .expect("a known node serves");
     assert_eq!(realm.penalized_nodes(), vec![seed.ip.clone()]);
-    assert_eq!(node_of_client(&s.client).await, other.ip, "the least-loaded node is not penalised");
+    assert_eq!(
+        node_of_client(&s.client).await,
+        other.ip,
+        "the least-loaded node is not penalised"
+    );
     assert_eq!(other.logins(), 1);
 }
 
@@ -1659,11 +2124,18 @@ async fn a_node_scoped_failure_survives_a_later_candidates_refusal() {
     let conf = config(&n1, "load_balance=only-primary yb_servers_refresh_interval=60 failed_host_reconnect_delay_secs=60");
     let held = connect(&conf, &realm).await.unwrap();
     // The idle node is tried first.
-    let (loaded, idle) = if node_of(&held).await == n1.ip { (&n1, &n2) } else { (&n2, &n1) };
+    let (loaded, idle) = if node_of(&held).await == n1.ip {
+        (&n1, &n2)
+    } else {
+        (&n2, &n1)
+    };
     idle.set(Behaviour::Shutdown);
     loaded.set(Behaviour::Refuse);
     let before = idle.logins();
-    let e = connect(&conf, &realm).await.err().expect("no candidate serves");
+    let e = connect(&conf, &realm)
+        .await
+        .err()
+        .expect("no candidate serves");
     assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
     assert_eq!(idle.logins() - before, 1, "the idle node was tried");
     assert_eq!(realm.penalized_nodes(), vec![idle.ip.clone()]);
@@ -1677,7 +2149,10 @@ async fn expired_penalties_are_dropped() {
     let (seed, n2) = (Node::start(&cluster).await, Node::start(&cluster).await);
     cluster.publish(&[(&seed, "primary", "z1"), (&n2, "primary", "z1")]);
     let realm = Realm::new("prune");
-    let mut conf = config(&seed, "load_balance=only-primary yb_servers_refresh_interval=0");
+    let mut conf = config(
+        &seed,
+        "load_balance=only-primary yb_servers_refresh_interval=0",
+    );
     conf.failed_host_reconnect_delay_secs(Duration::from_millis(200));
     connect(&conf, &realm).await.unwrap();
     seed.set(Behaviour::DiscoveryShutdown);
@@ -1685,7 +2160,11 @@ async fn expired_penalties_are_dropped() {
     assert_eq!(realm.penalized_nodes(), vec![seed.ip.clone()]);
     seed.set(Behaviour::Accept);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(realm.penalized_nodes().is_empty(), "{:?}", realm.penalized_nodes());
+    assert!(
+        realm.penalized_nodes().is_empty(),
+        "{:?}",
+        realm.penalized_nodes()
+    );
 }
 
 /// ASTS-86: a topology query that stalls past the acquisition budget does
@@ -1705,10 +2184,28 @@ async fn tls_error_survives_a_later_seeds_stalled_topology_query() {
         .parse()
         .unwrap();
         let started = Instant::now();
-        let e = connect_tls(&conf, Some(&Realm::new("query-stall"))).await.err().expect("discovery fails");
-        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
-        assert_eq!(e.tls_failure(), Some(TlsFailureKind::ServerRefusedTls), "{}: {}", load_balance, e);
-        assert_eq!(stalls.logins(), 1, "{}: the stalled seed was reached", load_balance);
+        let e = connect_tls(&conf, Some(&Realm::new("query-stall")))
+            .await
+            .err()
+            .expect("discovery fails");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            e.tls_failure(),
+            Some(TlsFailureKind::ServerRefusedTls),
+            "{}: {}",
+            load_balance,
+            e
+        );
+        assert_eq!(
+            stalls.logins(),
+            1,
+            "{}: the stalled seed was reached",
+            load_balance
+        );
     }
 }
 
@@ -1738,7 +2235,10 @@ async fn first_of_two_addresses(cluster: &Cluster) -> (&'static str, Node) {
             }
         }
     }
-    panic!("none of {:?} resolves to two loopback addresses with a common free port", TWO_ADDRESS_NAMES);
+    panic!(
+        "none of {:?} resolves to two loopback addresses with a common free port",
+        TWO_ADDRESS_NAMES
+    );
 }
 
 /// ASTS-86: when a name resolves to several addresses, a node-scoped failure
@@ -1758,7 +2258,11 @@ async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
     };
 
     node.set(Behaviour::Shutdown);
-    let e = conninfo("load_balance=false").connect(NoTls).await.err().expect("no address serves");
+    let e = conninfo("load_balance=false")
+        .connect(NoTls)
+        .await
+        .err()
+        .expect("no address serves");
     assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
 
     node.set(Behaviour::Accept);
@@ -1767,9 +2271,16 @@ async fn a_node_scoped_failure_survives_a_later_addresss_refusal() {
     let conf = conninfo("load_balance=only-primary yb_servers_refresh_interval=60 failed_host_reconnect_delay_secs=60");
     connect(&conf, &realm).await.unwrap();
     node.set(Behaviour::Shutdown);
-    let e = connect(&conf, &realm).await.err().expect("no address serves");
+    let e = connect(&conf, &realm)
+        .await
+        .err()
+        .expect("no address serves");
     assert_eq!(e.code().map(|c| c.code()), Some("57P01"), "{}", e);
-    assert!(realm.failed_nodes().is_empty(), "{:?}", realm.failed_nodes());
+    assert!(
+        realm.failed_nodes().is_empty(),
+        "{:?}",
+        realm.failed_nodes()
+    );
     assert_eq!(realm.penalized_nodes(), vec![name.to_string()]);
 }
 
@@ -1813,7 +2324,11 @@ async fn discovery_failure_cannot_bypass_restricted_routing() {
 
 #[tokio::test]
 async fn discovery_failure_preserves_unrestricted_seed_fallback() {
-    for parameters in ["load_balance=any", "load_balance=prefer-rr", "load_balance=any topology_keys=qual.e.z9"] {
+    for parameters in [
+        "load_balance=any",
+        "load_balance=prefer-rr",
+        "load_balance=any topology_keys=qual.e.z9",
+    ] {
         let cluster = Cluster::new("e");
         let n1 = Node::start(&cluster).await;
         cluster.publish(&[(&n1, "primary", "z1")]);
@@ -1821,7 +2336,12 @@ async fn discovery_failure_preserves_unrestricted_seed_fallback() {
         let realm = Realm::new("unrestricted");
         let s = connect(&config(&n1, parameters), &realm).await.unwrap();
         assert_eq!(node_of(&s).await, n1.ip);
-        assert_eq!(realm.connection_counts().get(&n1.ip), Some(&1), "{}", parameters);
+        assert_eq!(
+            realm.connection_counts().get(&n1.ip),
+            Some(&1),
+            "{}",
+            parameters
+        );
     }
 }
 
@@ -1830,7 +2350,10 @@ async fn disabled_load_balancing_does_not_attempt_discovery() {
     let cluster = Cluster::new("o");
     let n1 = Node::start(&cluster).await;
     cluster.publish(&[(&n1, "primary", "z1")]);
-    let (client, connection) = config(&n1, "load_balance=false").connect(NoTls).await.unwrap();
+    let (client, connection) = config(&n1, "load_balance=false")
+        .connect(NoTls)
+        .await
+        .unwrap();
     tokio::spawn(connection);
     assert_eq!(cluster.discoveries.load(Ordering::SeqCst), 0);
     drop(client);
@@ -1842,7 +2365,10 @@ async fn standing_follows_quarantine_expiry_removal_and_policy() {
     let (a, b) = (Node::start(&cluster).await, Node::start(&cluster).await);
     cluster.publish(&[(&a, "primary", "z1"), (&b, "primary", "z2")]);
     let realm = Realm::new("standing");
-    let mut conf = config(&b, "load_balance=true topology_keys=qual.st.z1:1,qual.st.z2:2");
+    let mut conf = config(
+        &b,
+        "load_balance=true topology_keys=qual.st.z1:1,qual.st.z2:2",
+    );
     conf.failed_host_reconnect_delay_secs(Duration::from_millis(300));
     conf.yb_servers_refresh_interval(Duration::ZERO);
 
@@ -1860,7 +2386,11 @@ async fn standing_follows_quarantine_expiry_removal_and_policy() {
     assert_eq!(preferred.client.node_standing(), NodeStanding::Preferred);
 
     realm.refresh(NoTls, &conf).await.unwrap();
-    assert_eq!(realm.topology_epoch(), first_epoch, "an unchanged snapshot is not a change");
+    assert_eq!(
+        realm.topology_epoch(),
+        first_epoch,
+        "an unchanged snapshot is not a change"
+    );
 
     cluster.publish(&[(&a, "primary", "z1")]);
     let info = realm.refresh(NoTls, &conf).await.unwrap();
@@ -1876,8 +2406,14 @@ async fn standing_follows_quarantine_expiry_removal_and_policy() {
     let only_primary = Realm::new("standing-primary");
     let session = connect(&primaries, &only_primary).await.unwrap();
     assert_eq!(node_of(&session).await, b.ip);
-    assert_eq!(only_primary.standing(&primaries, &a.ip), NodeStanding::Ineligible);
-    assert_eq!(only_primary.standing(&primaries, &b.ip), NodeStanding::Preferred);
+    assert_eq!(
+        only_primary.standing(&primaries, &a.ip),
+        NodeStanding::Ineligible
+    );
+    assert_eq!(
+        only_primary.standing(&primaries, &b.ip),
+        NodeStanding::Preferred
+    );
 
     let direct: Config = format!(
         "host={} port={} user=test dbname=test sslmode=disable connect_timeout=2",
@@ -1923,7 +2459,9 @@ async fn short_data_rows_are_errors_not_panics() {
     assert!(realm.topology().is_none());
 
     let realm = Realm::new("short-simple");
-    let session = connect(&config(&n1, "load_balance=false"), &realm).await.unwrap();
+    let session = connect(&config(&n1, "load_balance=false"), &realm)
+        .await
+        .unwrap();
     session
         .client
         .simple_query("select 1")
@@ -1947,9 +2485,19 @@ async fn unknown_type_chains_and_cycles_are_bounded() {
             .await
             .err()
             .expect("an unresolvable discovery column type must fail restricted routing closed");
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}: {:?}", mode, started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}: {:?}",
+            mode,
+            started.elapsed()
+        );
         let lookups = cluster.type_lookups.load(Ordering::SeqCst);
-        assert!(lookups > 0 && lookups <= most, "{:?}: {} type lookups", mode, lookups);
+        assert!(
+            lookups > 0 && lookups <= most,
+            "{:?}: {} type lookups",
+            mode,
+            lookups
+        );
         assert!(realm.topology().is_none());
     }
 }
@@ -1975,8 +2523,17 @@ async fn oversized_backend_messages_are_rejected_from_their_header() {
     assert_eq!(limited.get_max_message_size(), 1024);
     let (client, connection) = limited.connect(NoTls).await.unwrap();
     let connection = tokio::spawn(connection);
-    client.simple_query("node").await.err().expect("a row beyond the configured limit");
-    let e = timeout(Duration::from_secs(1), connection).await.unwrap().unwrap().err().unwrap();
+    client
+        .simple_query("node")
+        .await
+        .err()
+        .expect("a row beyond the configured limit");
+    let e = timeout(Duration::from_secs(1), connection)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .unwrap();
     assert!(e.to_string().contains("byte limit"), "{}", e);
 
     // A frame beyond the default limit fails as soon as its header arrives.
@@ -1988,7 +2545,12 @@ async fn oversized_backend_messages_are_rejected_from_their_header() {
         .expect("the oversized frame must be refused from its header")
         .err()
         .expect("a frame beyond the default limit");
-    let e = timeout(Duration::from_secs(1), connection).await.unwrap().unwrap().err().unwrap();
+    let e = timeout(Duration::from_secs(1), connection)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .unwrap();
     assert!(e.to_string().contains("byte limit"), "{}", e);
 }
 
@@ -2002,12 +2564,24 @@ async fn startup_messages_are_bounded() {
 
     n1.set(Behaviour::HugeStartupMessage);
     let started = Instant::now();
-    let e = direct.connect(NoTls).await.err().expect("an oversized startup message");
+    let e = direct
+        .connect(NoTls)
+        .await
+        .err()
+        .expect("an oversized startup message");
     assert!(e.to_string().contains("byte limit"), "{}", e);
-    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
 
     n1.set(Behaviour::ParameterFlood);
-    let e = direct.connect(NoTls).await.err().expect("a parameter status flood");
+    let e = direct
+        .connect(NoTls)
+        .await
+        .err()
+        .expect("a parameter status flood");
     assert!(e.to_string().contains("too many parameter status"), "{}", e);
 }
 
@@ -2086,13 +2660,18 @@ async fn seed_identity_is_admitted_only_on_the_seed_port() {
         // Restricted routing fails closed without dialling the other port.
         let restricted = admitting(conninfo("only-primary"), EndpointPolicy::new());
         let before = seed.logins();
-        let e = connect(&restricted, &Realm::new("port-restricted")).await.err().expect("refused");
+        let e = connect(&restricted, &Realm::new("port-restricted"))
+            .await
+            .err()
+            .expect("refused");
         assert!(not_admitted(&e), "{}: {}", key, e);
         assert_eq!((other.logins(), seed.logins() - before), (0, 1), "{}", key);
 
         // Unrestricted routing skips the node and uses the seed itself.
         let unrestricted = admitting(conninfo("any"), EndpointPolicy::new());
-        let s = connect(&unrestricted, &Realm::new("port-unrestricted")).await.unwrap();
+        let s = connect(&unrestricted, &Realm::new("port-unrestricted"))
+            .await
+            .unwrap();
         assert_eq!(node_of(&s).await, seed.ip);
         assert_eq!(other.logins(), 0, "{}", key);
 
@@ -2145,7 +2724,9 @@ async fn per_seed_ports_do_not_admit_each_other() {
 
 #[tokio::test]
 async fn suffix_admission_requires_its_port() {
-    assert!(EndpointPolicy::new().admit_dns_suffix_on_port("yb.invalid", 0).is_err());
+    assert!(EndpointPolicy::new()
+        .admit_dns_suffix_on_port("yb.invalid", 0)
+        .is_err());
     let cluster = Cluster::new("suffix");
     let seed = Node::start(&cluster).await;
     let conninfo = || {
@@ -2160,16 +2741,34 @@ async fn suffix_admission_requires_its_port() {
     let pinned = other_port(seed.port);
     for (policy, refused_port, admitted_port) in [
         // Without a port the suffix admits only the configured seed port.
-        (EndpointPolicy::new().admit_dns_suffix("yb.invalid").unwrap(), pinned, seed.port),
-        (EndpointPolicy::new().admit_dns_suffix_on_port("yb.invalid", pinned).unwrap(), seed.port, pinned),
+        (
+            EndpointPolicy::new()
+                .admit_dns_suffix("yb.invalid")
+                .unwrap(),
+            pinned,
+            seed.port,
+        ),
+        (
+            EndpointPolicy::new()
+                .admit_dns_suffix_on_port("yb.invalid", pinned)
+                .unwrap(),
+            seed.port,
+            pinned,
+        ),
     ] {
         let config = admitting(conninfo(), policy);
         publish_rows(&cluster, &[("n1.yb.invalid", refused_port)]);
-        let e = connect(&config, &Realm::new("suffix-refused")).await.err().expect("refused");
+        let e = connect(&config, &Realm::new("suffix-refused"))
+            .await
+            .err()
+            .expect("refused");
         assert!(not_admitted(&e), "{}", e);
 
         publish_rows(&cluster, &[("n1.yb.invalid", admitted_port)]);
-        let e = connect(&config, &Realm::new("suffix-admitted")).await.err().expect("unresolvable");
+        let e = connect(&config, &Realm::new("suffix-admitted"))
+            .await
+            .err()
+            .expect("unresolvable");
         assert!(!not_admitted(&e), "{}", e);
     }
 }
