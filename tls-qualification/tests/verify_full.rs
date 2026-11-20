@@ -67,7 +67,10 @@ fn connector(material: &TlsMaterial) -> MakeRustlsConnect {
     tls
 }
 
-fn connector_with(material: &TlsMaterial, f: impl FnOnce(TlsOptions) -> TlsOptions) -> MakeRustlsConnect {
+fn connector_with(
+    material: &TlsMaterial,
+    f: impl FnOnce(TlsOptions) -> TlsOptions,
+) -> MakeRustlsConnect {
     MakeRustlsConnect::new(material, f(options())).unwrap()
 }
 
@@ -159,7 +162,11 @@ async fn valid_dns_san_tls13_and_pg_stat_ssl() {
     assert_eq!(s.generation, Some(1));
     assert_eq!(s.protocol.as_deref(), Some("TLSv1_3"));
     assert_eq!(
-        scalar(&s.client, "select ssl::text || ' ' || version from pg_stat_ssl where pid = pg_backend_pid()").await,
+        scalar(
+            &s.client,
+            "select ssl::text || ' ' || version from pg_stat_ssl where pid = pg_backend_pid()"
+        )
+        .await,
         "true TLSv1.3"
     );
     assert_eq!(s.client.node_identity(), Some("localhost"));
@@ -175,29 +182,40 @@ async fn valid_ip_san() {
 #[tokio::test]
 async fn expected_name_is_separate_from_dial_address() {
     let tls = connector(&roots("ca-a.crt"));
-    let s = open(&format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "pg.test")), &tls)
-        .await
-        .unwrap();
+    let s = open(
+        &format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "pg.test")),
+        &tls,
+    )
+    .await
+    .unwrap();
     assert_eq!(scalar(&s.client, "select 1").await, "1");
 }
 
 #[tokio::test]
 async fn scram_channel_binding_required() {
     let tls = connector(&roots("ca-a.crt"));
-    let s = open(&format!("{} channel_binding=require", pg(PG_VALID, "localhost")), &tls)
-        .await
-        .unwrap();
+    let s = open(
+        &format!("{} channel_binding=require", pg(PG_VALID, "localhost")),
+        &tls,
+    )
+    .await
+    .unwrap();
     assert_eq!(scalar(&s.client, "select 1").await, "1");
 }
 
 #[tokio::test]
 async fn mutual_tls_with_valid_client_certificate() {
     let tls = connector(
-        &roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), read("client-postgres.key")),
+        &roots("ca-a.crt")
+            .with_client_identity(read("client-postgres.crt"), read("client-postgres.key")),
     );
     assert!(tls.current().has_client_identity());
     let s = open(&pg(PG_MTLS, "localhost"), &tls).await.unwrap();
-    let dn = scalar(&s.client, "select client_dn from pg_stat_ssl where pid = pg_backend_pid()").await;
+    let dn = scalar(
+        &s.client,
+        "select client_dn from pg_stat_ssl where pid = pg_backend_pid()",
+    )
+    .await;
     assert!(dn.ends_with("CN=postgres"), "{dn}");
 }
 
@@ -213,7 +231,11 @@ async fn cancel_request_uses_verified_tls() {
             token.cancel_query(tls).await
         })
     };
-    let err = s.client.simple_query("select pg_sleep(30)").await.unwrap_err();
+    let err = s
+        .client
+        .simple_query("select pg_sleep(30)")
+        .await
+        .unwrap_err();
     assert_eq!(err.code().map(|c| c.code()), Some("57014"), "{err}");
     canceller.await.unwrap().unwrap();
 }
@@ -237,7 +259,11 @@ async fn cancel_request_without_verified_tls_is_not_sent() {
     let e = wrong_ca.expect_err("a cancel request over an unverified channel succeeded");
     assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnknownIssuer), "{e}");
     let e = unverified.expect_err("a cancel request without TLS succeeded");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnverifiedConnector), "{e}");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::UnverifiedConnector),
+        "{e}"
+    );
     // Neither attempt reached the server: the query ran to completion.
     query.expect("the query must not have been cancelled");
 }
@@ -245,19 +271,32 @@ async fn cancel_request_without_verified_tls_is_not_sent() {
 #[tokio::test]
 async fn wrong_ca_is_unknown_issuer() {
     let tls = connector(&roots("ca-b.crt"));
-    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::UnknownIssuer);
+    expect_tls(
+        open(&pg(PG_VALID, "localhost"), &tls).await,
+        TlsFailureKind::UnknownIssuer,
+    );
 }
 
 #[tokio::test]
 async fn wrong_dns_san_is_identity_mismatch_and_redacted() {
     let tls = connector(&roots("ca-a.crt"));
     let e = expect_tls(
-        open(&format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "wrong.test")), &tls).await,
+        open(
+            &format!("{} hostaddr=127.0.0.1", pg(PG_VALID, "wrong.test")),
+            &tls,
+        )
+        .await,
         TlsFailureKind::IdentityMismatch,
     );
     let rendered = format!("{e} {e:?}");
-    assert!(!rendered.contains("wrong.test"), "endpoint name leaked: {rendered}");
-    assert!(!rendered.contains("127.0.0.1"), "endpoint address leaked: {rendered}");
+    assert!(
+        !rendered.contains("wrong.test"),
+        "endpoint name leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("127.0.0.1"),
+        "endpoint address leaked: {rendered}"
+    );
     assert!(rendered.contains("endpoint ep-"), "{rendered}");
 }
 
@@ -270,35 +309,52 @@ async fn tls_failure_on_one_seed_moves_to_the_next_seed_and_is_not_hidden() {
     let conninfo = format!(
         "host=wrong.test,localhost hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
     );
-    open(&conninfo, &tls).await.expect("the verified second seed serves");
+    open(&conninfo, &tls)
+        .await
+        .expect("the verified second seed serves");
     let conninfo = format!(
         "host=wrong.test,localhost hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID},1 user=postgres password={PASSWORD} dbname=postgres"
     );
-    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::IdentityMismatch);
+    expect_tls(
+        open(&conninfo, &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
     let conninfo = format!(
         "host=wrong.test,other.test hostaddr=127.0.0.1,127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
     );
-    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::IdentityMismatch);
+    expect_tls(
+        open(&conninfo, &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
 }
 
 #[tokio::test]
 async fn wrong_ip_san_is_identity_mismatch() {
     let tls = connector(&roots("ca-a.crt"));
     // PostgreSQL listens on every address; the certificate names only 127.0.0.1.
-    expect_tls(open(&pg(PG_VALID, "127.0.0.2"), &tls).await, TlsFailureKind::IdentityMismatch);
+    expect_tls(
+        open(&pg(PG_VALID, "127.0.0.2"), &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
 }
 
 #[tokio::test]
 async fn expired_server_certificate() {
     let tls = connector(&roots("ca-a.crt"));
-    expect_tls(open(&pg(PG_EXPIRED, "localhost"), &tls).await, TlsFailureKind::Expired);
+    expect_tls(
+        open(&pg(PG_EXPIRED, "localhost"), &tls).await,
+        TlsFailureKind::Expired,
+    );
 }
 
 #[tokio::test]
 async fn revoked_server_certificate() {
     let tls = connector(&roots("ca-a.crt").with_crl(read("crl-a-revokes-server-valid.pem")));
     assert_eq!(tls.current().crls(), 1);
-    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::Revoked);
+    expect_tls(
+        open(&pg(PG_VALID, "localhost"), &tls).await,
+        TlsFailureKind::Revoked,
+    );
     let clean = connector(&roots("ca-a.crt").with_crl(read("crl-a-empty.pem")));
     open(&pg(PG_VALID, "localhost"), &clean).await.unwrap();
 }
@@ -324,14 +380,28 @@ async fn crl_next_update_is_reported_for_alerting() {
     let utc = date_time_ymd(2035, 1, 1).unix_timestamp();
     let generalized = date_time_ymd(2051, 3, 1).unix_timestamp();
     let next = |m: TlsMaterial| unix(connector(&m).current().earliest_crl_next_update().unwrap());
-    assert_eq!(next(roots("ca-a.crt").with_crl(read("crl-a-empty.pem"))), utc);
-    assert_eq!(next(roots("ca-a.crt").with_crl(read("crl-a-empty-2051.pem"))), generalized);
+    assert_eq!(
+        next(roots("ca-a.crt").with_crl(read("crl-a-empty.pem"))),
+        utc
+    );
+    assert_eq!(
+        next(roots("ca-a.crt").with_crl(read("crl-a-empty-2051.pem"))),
+        generalized
+    );
     // The earliest across every loaded CRL, including several in one PEM.
-    let both = [read("crl-a-empty-2051.pem"), read("crl-a-revokes-server-valid.pem")].concat();
+    let both = [
+        read("crl-a-empty-2051.pem"),
+        read("crl-a-revokes-server-valid.pem"),
+    ]
+    .concat();
     assert_eq!(next(roots("ca-a.crt").with_crl(both)), utc);
     let expired = date_time_ymd(2024, 6, 1).unix_timestamp();
     assert_eq!(
-        next(roots("ca-a.crt").with_crl(read("crl-a-empty.pem")).with_crl(read("crl-a-expired.pem"))),
+        next(
+            roots("ca-a.crt")
+                .with_crl(read("crl-a-empty.pem"))
+                .with_crl(read("crl-a-expired.pem"))
+        ),
         expired
     );
 }
@@ -340,7 +410,10 @@ async fn crl_next_update_is_reported_for_alerting() {
 async fn stale_crl_is_still_used_by_default_and_reported() {
     let tls = connector(&roots("ca-a.crt").with_crl(read("crl-a-expired.pem")));
     let next_update = tls.current().earliest_crl_next_update().unwrap();
-    assert!(next_update < SystemTime::now(), "the fixture CRL must be stale");
+    assert!(
+        next_update < SystemTime::now(),
+        "the fixture CRL must be stale"
+    );
     open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
 }
 
@@ -351,7 +424,10 @@ async fn enforced_crl_expiry_rejects_stale_material_and_keeps_the_current_genera
     let err = MakeRustlsConnect::new(&stale, enforce(options())).unwrap_err();
     assert_eq!(err.kind(), TlsConfigErrorKind::CrlExpired, "{err}");
 
-    let tls = connector_with(&roots("ca-a.crt").with_crl(read("crl-a-empty.pem")), enforce);
+    let tls = connector_with(
+        &roots("ca-a.crt").with_crl(read("crl-a-empty.pem")),
+        enforce,
+    );
     assert_eq!(tls.current().crl_expiration(), CrlExpiration::Enforce);
     let before = tls.current().id();
     let err = tls.reload(&stale).unwrap_err();
@@ -364,9 +440,16 @@ async fn enforced_crl_expiry_rejects_stale_material_and_keeps_the_current_genera
 async fn enforced_crl_expiry_applies_to_a_crl_that_expires_after_loading() {
     let (ca, key) = load_ca(CA_A_CN, std::str::from_utf8(&read("ca-a.key")).unwrap());
     let now = time::OffsetDateTime::now_utc();
-    let short = crl(&ca, &key, 10, now - time::Duration::minutes(1), now + time::Duration::seconds(20), &[])
-        .pem()
-        .unwrap();
+    let short = crl(
+        &ca,
+        &key,
+        10,
+        now - time::Duration::minutes(1),
+        now + time::Duration::seconds(20),
+        &[],
+    )
+    .pem()
+    .unwrap();
     let material = roots("ca-a.crt").with_crl(short);
     let enforced = connector_with(&material, |o| o.crl_expiration(CrlExpiration::Enforce));
     let ignored = connector(&material);
@@ -374,10 +457,16 @@ async fn enforced_crl_expiry_applies_to_a_crl_that_expires_after_loading() {
 
     // Wait until the reported nextUpdate has passed (whole-second precision).
     let next_update = enforced.current().earliest_crl_next_update().unwrap();
-    let wait = next_update.duration_since(SystemTime::now()).unwrap_or_default() + Duration::from_secs(2);
+    let wait = next_update
+        .duration_since(SystemTime::now())
+        .unwrap_or_default()
+        + Duration::from_secs(2);
     tokio::time::sleep(wait).await;
     assert!(next_update < SystemTime::now());
-    let e = expect_tls(open(&pg(PG_VALID, "localhost"), &enforced).await, TlsFailureKind::CrlExpired);
+    let e = expect_tls(
+        open(&pg(PG_VALID, "localhost"), &enforced).await,
+        TlsFailureKind::CrlExpired,
+    );
     let rendered = format!("{e} {e:?}");
     assert!(rendered.contains("nextUpdate"), "{rendered}");
     open(&pg(PG_VALID, "localhost"), &ignored).await.unwrap();
@@ -394,24 +483,34 @@ async fn revoked_intermediate_is_refused_only_with_chain_depth() {
 
     // Default: only the end-entity certificate is checked.
     let leaf_only = connector(&revoked());
-    open(&pg(PG_CHAINED, "localhost"), &leaf_only).await.unwrap();
+    open(&pg(PG_CHAINED, "localhost"), &leaf_only)
+        .await
+        .unwrap();
 
     let tls = connector_with(&revoked(), chain);
     assert_eq!(tls.current().revocation_depth(), RevocationDepth::Chain);
-    let e = expect_tls(open(&pg(PG_CHAINED, "localhost"), &tls).await, TlsFailureKind::Revoked);
+    let e = expect_tls(
+        open(&pg(PG_CHAINED, "localhost"), &tls).await,
+        TlsFailureKind::Revoked,
+    );
     let rendered = format!("{e} {e:?}");
     assert!(rendered.contains("has been revoked"), "{rendered}");
 
     // Clean CRLs from every issuer in the chain: accepted.
     let clean = connector_with(
-        &roots("ca-c.crt").with_crl(read("crl-c-empty.pem")).with_crl(read("crl-c1-empty.pem")),
+        &roots("ca-c.crt")
+            .with_crl(read("crl-c-empty.pem"))
+            .with_crl(read("crl-c1-empty.pem")),
         chain,
     );
     open(&pg(PG_CHAINED, "localhost"), &clean).await.unwrap();
 
     // No CRL from the root that issued the intermediate: fails closed.
     let missing = connector_with(&roots("ca-c.crt").with_crl(read("crl-c1-empty.pem")), chain);
-    let e = expect_tls(open(&pg(PG_CHAINED, "localhost"), &missing).await, TlsFailureKind::Revoked);
+    let e = expect_tls(
+        open(&pg(PG_CHAINED, "localhost"), &missing).await,
+        TlsFailureKind::Revoked,
+    );
     let rendered = format!("{e} {e:?}");
     assert!(rendered.contains("unknown"), "{rendered}");
 }
@@ -420,18 +519,31 @@ async fn revoked_intermediate_is_refused_only_with_chain_depth() {
 async fn crl_der_reading_survives_truncation_and_corruption() {
     let (ca, key) = load_ca(CA_A_CN, std::str::from_utf8(&read("ca-a.key")).unwrap());
     let next_update = date_time_ymd(2035, 1, 1);
-    let der = crl(&ca, &key, 11, date_time_ymd(2025, 1, 1), next_update, &[1001])
-        .der()
-        .to_vec();
+    let der = crl(
+        &ca,
+        &key,
+        11,
+        date_time_ymd(2025, 1, 1),
+        next_update,
+        &[1001],
+    )
+    .der()
+    .to_vec();
     let load = |der: &[u8]| {
         MakeRustlsConnect::new(&roots("ca-a.crt").with_crl(pem("X509 CRL", der)), options())
     };
     let tls = load(&der).unwrap();
-    assert_eq!(unix(tls.current().earliest_crl_next_update().unwrap()), next_update.unix_timestamp());
+    assert_eq!(
+        unix(tls.current().earliest_crl_next_update().unwrap()),
+        next_update.unix_timestamp()
+    );
 
     for len in 0..der.len() {
         match load(&der[..len]) {
-            Ok(_) => panic!("a CRL truncated to {len} of {} bytes was accepted", der.len()),
+            Ok(_) => panic!(
+                "a CRL truncated to {len} of {} bytes was accepted",
+                der.len()
+            ),
             Err(e) => assert_eq!(e.kind(), TlsConfigErrorKind::InvalidCrl, "len {len}: {e}"),
         }
     }
@@ -442,7 +554,10 @@ async fn crl_der_reading_survives_truncation_and_corruption() {
             match load(&corrupt) {
                 Ok(tls) => {
                     assert_eq!(tls.current().crls(), 1);
-                    assert!(tls.current().earliest_crl_next_update().is_some(), "byte {i}");
+                    assert!(
+                        tls.current().earliest_crl_next_update().is_some(),
+                        "byte {i}"
+                    );
                 }
                 Err(e) => assert_eq!(e.kind(), TlsConfigErrorKind::InvalidCrl, "byte {i}: {e}"),
             }
@@ -453,14 +568,20 @@ async fn crl_der_reading_survives_truncation_and_corruption() {
 #[tokio::test]
 async fn real_server_refusing_tls() {
     let tls = connector(&roots("ca-a.crt"));
-    expect_tls(open(&pg(PG_NOSSL, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+    expect_tls(
+        open(&pg(PG_NOSSL, "localhost"), &tls).await,
+        TlsFailureKind::ServerRefusedTls,
+    );
 }
 
 #[tokio::test]
 async fn downgrade_answer_n_is_refused_without_plaintext() {
     let tls = connector(&roots("ca-a.crt"));
     let (port, peer) = fake_server(b"N").await;
-    expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+    expect_tls(
+        open(&pg(port, "localhost"), &tls).await,
+        TlsFailureKind::ServerRefusedTls,
+    );
     let seen = peer.await.unwrap();
     assert_eq!(seen.len(), 8, "only the SSLRequest may be sent: {seen:?}");
 }
@@ -468,9 +589,11 @@ async fn downgrade_answer_n_is_refused_without_plaintext() {
 #[tokio::test]
 async fn downgrade_error_response_is_not_read() {
     let tls = connector(&roots("ca-a.crt"));
-    let (port, peer) =
-        fake_server(b"E\x00\x00\x00\x1eSFATAL\x00MDowngrade attempt\x00\x00").await;
-    let e = expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::ServerRefusedTls);
+    let (port, peer) = fake_server(b"E\x00\x00\x00\x1eSFATAL\x00MDowngrade attempt\x00\x00").await;
+    let e = expect_tls(
+        open(&pg(port, "localhost"), &tls).await,
+        TlsFailureKind::ServerRefusedTls,
+    );
     assert!(!e.to_string().contains("Downgrade attempt"), "{e}");
     assert_eq!(peer.await.unwrap().len(), 8);
 }
@@ -479,18 +602,37 @@ async fn downgrade_error_response_is_not_read() {
 async fn garbage_after_tls_accept_fails_the_handshake() {
     let tls = connector(&roots("ca-a.crt"));
     let (port, peer) = fake_server(b"Sgarbage that is not a TLS record at all......").await;
-    expect_tls(open(&pg(port, "localhost"), &tls).await, TlsFailureKind::HandshakeFailure);
+    expect_tls(
+        open(&pg(port, "localhost"), &tls).await,
+        TlsFailureKind::HandshakeFailure,
+    );
     let seen = peer.await.unwrap();
-    assert!(seen.len() > 8 && seen[8] == 0x16, "a ClientHello, never plaintext, follows: {seen:?}");
+    assert!(
+        seen.len() > 8 && seen[8] == 0x16,
+        "a ClientHello, never plaintext, follows: {seen:?}"
+    );
 }
 
 #[tokio::test]
 async fn default_mode_refuses_unverified_connector_before_any_byte() {
     let (port, peer) = fake_server(b"S").await;
-    let config: Config = format!("host=localhost port={port} user=postgres").parse().unwrap();
-    assert_eq!(config.get_ssl_mode(), yb_tokio_postgres::config::SslMode::VerifyFull);
-    let e = config.connect(NoTls).await.err().expect("NoTls must be refused");
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::UnverifiedConnector), "{e}");
+    let config: Config = format!("host=localhost port={port} user=postgres")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        config.get_ssl_mode(),
+        yb_tokio_postgres::config::SslMode::VerifyFull
+    );
+    let e = config
+        .connect(NoTls)
+        .await
+        .err()
+        .expect("NoTls must be refused");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::UnverifiedConnector),
+        "{e}"
+    );
     assert!(peer.await.unwrap().is_empty());
 }
 
@@ -506,22 +648,32 @@ async fn verifying_connector_refuses_weaker_modes_before_any_byte() {
         assert!(peer.await.unwrap().is_empty(), "{mode}: {e}");
     }
     for mode in ["verify-ca", "allow", "bogus"] {
-        assert!(format!("host=x sslmode={mode}").parse::<Config>().is_err(), "{mode}");
+        assert!(
+            format!("host=x sslmode={mode}").parse::<Config>().is_err(),
+            "{mode}"
+        );
     }
 }
 
 #[tokio::test]
 async fn missing_expected_identity() {
     let tls = connector(&roots("ca-a.crt"));
-    let conninfo =
-        format!("hostaddr=127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres");
-    expect_tls(open(&conninfo, &tls).await, TlsFailureKind::NoExpectedIdentity);
+    let conninfo = format!(
+        "hostaddr=127.0.0.1 port={PG_VALID} user=postgres password={PASSWORD} dbname=postgres"
+    );
+    expect_tls(
+        open(&conninfo, &tls).await,
+        TlsFailureKind::NoExpectedIdentity,
+    );
 }
 
 #[tokio::test]
 async fn tls12_only_server_needs_explicit_opt_in() {
     let tls = connector(&roots("ca-a.crt"));
-    expect_tls(open(&pg(PG_TLS12, "localhost"), &tls).await, TlsFailureKind::ProtocolVersion);
+    expect_tls(
+        open(&pg(PG_TLS12, "localhost"), &tls).await,
+        TlsFailureKind::ProtocolVersion,
+    );
     let tls12 = MakeRustlsConnect::new(
         &roots("ca-a.crt"),
         options().protocol_versions(ProtocolVersions::Tls12AndTls13),
@@ -534,7 +686,10 @@ async fn tls12_only_server_needs_explicit_opt_in() {
 #[tokio::test]
 async fn absent_required_client_certificate() {
     let tls = connector(&roots("ca-a.crt"));
-    let e = open(&pg(PG_MTLS, "localhost"), &tls).await.err().expect("must fail");
+    let e = open(&pg(PG_MTLS, "localhost"), &tls)
+        .await
+        .err()
+        .expect("must fail");
     assert!(e.is_security_failure(), "{e}");
     assert_eq!(e.code().map(|c| c.code()), Some("28000"), "{e}");
 }
@@ -542,9 +697,13 @@ async fn absent_required_client_certificate() {
 #[tokio::test]
 async fn client_certificate_from_untrusted_ca_is_rejected() {
     let tls = connector(
-        &roots("ca-a.crt").with_client_identity(read("client-wrong-ca.crt"), read("client-wrong-ca.key")),
+        &roots("ca-a.crt")
+            .with_client_identity(read("client-wrong-ca.crt"), read("client-wrong-ca.key")),
     );
-    expect_tls(open(&pg(PG_MTLS, "localhost"), &tls).await, TlsFailureKind::ClientCertificateRejected);
+    expect_tls(
+        open(&pg(PG_MTLS, "localhost"), &tls).await,
+        TlsFailureKind::ClientCertificateRejected,
+    );
 }
 
 // ----------------------------------------------------- configuration path
@@ -567,7 +726,10 @@ async fn single_validated_configuration_path_from_files() {
     );
     let config: Config = conninfo.parse().unwrap();
     let debug = format!("{config:?}");
-    assert!(!debug.contains(dir.to_str().unwrap()), "paths leaked: {debug}");
+    assert!(
+        !debug.contains(dir.to_str().unwrap()),
+        "paths leaked: {debug}"
+    );
     assert!(!debug.contains("localhost"), "host leaked: {debug}");
     assert!(debug.contains("Tcp(ep-"), "{debug}");
 
@@ -577,7 +739,11 @@ async fn single_validated_configuration_path_from_files() {
 
     use std::os::unix::fs::MetadataExt;
     let root_owned = std::fs::metadata(&key).unwrap().uid() == 0;
-    let rejected: &[u32] = if root_owned { &[0o644, 0o604, 0o660] } else { &[0o644, 0o640, 0o604, 0o660] };
+    let rejected: &[u32] = if root_owned {
+        &[0o644, 0o604, 0o660]
+    } else {
+        &[0o644, 0o640, 0o604, 0o660]
+    };
     for &mode in rejected {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
         let e = MakeRustlsConnect::from_config(&config, options()).unwrap_err();
@@ -585,12 +751,38 @@ async fn single_validated_configuration_path_from_files() {
         assert!(!e.to_string().contains(dir.to_str().unwrap()), "{e}");
     }
 
-    let half: Config = format!("host=localhost sslrootcert={} sslcert={}", dir.join("ca-a.crt").display(), dir.join("client-postgres.crt").display()).parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&half, options()).unwrap_err().kind(), TlsConfigErrorKind::IncompleteClientIdentity);
-    let require: Config = format!("host=localhost sslmode=require sslrootcert={}", dir.join("ca-a.crt").display()).parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&require, options()).unwrap_err().kind(), TlsConfigErrorKind::ModeNotVerifyFull);
+    let half: Config = format!(
+        "host=localhost sslrootcert={} sslcert={}",
+        dir.join("ca-a.crt").display(),
+        dir.join("client-postgres.crt").display()
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        MakeRustlsConnect::from_config(&half, options())
+            .unwrap_err()
+            .kind(),
+        TlsConfigErrorKind::IncompleteClientIdentity
+    );
+    let require: Config = format!(
+        "host=localhost sslmode=require sslrootcert={}",
+        dir.join("ca-a.crt").display()
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        MakeRustlsConnect::from_config(&require, options())
+            .unwrap_err()
+            .kind(),
+        TlsConfigErrorKind::ModeNotVerifyFull
+    );
     let missing: Config = "host=localhost".parse().unwrap();
-    assert_eq!(MakeRustlsConnect::from_config(&missing, options()).unwrap_err().kind(), TlsConfigErrorKind::MissingRootCert);
+    assert_eq!(
+        MakeRustlsConnect::from_config(&missing, options())
+            .unwrap_err()
+            .kind(),
+        TlsConfigErrorKind::MissingRootCert
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -601,14 +793,50 @@ async fn invalid_reloads_keep_the_current_generation() {
     let tls = connector(&roots("ca-a.crt"));
     let keys = [read("client-postgres.key"), read("unrelated.key")].concat();
     let cases: Vec<(&str, TlsMaterial, TlsConfigErrorKind)> = vec![
-        ("malformed root", TlsMaterial::from_pem(&b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"[..]), TlsConfigErrorKind::InvalidRootCertificate),
-        ("empty root", TlsMaterial::from_pem(Vec::new()), TlsConfigErrorKind::NoRootCertificates),
-        ("expired root", roots("server-expired.crt"), TlsConfigErrorKind::CertificateNotCurrentlyValid),
-        ("key mismatch", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), read("unrelated.key")), TlsConfigErrorKind::KeyMismatch),
-        ("expired client", roots("ca-a.crt").with_client_identity(read("client-expired.crt"), read("client-expired.key")), TlsConfigErrorKind::CertificateNotCurrentlyValid),
-        ("two keys", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), keys), TlsConfigErrorKind::MultiplePrivateKeys),
-        ("cert without key", roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), Vec::new()), TlsConfigErrorKind::InvalidPrivateKey),
-        ("garbage crl", roots("ca-a.crt").with_crl(&b"garbage"[..]), TlsConfigErrorKind::InvalidCrl),
+        (
+            "malformed root",
+            TlsMaterial::from_pem(
+                &b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"[..],
+            ),
+            TlsConfigErrorKind::InvalidRootCertificate,
+        ),
+        (
+            "empty root",
+            TlsMaterial::from_pem(Vec::new()),
+            TlsConfigErrorKind::NoRootCertificates,
+        ),
+        (
+            "expired root",
+            roots("server-expired.crt"),
+            TlsConfigErrorKind::CertificateNotCurrentlyValid,
+        ),
+        (
+            "key mismatch",
+            roots("ca-a.crt")
+                .with_client_identity(read("client-postgres.crt"), read("unrelated.key")),
+            TlsConfigErrorKind::KeyMismatch,
+        ),
+        (
+            "expired client",
+            roots("ca-a.crt")
+                .with_client_identity(read("client-expired.crt"), read("client-expired.key")),
+            TlsConfigErrorKind::CertificateNotCurrentlyValid,
+        ),
+        (
+            "two keys",
+            roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), keys),
+            TlsConfigErrorKind::MultiplePrivateKeys,
+        ),
+        (
+            "cert without key",
+            roots("ca-a.crt").with_client_identity(read("client-postgres.crt"), Vec::new()),
+            TlsConfigErrorKind::InvalidPrivateKey,
+        ),
+        (
+            "garbage crl",
+            roots("ca-a.crt").with_crl(&b"garbage"[..]),
+            TlsConfigErrorKind::InvalidCrl,
+        ),
     ];
     let total = cases.len() as u64;
     for (name, material, kind) in cases {
@@ -631,7 +859,10 @@ async fn rotation_keeps_old_sessions_until_revoked_and_revocation_is_prompt() {
     assert_eq!(info.id(), 2);
     assert!(!tls.is_current(1));
     // New connections use only the new generation's roots.
-    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::UnknownIssuer);
+    expect_tls(
+        open(&pg(PG_VALID, "localhost"), &tls).await,
+        TlsFailureKind::UnknownIssuer,
+    );
     let new = open(&pg(PG_ROTATED, "localhost"), &tls).await.unwrap();
     assert_eq!(new.generation, Some(2));
     // The authenticated old session keeps working until it is retired.
@@ -641,11 +872,23 @@ async fn rotation_keeps_old_sessions_until_revoked_and_revocation_is_prompt() {
     let started = Instant::now();
     assert_eq!(tls.revoke_superseded(), 1);
     assert!(tls.is_revoked(1));
-    let ended = timeout(Duration::from_secs(2), old.task).await.expect("revoked session must close").unwrap();
+    let ended = timeout(Duration::from_secs(2), old.task)
+        .await
+        .expect("revoked session must close")
+        .unwrap();
     let e = ended.unwrap_err();
-    assert_eq!(e.tls_failure(), Some(TlsFailureKind::GenerationRevoked), "{e}");
+    assert_eq!(
+        e.tls_failure(),
+        Some(TlsFailureKind::GenerationRevoked),
+        "{e}"
+    );
     println!("revoked idle session closed after {:?}", started.elapsed());
-    assert!(old.client.simple_query("select 1").await.unwrap_err().is_closed());
+    assert!(old
+        .client
+        .simple_query("select 1")
+        .await
+        .unwrap_err()
+        .is_closed());
     assert_eq!(scalar(&new.client, "select 2").await, "2");
 
     // Overlapping roots during a CA rotation accept both servers.
@@ -660,13 +903,26 @@ async fn reload_and_drain_bounds_old_sessions() {
     let old = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
     let drain = Duration::from_millis(700);
     let started = Instant::now();
-    tls.reload_and_drain(&roots("ca-a-and-a2.crt"), drain).unwrap();
+    tls.reload_and_drain(&roots("ca-a-and-a2.crt"), drain)
+        .unwrap();
     assert_eq!(scalar(&old.client, "select 1").await, "1");
-    let ended = timeout(Duration::from_secs(5), old.task).await.expect("drain bound").unwrap();
+    let ended = timeout(Duration::from_secs(5), old.task)
+        .await
+        .expect("drain bound")
+        .unwrap();
     let elapsed = started.elapsed();
-    assert!(elapsed >= drain, "closed before the drain bound: {elapsed:?}");
-    assert!(elapsed < drain + Duration::from_secs(2), "drain overran: {elapsed:?}");
-    assert_eq!(ended.unwrap_err().tls_failure(), Some(TlsFailureKind::GenerationRevoked));
+    assert!(
+        elapsed >= drain,
+        "closed before the drain bound: {elapsed:?}"
+    );
+    assert!(
+        elapsed < drain + Duration::from_secs(2),
+        "drain overran: {elapsed:?}"
+    );
+    assert_eq!(
+        ended.unwrap_err().tls_failure(),
+        Some(TlsFailureKind::GenerationRevoked)
+    );
     println!("drained session closed after {elapsed:?} (bound {drain:?})");
     let fresh = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
     assert_eq!(fresh.generation, Some(2));
@@ -677,8 +933,15 @@ async fn revoking_the_current_generation_refuses_new_connections() {
     let tls = connector(&roots("ca-a.crt"));
     let s = open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
     assert!(tls.revoke_generation(1));
-    expect_tls(open(&pg(PG_VALID, "localhost"), &tls).await, TlsFailureKind::GenerationRevoked);
-    timeout(Duration::from_secs(2), s.task).await.expect("revoked session must close").unwrap().unwrap_err();
+    expect_tls(
+        open(&pg(PG_VALID, "localhost"), &tls).await,
+        TlsFailureKind::GenerationRevoked,
+    );
+    timeout(Duration::from_secs(2), s.task)
+        .await
+        .expect("revoked session must close")
+        .unwrap()
+        .unwrap_err();
     tls.reload(&roots("ca-a.crt")).unwrap();
     open(&pg(PG_VALID, "localhost"), &tls).await.unwrap();
 }
@@ -693,7 +956,11 @@ fn yb(host: &str, hostaddr: &str, extra: &str) -> Config {
 
 async fn servers(client: &Client) -> Vec<String> {
     let mut hosts = Vec::new();
-    for message in client.simple_query("select host from yb_servers() order by host").await.unwrap() {
+    for message in client
+        .simple_query("select host from yb_servers() order by host")
+        .await
+        .unwrap()
+    {
         if let SimpleQueryMessage::Row(row) = message {
             hosts.push(row.get(0).unwrap().to_string());
         }
@@ -704,21 +971,39 @@ async fn servers(client: &Client) -> Vec<String> {
 #[tokio::test]
 async fn yb_balancing_disabled_paths() {
     let tls = connector(&roots("ca-a.crt"));
-    for config in [yb("yb-a.test", "127.0.0.2", ""), "host=127.0.0.2 port=5433 user=yugabyte dbname=yugabyte".parse().unwrap()] {
+    for config in [
+        yb("yb-a.test", "127.0.0.2", ""),
+        "host=127.0.0.2 port=5433 user=yugabyte dbname=yugabyte"
+            .parse()
+            .unwrap(),
+    ] {
         let s = open_config(&config, &tls).await.unwrap();
         assert_eq!(servers(&s.client).await, vec!["127.0.0.2"]);
     }
     let wrong = connector(&roots("ca-b.crt"));
-    expect_tls(open_config(&yb("yb-a.test", "127.0.0.2", ""), &wrong).await, TlsFailureKind::UnknownIssuer);
-    expect_tls(open_config(&yb("yb-a.test", "127.0.0.3", ""), &tls).await, TlsFailureKind::IdentityMismatch);
+    expect_tls(
+        open_config(&yb("yb-a.test", "127.0.0.2", ""), &wrong).await,
+        TlsFailureKind::UnknownIssuer,
+    );
+    expect_tls(
+        open_config(&yb("yb-a.test", "127.0.0.3", ""), &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
 }
 
 #[tokio::test]
 async fn yb_discovered_node_dialled_through_seed_mapping() {
     let tls = connector(&roots("ca-a.crt"));
-    let s = open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &tls)
-        .await
-        .unwrap();
+    let s = open_config(
+        &yb(
+            "yb-a.test",
+            "127.0.0.2",
+            "load_balance=true yb_servers_refresh_interval=0",
+        ),
+        &tls,
+    )
+    .await
+    .unwrap();
     // Accounting uses the discovered canonical identity; TLS verified yb-a.test.
     assert_eq!(s.client.node_identity(), Some("127.0.0.2"));
 }
@@ -726,33 +1011,61 @@ async fn yb_discovered_node_dialled_through_seed_mapping() {
 #[tokio::test]
 async fn yb_discovered_identity_mismatch_is_terminal() {
     let tls = connector(&roots("ca-a.crt"));
-    let mut config = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    let mut config = yb(
+        "yb-b.test",
+        "127.0.0.3",
+        "load_balance=true yb_servers_refresh_interval=0",
+    );
     // Admit the discovered identity but verify it as itself: realm B's
     // certificate has no IP SAN, so the node must be refused rather than
     // verified against the seed name or silently replaced by the seed.
-    config.endpoint_policy(EndpointPolicy::new().admit_node("127.0.0.3", NodeEndpoint::new()).unwrap());
-    expect_tls(open_config(&config, &tls).await, TlsFailureKind::IdentityMismatch);
+    config.endpoint_policy(
+        EndpointPolicy::new()
+            .admit_node("127.0.0.3", NodeEndpoint::new())
+            .unwrap(),
+    );
+    expect_tls(
+        open_config(&config, &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
 }
 
 #[tokio::test]
 async fn yb_policy_maps_identity_to_tls_name() {
     let tls = connector(&roots("ca-a.crt"));
-    let mut config = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    let mut config = yb(
+        "yb-b.test",
+        "127.0.0.3",
+        "load_balance=true yb_servers_refresh_interval=0",
+    );
     config.endpoint_policy(
         EndpointPolicy::new()
-            .admit_node("127.0.0.3", NodeEndpoint::new().dial("127.0.0.3").tls_name("yb-b.test").port(5433))
+            .admit_node(
+                "127.0.0.3",
+                NodeEndpoint::new()
+                    .dial("127.0.0.3")
+                    .tls_name("yb-b.test")
+                    .port(5433),
+            )
             .unwrap(),
     );
     let s = open_config(&config, &tls).await.unwrap();
     assert_eq!(s.client.node_identity(), Some("127.0.0.3"));
 
-    let mut wrong = yb("yb-b.test", "127.0.0.3", "load_balance=true yb_servers_refresh_interval=0");
+    let mut wrong = yb(
+        "yb-b.test",
+        "127.0.0.3",
+        "load_balance=true yb_servers_refresh_interval=0",
+    );
     wrong.endpoint_policy(
         EndpointPolicy::new()
             .admit_node("127.0.0.3", NodeEndpoint::new().tls_name("yb-a.test"))
             .unwrap(),
     );
-    expect_tls(open_config(&wrong, &tls).await, TlsFailureKind::IdentityMismatch);
+    expect_tls(
+        open_config(&wrong, &tls).await,
+        TlsFailureKind::IdentityMismatch,
+    );
 }
 
 #[tokio::test]
@@ -767,36 +1080,67 @@ async fn yb_discovery_never_crosses_realms() {
         config.realm(shared.clone());
         config
     };
-    let a = open_config(&with(yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0")), &tls)
-        .await
-        .unwrap();
+    let a = open_config(
+        &with(yb(
+            "yb-a.test",
+            "127.0.0.2",
+            "load_balance=true yb_servers_refresh_interval=0",
+        )),
+        &tls,
+    )
+    .await
+    .unwrap();
     assert_eq!(servers(&a.client).await, vec!["127.0.0.2"]);
-    let snapshot: Vec<String> = shared.topology().unwrap().nodes().iter().map(|n| n.identity().to_string()).collect();
+    let snapshot: Vec<String> = shared
+        .topology()
+        .unwrap()
+        .nodes()
+        .iter()
+        .map(|n| n.identity().to_string())
+        .collect();
     assert_eq!(snapshot, vec!["127.0.0.2"]);
 
     // B reuses that snapshot (no refresh). Unrestricted balancing falls back
     // to B's own seed rather than dialling the unadmitted node.
     let b_conf = "load_balance=true yb_servers_refresh_interval=600";
     for _ in 0..5 {
-        let b = open_config(&with(yb("yb-b.test", "127.0.0.3", b_conf)), &tls).await.unwrap();
+        let b = open_config(&with(yb("yb-b.test", "127.0.0.3", b_conf)), &tls)
+            .await
+            .unwrap();
         assert_ne!(b.client.node_identity(), Some("127.0.0.2"));
         assert_eq!(servers(&b.client).await, vec!["127.0.0.3"]);
     }
     // Restricted routing has no seed fallback and fails closed instead.
     let e = open_config(
-        &with(yb("yb-b.test", "127.0.0.3", "load_balance=only-primary yb_servers_refresh_interval=600")),
+        &with(yb(
+            "yb-b.test",
+            "127.0.0.3",
+            "load_balance=only-primary yb_servers_refresh_interval=600",
+        )),
         &tls,
     )
     .await
     .err()
     .expect("B must not be routed into A");
     assert!(e.to_string().contains("admitted"), "{e}");
-    assert_eq!(shared.connection_counts().get("127.0.0.2"), Some(&1), "only A's session uses A");
+    assert_eq!(
+        shared.connection_counts().get("127.0.0.2"),
+        Some(&1),
+        "only A's session uses A"
+    );
 
     // Control: if B's trusted configuration admitted 127.0.0.2, the shared
     // snapshot would route B into A, so the checks above are not vacuous.
-    let mut crossing = with(yb("yb-b.test", "127.0.0.3", "load_balance=only-primary yb_servers_refresh_interval=600"));
-    crossing.endpoint_policy(EndpointPolicy::new().admit_node("127.0.0.2", NodeEndpoint::new()).unwrap());
+    let mut crossing = with(yb(
+        "yb-b.test",
+        "127.0.0.3",
+        "load_balance=only-primary yb_servers_refresh_interval=600",
+    ));
+    crossing.endpoint_policy(
+        EndpointPolicy::new()
+            .admit_node("127.0.0.2", NodeEndpoint::new())
+            .unwrap(),
+    );
     let crossed = open_config(&crossing, &tls).await.unwrap();
     assert_eq!(crossed.client.node_identity(), Some("127.0.0.2"));
     assert_eq!(servers(&crossed.client).await, vec!["127.0.0.2"]);
@@ -806,7 +1150,15 @@ async fn yb_discovery_never_crosses_realms() {
 async fn yb_discovery_tls_failure_does_not_fall_back() {
     let wrong = connector(&roots("ca-b.crt"));
     expect_tls(
-        open_config(&yb("yb-a.test", "127.0.0.2", "load_balance=true yb_servers_refresh_interval=0"), &wrong).await,
+        open_config(
+            &yb(
+                "yb-a.test",
+                "127.0.0.2",
+                "load_balance=true yb_servers_refresh_interval=0",
+            ),
+            &wrong,
+        )
+        .await,
         TlsFailureKind::UnknownIssuer,
     );
 }
@@ -853,14 +1205,27 @@ async fn yb_seed_identity_is_admitted_only_on_the_seed_port() {
         .await
         .err()
         .expect("restricted routing must fail closed");
-    assert!(e.to_string().contains("no discovered node is admitted"), "{e}");
+    assert!(
+        e.to_string().contains("no discovered node is admitted"),
+        "{e}"
+    );
     assert!(!e.is_security_failure(), "{e}");
-    assert_eq!(accepted.load(Ordering::SeqCst), 1, "control connection only");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "control connection only"
+    );
 
     // Unrestricted routing skips the node and connects through the seed.
-    let s = open_config(&config("true", "port-unrestricted"), &tls).await.unwrap();
+    let s = open_config(&config("true", "port-unrestricted"), &tls)
+        .await
+        .unwrap();
     assert_eq!(s.client.node_identity(), Some("yb-a.test"));
-    assert_eq!(accepted.load(Ordering::SeqCst), 3, "control and data through the seed port");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "control and data through the seed port"
+    );
     assert_eq!(scalar(&s.client, "select 1").await, "1");
     task.abort();
 }

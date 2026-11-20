@@ -613,7 +613,10 @@ impl Realm {
     }
 
     fn mark_failed(&self, identity: &str) {
-        info!("Quarantining {} after a transport failure", endpoint::label(identity));
+        info!(
+            "Quarantining {} after a transport failure",
+            endpoint::label(identity)
+        );
         self.inner
             .failures
             .lock()
@@ -767,7 +770,11 @@ impl Realm {
                                         }
                                     }
                                     AttemptFailure::Busy => {
-                                        info!("{} is busy: {}, trying another node", label, error_chain(&e));
+                                        info!(
+                                            "{} is busy: {}, trying another node",
+                                            label,
+                                            error_chain(&e)
+                                        );
                                     }
                                     AttemptFailure::Transport => {
                                         info!(
@@ -888,7 +895,8 @@ impl Realm {
     where
         T: MakeTlsConnect<Socket>,
     {
-        let fresh = |t: &Arc<Topology>| t.fetched_at.elapsed() <= config.yb_servers_refresh_interval;
+        let fresh =
+            |t: &Arc<Topology>| t.fetched_at.elapsed() <= config.yb_servers_refresh_interval;
         let snapshot = self.inner.snapshot.read().clone();
         if let Some(topology) = &snapshot {
             if fresh(topology) && config.yb_servers_refresh_interval > Duration::ZERO {
@@ -1005,7 +1013,11 @@ impl Realm {
     /// refresh is in progress and it is within the maximum staleness), and
     /// the query's error otherwise; the snapshot is left as it was, so a
     /// caller can fall back to [`refresh`](Self::refresh).
-    pub async fn refresh_with(&self, client: &Client, config: &Config) -> Result<TopologyInfo, Error> {
+    pub async fn refresh_with(
+        &self,
+        client: &Client,
+        config: &Config,
+    ) -> Result<TopologyInfo, Error> {
         if client.realm() != Some(self) {
             return Err(Error::config(
                 "refresh_with needs a load-balanced session of this realm".into(),
@@ -1386,7 +1398,10 @@ impl Realm {
             .map_err(|_| {
                 Error::connect(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("`select * from yb_servers()` did not complete within {:?}", bound),
+                    format!(
+                        "`select * from yb_servers()` did not complete within {:?}",
+                        bound
+                    ),
                 ))
             })??
         };
@@ -1412,7 +1427,9 @@ impl Realm {
             let public_ip: Option<String> = row.try_get("public_ip")?;
             let label = endpoint::label(&host);
             if host.is_empty() || !(1..=65535).contains(&port) {
-                return Err(invalid_topology("an entry has an empty host or an invalid port"));
+                return Err(invalid_topology(
+                    "an entry has an empty host or an invalid port",
+                ));
             }
             let role = match node_type.as_str() {
                 "primary" => NodeRole::Primary,
@@ -1614,8 +1631,10 @@ impl<'a> Policy<'a> {
         };
         let mut priorities: Vec<&i64> = config.topology_keys.keys().collect();
         priorities.sort();
-        let mut placement_tiers: Vec<Option<&Vec<String>>> =
-            priorities.into_iter().map(|p| config.topology_keys.get(p)).collect();
+        let mut placement_tiers: Vec<Option<&Vec<String>>> = priorities
+            .into_iter()
+            .map(|p| config.topology_keys.get(p))
+            .collect();
         let strict_placement = !placement_tiers.is_empty() && config.fallback_to_topology_keys_only;
         if !strict_placement {
             placement_tiers.push(None);
@@ -1630,7 +1649,10 @@ impl<'a> Policy<'a> {
     /// Admission and hard role/placement eligibility.
     fn eligible(&self, config: &Config, node: &NodeInfo) -> bool {
         resolve_node(config, &node.identity, node.port).is_some()
-            && self.role_tiers.iter().any(|roles| roles.contains(&node.role))
+            && self
+                .role_tiers
+                .iter()
+                .any(|roles| roles.contains(&node.role))
             && (!self.strict_placement
                 || self
                     .placement_tiers
@@ -1771,7 +1793,10 @@ pub(crate) fn plan(
         } else {
             "every eligible node is quarantined after recent failures"
         };
-        return Err(Error::connect(io::Error::new(io::ErrorKind::ConnectionRefused, reason)));
+        return Err(Error::connect(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            reason,
+        )));
     }
     Ok(ordered)
 }

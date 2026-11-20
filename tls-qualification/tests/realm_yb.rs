@@ -32,7 +32,11 @@ async fn open(config: &Config, realm: &Realm, tls: &MakeRustlsConnect) -> Client
 
 async fn server_hosts(client: &Client) -> Vec<String> {
     let mut hosts = Vec::new();
-    for message in client.simple_query("select host from yb_servers()").await.unwrap() {
+    for message in client
+        .simple_query("select host from yb_servers()")
+        .await
+        .unwrap()
+    {
         if let SimpleQueryMessage::Row(row) = message {
             hosts.push(row.get(0).unwrap().to_string());
         }
@@ -63,19 +67,37 @@ async fn two_verified_realms_in_one_process_are_isolated() {
     let mut clients = Vec::new();
     for task in tasks {
         let (realm, hosts, client) = task.await.unwrap();
-        let expected = if realm == "yb-a" { "127.0.0.2" } else { "127.0.0.3" };
-        assert_eq!(hosts, vec![expected.to_string()], "{realm} reached another universe");
+        let expected = if realm == "yb-a" {
+            "127.0.0.2"
+        } else {
+            "127.0.0.3"
+        };
+        assert_eq!(
+            hosts,
+            vec![expected.to_string()],
+            "{realm} reached another universe"
+        );
         clients.push(client);
     }
-    assert_eq!(ra.connection_counts().into_iter().collect::<Vec<_>>(), vec![("127.0.0.2".to_string(), 8)]);
+    assert_eq!(
+        ra.connection_counts().into_iter().collect::<Vec<_>>(),
+        vec![("127.0.0.2".to_string(), 8)]
+    );
     // Realm B verifies 127.0.0.3 as yb-b.test through the seed mapping.
-    assert_eq!(rb.connection_counts().into_iter().collect::<Vec<_>>(), vec![("127.0.0.3".to_string(), 8)]);
+    assert_eq!(
+        rb.connection_counts().into_iter().collect::<Vec<_>>(),
+        vec![("127.0.0.3".to_string(), 8)]
+    );
     assert!(ra.failed_nodes().is_empty() && rb.failed_nodes().is_empty());
     assert_eq!(ra.topology().unwrap().nodes().len(), 1);
     assert_eq!(rb.topology().unwrap().nodes()[0].identity(), "127.0.0.3");
 
     // Realm B loses its only endpoint; it must fail rather than reach A.
-    let broken_b = yb("yb-b.test", "127.0.0.9", "yb_servers_refresh_interval=0 yb_acquire_timeout=5");
+    let broken_b = yb(
+        "yb-b.test",
+        "127.0.0.9",
+        "yb_servers_refresh_interval=0 yb_acquire_timeout=5",
+    );
     let mut config = broken_b.clone();
     let lost = Realm::new("yb-b-lost");
     config.realm(lost.clone());
@@ -113,10 +135,19 @@ async fn stalled_tls_handshake_is_bounded() {
         .parse()
         .unwrap();
         let started = Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(10), config.connect(tls.clone())).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), config.connect(tls.clone())).await;
         let elapsed = started.elapsed();
-        assert!(result.expect("the driver must bound the stall itself").is_err(), "{extra}");
-        assert!(elapsed < Duration::from_millis(3500), "{extra}: {elapsed:?}");
+        assert!(
+            result
+                .expect("the driver must bound the stall itself")
+                .is_err(),
+            "{extra}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3500),
+            "{extra}: {elapsed:?}"
+        );
         println!("{extra}: stalled TLS handshake abandoned after {elapsed:?}");
     }
 }
@@ -139,6 +170,13 @@ async fn established_sessions_refresh_the_topology_and_report_standing() {
         .await
         .unwrap();
     let info = realm.refresh_with(&client, &conf).await.unwrap();
-    assert_eq!(info.nodes()[0].identity(), "127.0.0.2", "an unqualified lookup would reach shadow.yb_servers()");
-    client.batch_execute("DROP SCHEMA shadow CASCADE").await.unwrap();
+    assert_eq!(
+        info.nodes()[0].identity(),
+        "127.0.0.2",
+        "an unqualified lookup would reach shadow.yb_servers()"
+    );
+    client
+        .batch_execute("DROP SCHEMA shadow CASCADE")
+        .await
+        .unwrap();
 }

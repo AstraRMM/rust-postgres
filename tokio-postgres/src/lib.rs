@@ -154,7 +154,6 @@ mod codec;
 pub mod config;
 #[cfg(feature = "runtime")]
 mod connect;
-pub mod endpoint;
 mod connect_raw;
 #[cfg(feature = "runtime")]
 mod connect_socket;
@@ -162,6 +161,7 @@ mod connect_tls;
 mod connection;
 mod copy_in;
 mod copy_out;
+pub mod endpoint;
 pub mod error;
 mod generic_client;
 #[cfg(not(target_arch = "wasm32"))]

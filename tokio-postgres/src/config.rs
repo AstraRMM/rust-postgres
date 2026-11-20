@@ -4,16 +4,16 @@
 use crate::connect::connect;
 use crate::connect::yb_connect;
 use crate::connect_raw::connect_raw;
+use crate::endpoint::EndpointPolicy;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::keepalive::KeepaliveConfig;
+#[cfg(feature = "runtime")]
+use crate::realm::Realm;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 #[cfg(feature = "runtime")]
 use crate::Socket;
-use crate::endpoint::EndpointPolicy;
-#[cfg(feature = "runtime")]
-use crate::realm::Realm;
 use crate::{Client, Connection, Error};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -26,9 +26,9 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::str;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{error, fmt, iter, mem};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -976,15 +976,15 @@ impl Config {
 
     ///Check if the given load_balnce value if one of the allowed values.
     pub fn is_lb_valid(&self, lb: &str) -> bool {
-        match lb.to_lowercase().as_str(){
+        match lb.to_lowercase().as_str() {
             "only-rr" => true,
-            "only-primary"=> true,
-            "prefer-primary"=> true,
-            "prefer-rr"=> true,
-            "any"=> true,
-            "true"=> true,
-            "false"=> true,
-            _=>false,
+            "only-primary" => true,
+            "prefer-primary" => true,
+            "prefer-rr" => true,
+            "any" => true,
+            "true" => true,
+            "false" => true,
+            _ => false,
         }
     }
 
@@ -1243,7 +1243,9 @@ impl Config {
                     .parse::<usize>()
                     .ok()
                     .filter(|a| (1..=32).contains(a))
-                    .ok_or_else(|| Error::config_parse(Box::new(InvalidValue("yb_max_attempts"))))?;
+                    .ok_or_else(|| {
+                        Error::config_parse(Box::new(InvalidValue("yb_max_attempts")))
+                    })?;
                 self.yb_max_attempts(attempts);
             }
             _ => {
@@ -1337,7 +1339,10 @@ impl fmt::Debug for Config {
             .field("options", &self.options.as_ref().map(|_| Redaction {}))
             .field("application_name", &self.application_name)
             .field("ssl_mode", &self.ssl_mode)
-            .field("ssl_root_cert", &self.ssl_root_cert.as_ref().map(|_| Redaction {}))
+            .field(
+                "ssl_root_cert",
+                &self.ssl_root_cert.as_ref().map(|_| Redaction {}),
+            )
             .field("ssl_cert", &self.ssl_cert.as_ref().map(|_| Redaction {}))
             .field("ssl_key", &self.ssl_key.as_ref().map(|_| Redaction {}))
             .field("ssl_crl", &self.ssl_crl.as_ref().map(|_| Redaction {}))

@@ -609,13 +609,10 @@ pub(crate) fn error_chain(err: &Error) -> String {
 /// `CONNECT_TIMEOUT`.
 pub(crate) fn control_connection_config(config: &Config) -> Config {
     let mut control_config = config.clone();
-    control_config.connect_timeout = Some(
-        config
-            .connect_timeout
-            .map_or(CONNECT_TIMEOUT, |timeout| {
-                cmp::min(timeout, CONNECT_TIMEOUT)
-            }),
-    );
+    control_config.connect_timeout =
+        Some(config.connect_timeout.map_or(CONNECT_TIMEOUT, |timeout| {
+            cmp::min(timeout, CONNECT_TIMEOUT)
+        }));
     control_config
 }
 

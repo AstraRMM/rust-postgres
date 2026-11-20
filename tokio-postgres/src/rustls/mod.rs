@@ -30,7 +30,9 @@ use crate::tls::{
 use ::rustls::client::WebPkiServerVerifier;
 use ::rustls::crypto::CryptoProvider;
 use ::rustls::pki_types::pem::PemObject;
-use ::rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
+use ::rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName,
+};
 use ::rustls::sign::CertifiedKey;
 use ::rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 use parking_lot::{Mutex, RwLock};
@@ -655,7 +657,10 @@ fn build_generation(
             crls.push(crl);
         }
         if crls.len() == before {
-            return Err(TlsConfigError::new(K::InvalidCrl, "sslcrl contains no CRLs"));
+            return Err(TlsConfigError::new(
+                K::InvalidCrl,
+                "sslcrl contains no CRLs",
+            ));
         }
     }
     let crl_count = crls.len();
@@ -680,9 +685,7 @@ fn build_generation(
 
     let versions: &[&'static SupportedProtocolVersion] = match options.protocol_versions {
         ProtocolVersions::Tls13Only => &[&::rustls::version::TLS13],
-        ProtocolVersions::Tls12AndTls13 => {
-            &[&::rustls::version::TLS13, &::rustls::version::TLS12]
-        }
+        ProtocolVersions::Tls12AndTls13 => &[&::rustls::version::TLS13, &::rustls::version::TLS12],
     };
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(versions)
@@ -729,7 +732,9 @@ fn build_generation(
                 .ok_or_else(|| {
                     TlsConfigError::new(K::InvalidPrivateKey, "sslkey contains no private key")
                 })?
-                .map_err(|_| TlsConfigError::new(K::InvalidPrivateKey, "sslkey is not valid PEM"))?;
+                .map_err(|_| {
+                    TlsConfigError::new(K::InvalidPrivateKey, "sslkey is not valid PEM")
+                })?;
             if keys.next().is_some() {
                 return Err(TlsConfigError::new(
                     K::MultiplePrivateKeys,
@@ -1007,8 +1012,7 @@ where
 
     fn connect(self, stream: S) -> Self::Future {
         Box::pin(async move {
-            let connector =
-                tokio_rustls::TlsConnector::from(self.generation.client_config.clone());
+            let connector = tokio_rustls::TlsConnector::from(self.generation.client_config.clone());
             let label = self.label;
             let client_identity = self.generation.info.client_identity;
             let tls = connector
@@ -1229,9 +1233,7 @@ pub(crate) fn classify_rustls_error(e: &::rustls::Error) -> (TlsFailureKind, &'s
                 K::IdentityMismatch,
                 "server certificate is not valid for the expected TLS identity",
             ),
-            C::Expired | C::ExpiredContext { .. } => {
-                (K::Expired, "server certificate has expired")
-            }
+            C::Expired | C::ExpiredContext { .. } => (K::Expired, "server certificate has expired"),
             C::NotValidYet | C::NotValidYetContext { .. } => {
                 (K::NotYetValid, "server certificate is not yet valid")
             }

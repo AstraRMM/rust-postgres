@@ -43,15 +43,21 @@ async fn multiple_hosts_multiple_ports() {
 
 #[tokio::test]
 async fn wrong_port_count() {
-    yb_tokio_postgres::connect("host=localhost port=5433,5433 user=postgres sslmode=disable", NoTls)
-        .await
-        .err()
-        .unwrap();
+    yb_tokio_postgres::connect(
+        "host=localhost port=5433,5433 user=postgres sslmode=disable",
+        NoTls,
+    )
+    .await
+    .err()
+    .unwrap();
 }
 
 #[tokio::test]
 async fn target_session_attrs_ok() {
-    smoke_test("host=localhost port=5433 user=postgres target_session_attrs=read-write sslmode=disable").await;
+    smoke_test(
+        "host=localhost port=5433 user=postgres target_session_attrs=read-write sslmode=disable",
+    )
+    .await;
 }
 
 #[tokio::test]
