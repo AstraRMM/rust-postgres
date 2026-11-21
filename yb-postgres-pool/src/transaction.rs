@@ -2,8 +2,8 @@
 
 use crate::cache::StatementCache;
 use crate::error::{ErrorKind, PoolError};
-use crate::pool::prepare_cached;
-use crate::stats::{bump, Stats};
+use crate::pool::{clear_if_stale, prepare_cached};
+use crate::stats::Stats;
 use std::ops::{Deref, DerefMut};
 use yb_tokio_postgres::types::{ToSql, Type};
 use yb_tokio_postgres::{Client, IsolationLevel, Row, Statement, Transaction, TransactionStatus};
@@ -75,7 +75,10 @@ impl<'a> PoolTransaction<'a> {
         if options.deferrable {
             builder = builder.deferrable(true);
         }
-        let tx = builder.start().await.map_err(PoolError::from_driver)?;
+        let tx = match builder.start().await {
+            Ok(tx) => tx,
+            Err(e) => return Err(clear_if_stale(cache, stats, PoolError::from_driver(e))),
+        };
         Ok(PoolTransaction {
             tx: Some(tx),
             cache,
@@ -88,11 +91,7 @@ impl<'a> PoolTransaction<'a> {
     }
 
     fn map_error(&mut self, error: yb_tokio_postgres::Error) -> PoolError {
-        let error = PoolError::from_driver(error);
-        if error.kind() == ErrorKind::StaleStatement && self.cache.clear() > 0 {
-            bump(&self.stats.statement_invalidations);
-        }
-        error
+        clear_if_stale(self.cache, self.stats, PoolError::from_driver(error))
     }
 
     /// Prepares `sql` with inferred types through the connection's cache.
@@ -171,6 +170,8 @@ impl<'a> PoolTransaction<'a> {
     ///   was committed.
     /// * [`ErrorKind::Database`] (or `DatabaseTimeout`): the server rejected
     ///   `COMMIT` (for example a serialization failure); nothing committed.
+    /// * [`ErrorKind::StaleStatement`]: the server rejected `COMMIT` after a
+    ///   schema or catalog change; nothing committed and the cache is cleared.
     /// * [`ErrorKind::AmbiguousCommit`]: the connection failed with `COMMIT`
     ///   in flight; the outcome is unknown. Do not replay the writes
     ///   automatically. Dropping the future returned by `commit` mid-flight
@@ -195,7 +196,7 @@ impl<'a> PoolTransaction<'a> {
         match tx.commit().await {
             Ok(()) => Ok(()),
             Err(e) => {
-                let error = PoolError::from_driver(e);
+                let error = self.map_error(e);
                 if error.kind() == ErrorKind::Transport {
                     Err(error.with_kind(ErrorKind::AmbiguousCommit))
                 } else {
@@ -208,7 +209,7 @@ impl<'a> PoolTransaction<'a> {
     /// Rolls back and reports any error.
     pub async fn rollback(mut self) -> Result<(), PoolError> {
         let tx = self.tx.take().expect("transaction present");
-        tx.rollback().await.map_err(PoolError::from_driver)
+        tx.rollback().await.map_err(|e| self.map_error(e))
     }
 }
 
