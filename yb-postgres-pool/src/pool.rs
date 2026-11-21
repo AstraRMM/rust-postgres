@@ -2088,6 +2088,17 @@ impl<T: PoolTls> PooledClient<T> {
     }
 }
 
+pub(crate) fn clear_if_stale(
+    cache: &mut StatementCache,
+    stats: &Stats,
+    error: PoolError,
+) -> PoolError {
+    if error.kind() == ErrorKind::StaleStatement && cache.clear() > 0 {
+        bump(&stats.statement_invalidations);
+    }
+    error
+}
+
 pub(crate) async fn prepare_cached(
     client: &Client,
     cache: &mut StatementCache,
@@ -2100,10 +2111,10 @@ pub(crate) async fn prepare_cached(
         return Ok(statement);
     }
     bump(&stats.statement_prepares);
-    let statement = client
-        .prepare_typed(sql, types)
-        .await
-        .map_err(PoolError::from_driver)?;
+    let statement = match client.prepare_typed(sql, types).await {
+        Ok(statement) => statement,
+        Err(e) => return Err(clear_if_stale(cache, stats, PoolError::from_driver(e))),
+    };
     let evicted = cache.insert(sql, types, statement.clone());
     if evicted > 0 {
         stats
