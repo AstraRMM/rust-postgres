@@ -42,9 +42,18 @@ pub enum ErrorKind {
     Database,
     /// A cached prepared statement was invalidated by a schema or
     /// search-path change ("cached plan must not change result type",
-    /// 26000, YugabyteDB schema/catalog version mismatch). The connection's
-    /// statement cache was cleared. Outside a transaction the pooled query
-    /// helpers already retried once; inside one the transaction is aborted.
+    /// 26000, YugabyteDB schema/catalog version mismatch).
+    ///
+    /// The statement, prepare, transaction, commit and rollback methods of
+    /// [`PooledClient`](crate::PooledClient) and
+    /// [`PoolTransaction`](crate::PoolTransaction) clear the connection's
+    /// statement cache before returning this kind. [`classify`],
+    /// [`PoolError::from_driver`], `From` and
+    /// [`PooledClient::classify_error`](crate::PooledClient::classify_error)
+    /// only classify. Outside a transaction,
+    /// [`PooledClient::query`](crate::PooledClient::query) and its siblings
+    /// re-prepare and retry once when execution fails stale; a stale
+    /// prepare is not retried. Nothing inside a transaction is retried.
     StaleStatement,
     /// The connection failed while `COMMIT` was in flight: the transaction
     /// may or may not have committed. Resolve through idempotency or outcome
