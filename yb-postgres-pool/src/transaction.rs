@@ -49,7 +49,7 @@ impl TransactionOptions {
 /// is queued without waiting; the pool's return check waits for it).
 ///
 /// Errors inside the transaction are never retried. A stale statement
-/// aborts the transaction; this type's methods then return
+/// aborts the transaction; the method of this type that hit it returns
 /// [`ErrorKind::StaleStatement`] with the cache cleared, while native
 /// calls through `Deref` leave the cache as it is. Retry the whole
 /// transaction under its own retry contract.
