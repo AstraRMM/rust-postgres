@@ -48,10 +48,11 @@ impl TransactionOptions {
 /// Dropping it without [`commit`](Self::commit) rolls back (the `ROLLBACK`
 /// is queued without waiting; the pool's return check waits for it).
 ///
-/// Errors inside the transaction are never retried: after a stale cached
-/// statement the transaction is aborted, the cache is cleared and the error
-/// is [`ErrorKind::StaleStatement`]; retry the whole transaction under its
-/// own retry contract.
+/// Errors inside the transaction are never retried. A stale statement
+/// aborts the transaction; the method of this type that hit it returns
+/// [`ErrorKind::StaleStatement`] with the cache cleared, while native
+/// calls through `Deref` leave the cache as it is. Retry the whole
+/// transaction under its own retry contract.
 pub struct PoolTransaction<'a> {
     tx: Option<Transaction<'a>>,
     cache: &'a mut StatementCache,
